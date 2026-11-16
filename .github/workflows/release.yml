@@ -27,16 +27,21 @@ jobs:
 
       - name: Package portable bundle & prepare release notes
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
-          $headers = @{ "User-Agent" = "mihomo-tray-release" }
-          if ($env:GITHUB_TOKEN) {
-            $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+
+          function Get-LatestTag([string]$repo) {
+            $resp = curl.exe -fsSI "https://github.com/$repo/releases/latest"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to query latest release for $repo" }
+            $locLine = $resp | Where-Object { $_ -match '^(?i)location:\s*(.+)$' } | Select-Object -First 1
+            if (-not $locLine) { throw "Missing location header for $repo" }
+            $loc = $Matches[1].Trim()
+            $tag = ($loc.TrimEnd('/') -split '/')[-1]
+            if (-not $tag) { throw "Failed to parse tag from $loc" }
+            return $tag
           }
 
-          New-Item -ItemType Directory -Force -Path dist, dist\core, dist\config, dist\ui | Out-Null
+          New-Item -ItemType Directory -Force -Path dist, dist\core, dist\config, dist\ui, tmp_ui | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\mihomo-tray.exe dist\mihomo-tray.exe
           Copy-Item assets\tray.sample.yml dist\tray.yml
           Copy-Item assets\config.sample.yaml dist\config\config.yaml
@@ -44,12 +49,10 @@ jobs:
           Copy-Item README_zh.md dist\README_zh.md
           Copy-Item LICENSE dist\LICENSE
 
-          # 1. Download latest Zephyruso/zashboard dist-no-fonts.zip into dist\ui\
-          $zash = Invoke-RestMethod -Uri "https://api.github.com/repos/Zephyruso/zashboard/releases/latest" -Headers $headers
-          $zashAsset = $zash.assets | Where-Object { $_.name -eq "dist-no-fonts.zip" } | Select-Object -First 1
-          if (-not $zashAsset) { throw "dist-no-fonts.zip not found in Zephyruso/zashboard latest release" }
-          Invoke-WebRequest -Uri $zashAsset.browser_download_url -OutFile zashboard.zip
-          New-Item -ItemType Directory -Force -Path tmp_ui | Out-Null
+          # 1. Latest Zephyruso/zashboard (dist-no-fonts.zip) -> dist\ui\
+          $zashTag = Get-LatestTag "Zephyruso/zashboard"
+          curl.exe -fsSL -o zashboard.zip "https://github.com/Zephyruso/zashboard/releases/download/$zashTag/dist-no-fonts.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download zashboard $zashTag" }
           Expand-Archive -Path zashboard.zip -DestinationPath tmp_ui -Force
           if (Test-Path tmp_ui\dist\index.html) {
             Copy-Item tmp_ui\dist\* dist\ui -Recurse -Force
@@ -59,19 +62,21 @@ jobs:
             throw "index.html not found inside zashboard dist-no-fonts.zip"
           }
 
-          # 2. Download latest MetaCubeX/mihomo mihomo-windows-amd64-v3-v*.zip into dist\core\
-          $mihomo = Invoke-RestMethod -Uri "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" -Headers $headers
-          $mihomoAsset = $mihomo.assets | Where-Object { $_.name -match '^mihomo-windows-amd64-v3-v.*\.zip$' } | Select-Object -First 1
-          if (-not $mihomoAsset) { throw "mihomo-windows-amd64-v3 asset not found in MetaCubeX/mihomo latest release" }
-          Invoke-WebRequest -Uri $mihomoAsset.browser_download_url -OutFile mihomo.zip
+          # 2. Latest MetaCubeX/mihomo (mihomo-windows-amd64-v3-<tag>.zip) -> dist\core\
+          $mihomoTag = Get-LatestTag "MetaCubeX/mihomo"
+          curl.exe -fsSL -o mihomo.zip "https://github.com/MetaCubeX/mihomo/releases/download/$mihomoTag/mihomo-windows-amd64-v3-$mihomoTag.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download mihomo $mihomoTag" }
           Expand-Archive -Path mihomo.zip -DestinationPath dist\core -Force
           $kernelExe = Get-ChildItem -Path dist\core -Filter "mihomo*.exe" | Select-Object -First 1
           if (-not $kernelExe) { throw "mihomo executable missing after extraction" }
 
-          # 3. Download latest Loyalsoldier geoip.dat, geosite.dat, and Country.mmdb into dist\config\
-          Invoke-WebRequest -Uri "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -OutFile dist\config\geoip.dat
-          Invoke-WebRequest -Uri "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -OutFile dist\config\geosite.dat
-          Invoke-WebRequest -Uri "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb" -OutFile dist\config\Country.mmdb
+          # 3. Latest Loyalsoldier geoip.dat, geosite.dat, and Country.mmdb -> dist\config\
+          curl.exe -fsSL -o dist\config\geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download geoip.dat" }
+          curl.exe -fsSL -o dist\config\geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download geosite.dat" }
+          curl.exe -fsSL -o dist\config\Country.mmdb "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download Country.mmdb" }
 
           # 4. Validate packaged config.yaml & geodata using the bundled mihomo kernel
           & $kernelExe.FullName -t -d dist\config -f dist\config\config.yaml
@@ -81,8 +86,8 @@ jobs:
 
           $body = (Get-Content -Raw -Encoding utf8 .github/release-body.md) `
             .Replace('{{TAG}}', $env:GITHUB_REF_NAME) `
-            .Replace('{{MIHOMO_TAG}}', $mihomo.tag_name) `
-            .Replace('{{ZASHBOARD_TAG}}', $zash.tag_name)
+            .Replace('{{MIHOMO_TAG}}', $mihomoTag) `
+            .Replace('{{ZASHBOARD_TAG}}', $zashTag)
           Set-Content -Path release-notes.md -Value $body -Encoding utf8
 
       - name: Publish GitHub Release

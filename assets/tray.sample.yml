@@ -1,0 +1,62 @@
+# mihomo-tray portable configuration (English UI).
+#
+# All relative paths are resolved against the portable root directory
+# (the directory containing mihomo-tray.exe), so the entire folder can
+# be moved freely without breaking paths.
+
+mihomo:
+  # Kernel binary path.
+  # Empty = auto-discover in this order:
+  #   1. ./mihomo.exe
+  #   2. ./core/mihomo.exe
+  #   3. ./bin/mihomo.exe
+  #   4. A single mihomo*.exe inside ./core/ or ./
+  #   5. PATH (including Scoop shims)
+  # You can also set a relative path like "./core/mihomo-alpha.exe".
+  path: ""
+
+  # Kernel home directory (-d), where cache.db and geodata live.
+  # Empty = ./config (if ./config or ./config/config.yaml exists),
+  #         else beside config.yaml, defaulting to ./config to stay portable.
+  home: ""
+
+  # Kernel config file (-f).
+  # Empty = <home>/config.yaml (or ./config.yaml if present at portable root).
+  config: ""
+
+  # Extra CLI arguments forwarded to mihomo (do not duplicate -d, -f, -ext-ctl, or -secret).
+  args: []
+
+  # Start the core automatically when mihomo-tray launches.
+  auto_start: true
+
+controller:
+  # Fallback controller address & secret used only if mihomo's own args/env/config do not specify one.
+  address: ""
+  secret: ""
+  timeout_ms: 2000
+
+proxy:
+  # Extra Windows ProxyOverride bypass entries; "<local>" is always included.
+  bypass: []
+
+groups:
+  # Explicit group display order; remaining groups are sorted case-insensitively.
+  order: []
+  # Include only these groups (empty = all switchable groups).
+  include: []
+  # Exclude these groups.
+  exclude: []
+  # Submenu page size for very long node lists (0 = disabled).
+  page_size: 0
+
+ui:
+  # Optional directory containing static WebUI files (e.g., zashboard / metacubexd),
+  # passed to mihomo as -ext-ui. Empty = auto-use ./ui if ./ui/index.html exists.
+  external_ui: ""
+  # Dashboard URL opened in the default browser.
+  # Placeholders {host}, {port}, and {secret} are expanded automatically.
+  # Empty = http://{host}:{port}/ui/?hostname={host}&port={port}&secret={secret}
+  web_url: ""
+  # Background controller polling interval in milliseconds (500..60000).
+  poll_interval_ms: 3000

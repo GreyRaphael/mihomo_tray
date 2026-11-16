@@ -6,6 +6,7 @@ pub const MIHOMO_CONFIG_NAME: &str = "config.yaml";
 pub const RUNTIME_LOCK_NAME: &str = ".runtime.json";
 
 pub const MENU_OPEN_WEB_UI: &str = "Open WebUI";
+pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription URL...";
 pub const MENU_MODE_RULE: &str = "Rule";
 pub const MENU_MODE_GLOBAL: &str = "Global";
 pub const MENU_MODE_DIRECT: &str = "Direct";
@@ -30,8 +31,7 @@ pub const MENU_OPEN_PORTABLE_DIR: &str = "Open Portable Folder";
 pub const MENU_OPEN_UI_DIR: &str = "Open WebUI Folder (ui/)";
 pub const MENU_OPEN_LOG_FILE: &str = "Open Log File";
 pub const MENU_AUTOSTART: &str = "Start with Windows";
-pub const MENU_QUIT_AND_STOP: &str = "Quit and Stop Core";
-pub const MENU_QUIT_ONLY: &str = "Quit Tray Only";
+pub const MENU_QUIT: &str = "Quit";
 
 pub const STATUS_STARTING_CORE: &str = "Starting mihomo core...";
 pub const STATUS_WAITING_CONTROLLER: &str = "Waiting for mihomo controller...";

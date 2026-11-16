@@ -169,13 +169,14 @@ pub enum WorkerCommand {
     RefreshProvider(String),
     ReloadConfig,
     CloseConnections,
+    SetSubscriptionUrl(String),
     StartCore,
     StopCore,
     RestartCore,
     ForceRestartCore,
     ToggleAutostart,
     RefreshNow,
-    Quit { stop_core: bool },
+    Quit,
 }
 
 #[derive(Debug)]

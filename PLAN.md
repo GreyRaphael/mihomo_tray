@@ -65,7 +65,7 @@ mihomo-tray/
 ### 3.2 Windows-Only Dependencies (`[target.'cfg(windows)']`)
 | Crate | Version | Purpose |
 |---|---|---|
-| `embed-manifest` | `1.5.1` | `build.rs` manifest embedding (Common-Controls v6 + Per-Monitor DPI v2 + Win10/11 support) |
+| `winresource` | `0.1.34` | `build.rs` single-pass embedding of `assets/app.ico` + DPI/UTF-8 manifest (avoids `CVT1100` conflicts) |
 | `winreg` | `0.56.0` | Per-user `Internet Settings` registry updates & `Run` autostart path checks |
 | `windows-sys` | `0.61.2` | `InternetSetOptionW`, `MessageBoxW`, `ShellExecuteExW` (`CommandLineToArgvW`-safe quoting) |
 | `deelevate` | `0.2.0` | Detect whether the tray itself was launched elevated |

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use winit::event_loop::EventLoopProxy;
 
+use crate::config::mihomo;
 use crate::config::tray::{self, TraySettings};
 use crate::core::api::Client;
 use crate::core::discover;
@@ -101,16 +102,16 @@ impl Worker {
         loop {
             let interval = Duration::from_millis(self.settings.ui.poll_interval_ms as u64);
             match rx.recv_timeout(interval) {
-                Ok(WorkerCommand::Quit { stop_core }) => {
-                    self.handle_quit(stop_core);
+                Ok(WorkerCommand::Quit) => {
+                    self.handle_quit();
                     break;
                 }
                 Ok(cmd) => {
                     self.handle_command(cmd);
                     // Coalesce burst commands before doing a full poll.
                     while let Ok(extra) = rx.try_recv() {
-                        if let WorkerCommand::Quit { stop_core } = extra {
-                            self.handle_quit(stop_core);
+                        if matches!(extra, WorkerCommand::Quit) {
+                            self.handle_quit();
                             return;
                         }
                         self.handle_command(extra);
@@ -208,6 +209,7 @@ impl Worker {
             WorkerCommand::RefreshProvider(name) => self.with_client(|c| c.refresh_provider(&name)),
             WorkerCommand::ReloadConfig => self.with_client(Client::reload_configs),
             WorkerCommand::CloseConnections => self.with_client(Client::close_all_connections),
+            WorkerCommand::SetSubscriptionUrl(url) => self.set_subscription_url(&url),
             WorkerCommand::StartCore => self.start_core_internal(),
             WorkerCommand::StopCore => self.stop_core_internal(true),
             WorkerCommand::RestartCore => self.restart_core_api(),
@@ -222,7 +224,7 @@ impl Worker {
                 self.re_resolve_controller(&running);
                 Ok(())
             }
-            WorkerCommand::Quit { .. } => return,
+            WorkerCommand::Quit => return,
         };
 
         match result {
@@ -362,8 +364,9 @@ impl Worker {
             Some(&kernel_path),
         );
         self.home_dir = home_dir.clone();
-        self.config_file = config_file;
+        self.config_file = config_file.clone();
         let _ = std::fs::create_dir_all(&home_dir);
+        mihomo::ensure_default_config(&config_file);
 
         let args =
             discover::build_launch_args(&self.portable_root, &self.settings, Some(&kernel_path))?;
@@ -524,10 +527,25 @@ impl Worker {
         Err(timeout_msg.to_string())
     }
 
-    fn handle_quit(&mut self, stop_core: bool) {
-        if stop_core {
-            let _ = self.stop_core_internal(true);
-        }
+    fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
+        self.set_status_note(Some("Updating subscription..."));
+        let res = (|| {
+            mihomo::apply_subscription_url(&self.config_file, url)?;
+            if let Some(client) = &self.client
+                && client.probe().is_ok()
+            {
+                client.reload_configs()?;
+                client.refresh_provider("subscription")?;
+                return Ok(());
+            }
+            self.start_core_internal()
+        })();
+        self.set_status_note(None);
+        res
+    }
+
+    fn handle_quit(&mut self) {
+        let _ = self.stop_core_internal(true);
         let _ = self.proxy.send_event(AppEvent::QuitCompleted);
     }
 

@@ -10,12 +10,13 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
+use crate::config::mihomo;
 use crate::config::tray::TraySettings;
 use crate::core::worker;
 use crate::platform;
 use crate::state::{AppEvent, SharedSnapshot, Snapshot, WorkerCommand};
 use crate::tray::icon::{self, IconKey};
-use crate::tray::menu::{self, MenuAction};
+use crate::tray::menu::{self, MenuAction, MenuFingerprint};
 
 const CLICK_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -32,6 +33,8 @@ pub struct MihomoTrayApp {
     actions: Vec<MenuAction>,
     last_icon: Option<IconKey>,
     last_tooltip: String,
+    last_menu_fingerprint: Option<MenuFingerprint>,
+    pending_menu_rebuild: bool,
     last_click: Instant,
     quitting: bool,
 }
@@ -59,6 +62,8 @@ impl MihomoTrayApp {
             actions: Vec::new(),
             last_icon: None,
             last_tooltip: String::new(),
+            last_menu_fingerprint: None,
+            pending_menu_rebuild: false,
             last_click: Instant::now() - CLICK_DEBOUNCE,
             quitting: false,
         }
@@ -81,6 +86,7 @@ impl MihomoTrayApp {
             let snap = self.shared.lock().unwrap().clone();
             let built = menu::build(&snap, snap.page_size);
             self.actions = built.actions;
+            self.last_menu_fingerprint = Some(MenuFingerprint::from_snapshot(&snap));
 
             let icon_key = IconKey {
                 state: snap.operational_state(),
@@ -142,6 +148,7 @@ impl MihomoTrayApp {
 
         match action {
             MenuAction::OpenWebUi => self.open_web_ui(),
+            MenuAction::SetSubscriptionUrl => self.prompt_and_set_subscription(),
             MenuAction::OpenTrayConfig => {
                 crate::config::tray::ensure_sample_file(&self.settings_path);
                 self.open_target(&self.settings_path.display().to_string());
@@ -204,13 +211,36 @@ impl MihomoTrayApp {
             MenuAction::CloseConnections => self.send_worker(WorkerCommand::CloseConnections),
             MenuAction::RefreshNow => self.send_worker(WorkerCommand::RefreshNow),
             MenuAction::ToggleAutostart => self.send_worker(WorkerCommand::ToggleAutostart),
-            MenuAction::Quit { stop_core } => {
+            MenuAction::Quit => {
                 if !self.quitting {
                     self.quitting = true;
-                    self.send_worker(WorkerCommand::Quit { stop_core });
+                    self.send_worker(WorkerCommand::Quit);
                 }
             }
         }
+    }
+
+    fn prompt_and_set_subscription(&self) {
+        let Some(tx) = self.worker_tx.clone() else {
+            return;
+        };
+        let cfg_path = self
+            .shared
+            .lock()
+            .unwrap()
+            .resolved_config
+            .clone()
+            .unwrap_or_else(|| self.portable_root.join("config").join("config.yaml"));
+
+        std::thread::Builder::new()
+            .name("sub-prompt".to_string())
+            .spawn(move || {
+                let current = mihomo::read_subscription_url(&cfg_path);
+                if let Some(url) = platform::prompt_subscription_url(current.as_deref()) {
+                    let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
+                }
+            })
+            .ok();
     }
 
     fn apply_snapshot(&mut self, rebuild_menu: bool) {
@@ -240,10 +270,28 @@ impl MihomoTrayApp {
         }
 
         if rebuild_menu {
-            let built = menu::build(&snap, snap.page_size);
-            self.actions = built.actions;
-            tray.set_menu(Some(Box::new(built.menu)));
+            let fp = MenuFingerprint::from_snapshot(&snap);
+            if self.last_menu_fingerprint.as_ref() != Some(&fp) {
+                // Never call `set_menu` while TrackPopupMenu is displaying the live HMENU,
+                // otherwise Windows destroys the active popup menu mid-hover.
+                if platform::is_tray_menu_open() {
+                    self.pending_menu_rebuild = true;
+                } else {
+                    let built = menu::build(&snap, snap.page_size);
+                    self.actions = built.actions;
+                    tray.set_menu(Some(Box::new(built.menu)));
+                    self.last_menu_fingerprint = Some(fp);
+                    self.pending_menu_rebuild = false;
+                }
+            }
         }
+    }
+
+    fn flush_pending_menu(&mut self) {
+        if !self.pending_menu_rebuild || self.quitting || platform::is_tray_menu_open() {
+            return;
+        }
+        self.apply_snapshot(true);
     }
 
     fn open_web_ui(&self) {
@@ -303,5 +351,9 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
                 event_loop.exit();
             }
         }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.flush_pending_menu();
     }
 }

@@ -10,6 +10,7 @@ use crate::text;
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     OpenWebUi,
+    SetSubscriptionUrl,
     SetMode(String),
     ToggleSystemProxy,
     ToggleTun,
@@ -30,7 +31,50 @@ pub enum MenuAction {
     OpenUiDir,
     OpenLogFile,
     ToggleAutostart,
-    Quit { stop_core: bool },
+    Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuFingerprint {
+    status_line: String,
+    status_note: Option<String>,
+    error: Option<String>,
+    web_ui_url: Option<String>,
+    mode: ProxyMode,
+    controller_ok: bool,
+    mixed_port: u16,
+    sysproxy: bool,
+    tun: bool,
+    autostart: bool,
+    kernel_running: bool,
+    groups: Vec<Group>,
+    node_latency: Vec<(String, Option<u32>)>,
+    providers: Vec<crate::state::Provider>,
+    resolved_config: Option<std::path::PathBuf>,
+    page_size: usize,
+}
+
+impl MenuFingerprint {
+    pub fn from_snapshot(snap: &Snapshot) -> Self {
+        Self {
+            status_line: snap.status_line(),
+            status_note: snap.status_note.clone(),
+            error: snap.error().map(ToString::to_string),
+            web_ui_url: snap.web_ui_url.clone(),
+            mode: snap.proxy_mode(),
+            controller_ok: snap.controller_ok,
+            mixed_port: snap.mixed_port,
+            sysproxy: snap.sysproxy,
+            tun: snap.tun,
+            autostart: snap.autostart,
+            kernel_running: snap.kernel_running,
+            groups: snap.groups.clone(),
+            node_latency: snap.node_latency.clone(),
+            providers: snap.providers.clone(),
+            resolved_config: snap.resolved_config.clone(),
+            page_size: snap.page_size,
+        }
+    }
 }
 
 pub struct BuiltMenu {
@@ -89,13 +133,20 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
         append_root_item(&menu, &mut actions, &format!("! {short}"), false, None);
     }
 
-    // 2. WebUI action
+    // 2. WebUI & subscription onboarding actions
     append_root_item(
         &menu,
         &mut actions,
         text::MENU_OPEN_WEB_UI,
         snapshot.web_ui_url.is_some(),
         Some(MenuAction::OpenWebUi),
+    );
+    append_root_item(
+        &menu,
+        &mut actions,
+        text::MENU_SET_SUBSCRIPTION,
+        true,
+        Some(MenuAction::SetSubscriptionUrl),
     );
     let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -174,20 +225,13 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // 9. Quit actions
+    // 9. Quit (stops managed core and cleans up system proxy)
     append_root_item(
         &menu,
         &mut actions,
-        text::MENU_QUIT_AND_STOP,
+        text::MENU_QUIT,
         true,
-        Some(MenuAction::Quit { stop_core: true }),
-    );
-    append_root_item(
-        &menu,
-        &mut actions,
-        text::MENU_QUIT_ONLY,
-        true,
-        Some(MenuAction::Quit { stop_core: false }),
+        Some(MenuAction::Quit),
     );
 
     BuiltMenu { menu, actions }
@@ -491,5 +535,24 @@ mod tests {
             .filter(|a| matches!(a, MenuAction::SelectProxy { .. }))
             .count();
         assert_eq!(selected_count, 5);
+    }
+
+    #[test]
+    fn menu_fingerprint_tracks_visible_changes_only() {
+        let s1 = Snapshot {
+            controller_ok: true,
+            mode: "rule".to_string(),
+            ..Default::default()
+        };
+        let mut s2 = s1.clone();
+        assert_eq!(
+            MenuFingerprint::from_snapshot(&s1),
+            MenuFingerprint::from_snapshot(&s2)
+        );
+        s2.mode = "global".to_string();
+        assert_ne!(
+            MenuFingerprint::from_snapshot(&s1),
+            MenuFingerprint::from_snapshot(&s2)
+        );
     }
 }

@@ -15,9 +15,11 @@
   - 或者直接在 `tray.yml` 中配置 `ui.web_url`（支持 `{host}`、`{port}`、`{secret}` 占位符）；
   - 点击 `Open WebUI` 或左键单击托盘图标，直接调用系统默认浏览器打开。
 - **免安装、无服务、按需 TUN 提权**：绝不注册 Windows Service；日常以普通权限启动内核，仅在启用 TUN 模式且需要管理员权限时，通过隐藏自身 UAC 辅助进程（`--elevate-start` / `--elevate-stop`）拉起提权内核。
+- **托盘一键填订阅**：点击菜单 `Set Subscription URL...` 输入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `Proxy` / `Auto` / `Fallback` 分组），同时立即拉取节点，下载 Release 后填完订阅就能用。
+- **开箱即用 Release 便携包**：GitHub Releases 自动打包 `mihomo-tray.exe`（内嵌可执行文件图标）、最新 `mihomo-windows-amd64-v3` 内核、最新 `zashboard`（`dist-no-fonts`）、默认 `config/config.yaml` 以及 Loyalsoldier 最新 `geoip.dat` / `geosite.dat` / `Country.mmdb`。
 - **两阶段菜单刷新与纯代码双轴图标**：
-  - 托盘图标由代码实时生成 32x32 RGBA 图像：外圈代表运行状态（蓝 = TUN、橙 = 系统代理、绿 = 仅内核运行、灰 = 未运行/控制器不可达），中心点代表代理模式（浅白 = Rule、红 = Global、深灰 = Direct）；
-  - 菜单采用两阶段刷新：先即时更新状态与核心开关，再异步拉取 `/proxies` 与 `/providers/proxies`，支持节点延迟展示与快慢排序、超长分组分页（`groups.page_size`）、测速、解除固定、订阅刷新等操作。
+  - 托盘图标由代码实时生成 32x32 RGBA 图像：外圈代表运行状态（蓝 = TUN、橙 = 系统代理、绿 = 运行中、灰 = 未运行/控制器不可达），中心点代表代理模式（浅白 = Rule、红 = Global、深灰 = Direct）；
+  - 菜单采用两阶段刷新并具备菜单展开防打断保护（悬停浏览不会自动消失），支持节点延迟展示与快慢排序、超长列表分页（`groups.page_size`）、测速、解除固定、订阅刷新等操作。
 - **多份便携实例独立互斥**：单实例互斥锁基于便携目录路径哈希生成，不同目录放置多份便携版互不干扰，同一目录重复启动会弹窗提示。
 
 ---
@@ -61,13 +63,14 @@ mihomo-tray/
 
 - **状态行**：显示 `Mihomo <version>: Running (<mode>)` / `Mihomo: Stopped` / `Mihomo: Controller Unreachable` 及最近错误。
 - **Open WebUI**：用默认浏览器打开面板（左键单击托盘图标同样触发）。
+- **Set Subscription URL...**：弹窗输入并保存订阅地址到 `config/config.yaml`（默认 12 小时更新），并立即触发加载与刷新节点。
 - **模式切换**：`Rule` / `Global` / `Direct`。
 - **接管开关**：`System Proxy` / `TUN Mode`。
 - **Proxy Groups**：各策略组子菜单（支持 `Test Group Latency`、`Auto (Unpin)`、延迟排序与分页）。
 - **Core**：`Start Core` / `Stop Core`、`Restart Core`、`Force Restart / Rescan Core`、`Reload Config`、`Close All Connections`、`Refresh Status`、`Refresh Subscriptions`（列举 `HTTP` / `File` 类型 provider）。
 - **Open**：快捷打开 `tray.yml`、`config.yaml`、便携根目录、`ui/` 目录及日志文件。
 - **Start with Windows**：注册/取消开机自启（基于当前便携 exe 路径）。
-- **Quit and Stop Core / Quit Tray Only**：退出并停核（同时自动关闭已开启的系统代理）或仅退出托盘。
+- **Quit**：退出托盘，自动停止受管内核并清理系统代理。
 
 ---
 

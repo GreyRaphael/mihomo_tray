@@ -10,7 +10,9 @@ A lightweight, **100% portable** Windows 10/11 system tray controller for the [m
 - **Stop-and-Replace Core**: Stop the core from `Core -> Stop Core`, drop any updated `mihomo*.exe` into `./core/` (auto-discovered even without renaming if it is the only `mihomo*.exe`), and start again.
 - **Stop-and-Replace WebUI**: Drop any static dashboard (`zashboard`, `metacubexd`, `yacd-meta`) into `./ui/` (passed automatically as `-ext-ui`), or configure `ui.web_url` in `tray.yml`. Opens in your default browser.
 - **No Service Required**: Normal execution runs non-elevated; TUN mode triggers UAC only when needed via a hidden self-helper (`--elevate-start` / `--elevate-stop`).
-- **Two-Phase Menu + Procedural Icon**: Instant status/toggle refresh followed by async proxy group latency updates (`ureq`), with a 32x32 procedural RGBA dual-axis icon (`outer ring = state`, `center dot = mode`).
+- **One-Step Subscription Setup**: Click `Set Subscription URL...` in the tray menu to configure your subscription (auto-updates every 12 hours, wired into `Proxy` / `Auto` / `Fallback` groups and refreshed immediately).
+- **Ready-to-Use Release Bundle**: GitHub Releases bundle `mihomo-tray.exe` (with embedded icon), the latest `mihomo-windows-amd64-v3` core, `zashboard` (`dist-no-fonts`), default `config/config.yaml`, and Loyalsoldier `geoip.dat` / `geosite.dat` / `Country.mmdb`.
+- **Two-Phase Menu + Procedural Icon**: Instant status/toggle refresh followed by async proxy group latency updates (`ureq`), menu-open guards so hovering never dismisses the menu, and a 32x32 procedural RGBA dual-axis icon (`outer ring = state`, `center dot = mode`).
 
 ## Portable Layout
 

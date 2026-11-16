@@ -140,6 +140,16 @@ pub fn after_event_loop_ready() {
     imp::after_event_loop_ready();
 }
 
+/// Whether a native tray popup menu is currently open on the calling UI thread.
+pub fn is_tray_menu_open() -> bool {
+    imp::is_tray_menu_open()
+}
+
+/// Prompts the user with a simple modal text input box for a subscription URL.
+pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
+    imp::prompt_subscription_url(current)
+}
+
 /// Quotes arguments following Microsoft `CommandLineToArgvW` rules so paths with spaces,
 /// backslashes, and UNC prefixes survive `ShellExecuteExW` verbatim.
 #[cfg(any(windows, test))]

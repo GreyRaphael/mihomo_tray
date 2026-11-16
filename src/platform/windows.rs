@@ -4,8 +4,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
@@ -13,20 +15,33 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    CREATE_NO_WINDOW, GetCurrentThreadId, GetExitCodeProcess, INFINITE, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Controls::EM_SETSEL;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MessageBoxW, SW_HIDE,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUITHREADINFO,
+    GWLP_USERDATA, GetGUIThreadInfo, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowTextW, IDCANCEL, IDOK, IDYES, IsDialogMessageW, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, PostQuitMessage,
+    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const SCOOP_SHIM_MAX_BYTES: u64 = 64 * 1024;
+const EDIT_ID: usize = 101;
+static PROMPT_OPEN: AtomicBool = AtomicBool::new(false);
 
 pub fn portable_root() -> PathBuf {
     std::env::current_exe()
@@ -248,6 +263,227 @@ pub fn confirm_yes_no(title: &str, message: &str) -> bool {
 }
 
 pub fn after_event_loop_ready() {}
+
+pub fn is_tray_menu_open() -> bool {
+    unsafe {
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(GetCurrentThreadId(), &mut info) == 0 {
+            return false;
+        }
+        (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0
+    }
+}
+
+struct PromptGuard;
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        PROMPT_OPEN.store(false, Ordering::Release);
+    }
+}
+
+struct DialogState {
+    edit: HWND,
+    result: Option<String>,
+}
+
+pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
+    if PROMPT_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    let _guard = PromptGuard;
+
+    let class_name = wide("MihomoTraySubscriptionPrompt");
+    let title_w = wide("Set Subscription URL");
+    let label_w = wide("Enter subscription URL (auto-updates every 12 hours):");
+    let initial_w = wide(current.unwrap_or(""));
+    let save_w = wide("Save");
+    let cancel_w = wide("Cancel");
+    let static_cls = wide("STATIC");
+    let edit_cls = wide("EDIT");
+    let button_cls = wide("BUTTON");
+
+    unsafe {
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(prompt_wnd_proc),
+            hInstance: hinstance,
+            lpszClassName: class_name.as_ptr(),
+            hbrBackground: (windows_sys::Win32::Graphics::Gdi::COLOR_BTNFACE + 1) as _,
+            ..std::mem::zeroed()
+        };
+        RegisterClassExW(&wc);
+
+        let width = 520;
+        let height = 160;
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let x = ((screen_w - width) / 2).max(0);
+        let y = ((screen_h - height) / 2).max(0);
+
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            title_w.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            x,
+            y,
+            width,
+            height,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            UnregisterClassW(class_name.as_ptr(), hinstance);
+            return None;
+        }
+
+        let font = GetStockObject(DEFAULT_GUI_FONT) as usize;
+
+        let label = CreateWindowExW(
+            0,
+            static_cls.as_ptr(),
+            label_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            16,
+            14,
+            472,
+            20,
+            hwnd,
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        );
+        SendMessageW(label, WM_SETFONT, font, 1);
+
+        let edit = CreateWindowExW(
+            0,
+            edit_cls.as_ptr(),
+            initial_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            16,
+            40,
+            472,
+            26,
+            hwnd,
+            EDIT_ID as _,
+            hinstance,
+            std::ptr::null(),
+        );
+        SendMessageW(edit, WM_SETFONT, font, 1);
+
+        let ok_btn = CreateWindowExW(
+            0,
+            button_cls.as_ptr(),
+            save_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+            306,
+            82,
+            86,
+            28,
+            hwnd,
+            IDOK as usize as _,
+            hinstance,
+            std::ptr::null(),
+        );
+        SendMessageW(ok_btn, WM_SETFONT, font, 1);
+
+        let cancel_btn = CreateWindowExW(
+            0,
+            button_cls.as_ptr(),
+            cancel_w.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
+            402,
+            82,
+            86,
+            28,
+            hwnd,
+            IDCANCEL as usize as _,
+            hinstance,
+            std::ptr::null(),
+        );
+        SendMessageW(cancel_btn, WM_SETFONT, font, 1);
+
+        let mut state = Box::new(DialogState { edit, result: None });
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            (&mut *state as *mut DialogState) as isize,
+        );
+
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+        SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        UnregisterClassW(class_name.as_ptr(), hinstance);
+        state
+            .result
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+unsafe extern "system" fn prompt_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let cmd_id = (wparam & 0xFFFF) as i32;
+            if cmd_id == IDOK {
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState };
+                if !ptr.is_null() {
+                    let state = unsafe { &mut *ptr };
+                    let len = unsafe { GetWindowTextLengthW(state.edit) };
+                    if len > 0 {
+                        let mut buf = vec![0u16; len as usize + 1];
+                        let copied = unsafe {
+                            GetWindowTextW(state.edit, buf.as_mut_ptr(), buf.len() as i32)
+                        };
+                        if copied > 0 {
+                            state.result = Some(String::from_utf16_lossy(&buf[..copied as usize]));
+                        }
+                    }
+                }
+                unsafe { DestroyWindow(hwnd) };
+                return 0;
+            }
+            if cmd_id == IDCANCEL {
+                unsafe { DestroyWindow(hwnd) };
+                return 0;
+            }
+        }
+        WM_CLOSE => {
+            unsafe { DestroyWindow(hwnd) };
+            return 0;
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            return 0;
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)

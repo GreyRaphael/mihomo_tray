@@ -68,3 +68,11 @@ pub fn confirm_yes_no(_title: &str, _message: &str) -> bool {
 }
 
 pub fn after_event_loop_ready() {}
+
+pub fn is_tray_menu_open() -> bool {
+    false
+}
+
+pub fn prompt_subscription_url(_current: Option<&str>) -> Option<String> {
+    None
+}

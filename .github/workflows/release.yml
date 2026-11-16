@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 推送以 v 开头的 tag 时触发，例如 v0.1.0
+
+permissions:
+  contents: write # 创建 Release 与上传产物需要写权限
+
+jobs:
+  release:
+    name: Build & Publish (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build release
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package & prepare release notes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\mihomo-tray.exe dist\mihomo-tray.exe
+          Copy-Item assets\tray.sample.yml dist\tray.yml
+          Copy-Item README.md dist\README.md
+          Copy-Item README_zh.md dist\README_zh.md
+          Copy-Item LICENSE dist\LICENSE
+          Compress-Archive -Path dist\* -DestinationPath mihomo-tray-windows-amd64.zip -Force
+          $body = (Get-Content -Raw -Encoding utf8 .github/release-body.md).Replace('{{TAG}}', $env:GITHUB_REF_NAME)
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: mihomo-tray ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: mihomo-tray-windows-amd64.zip
+          prerelease: ${{ contains(github.ref_name, '-') }}

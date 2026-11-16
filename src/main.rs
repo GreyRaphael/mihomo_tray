@@ -11,6 +11,7 @@ mod tray;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use single_instance::SingleInstance;
 use tray_icon::TrayIconEvent;
@@ -33,21 +34,19 @@ fn main() {
     let portable_root = platform::portable_root();
     let log_path = init_logging(&portable_root);
 
-    let instance_key = single_instance_key(&portable_root);
-    let instance = match SingleInstance::new(&instance_key) {
-        Ok(inst) => inst,
-        Err(err) => {
-            platform::notify_error(
-                text::APP_NAME,
-                &format!("Single-instance check failed: {err}"),
-            );
-            std::process::exit(1);
+    let after_restart_pid = parse_after_restart_pid();
+    if let Some(old_pid) = after_restart_pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process::is_pid_alive(old_pid) {
+            std::thread::sleep(Duration::from_millis(50));
         }
-    };
-    if !instance.is_single() {
-        platform::notify_error(text::APP_NAME, text::ERR_ALREADY_RUNNING);
-        return;
     }
+
+    let instance_key = single_instance_key(&portable_root);
+    let instance = acquire_single_instance(&instance_key, after_restart_pid.is_some());
+    let Some(instance) = instance else {
+        return;
+    };
 
     let settings_path = tray_cfg::settings_path(&portable_root);
     tray_cfg::ensure_sample_file(&settings_path);
@@ -92,7 +91,58 @@ fn main() {
     if let Err(err) = event_loop.run_app(&mut app) {
         tracing::error!("Event loop terminated with error: {err}");
     }
+    let should_restart = app.should_restart();
     drop(instance);
+    if should_restart {
+        let args = vec![
+            platform::AFTER_RESTART_FLAG.to_string(),
+            std::process::id().to_string(),
+        ];
+        if let Err(err) = platform::spawn_detached_self(&args) {
+            platform::notify_error(text::APP_NAME, &err);
+        }
+    }
+}
+
+fn parse_after_restart_pid() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(platform::AFTER_RESTART_FLAG) {
+        return args.get(2).and_then(|s| s.parse::<u32>().ok());
+    }
+    None
+}
+
+fn acquire_single_instance(
+    instance_key: &str,
+    retry_after_restart: bool,
+) -> Option<SingleInstance> {
+    let deadline = if retry_after_restart {
+        Instant::now() + Duration::from_secs(3)
+    } else {
+        Instant::now()
+    };
+
+    loop {
+        match SingleInstance::new(instance_key) {
+            Ok(inst) if inst.is_single() => return Some(inst),
+            Ok(inst) => {
+                drop(inst);
+                if Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                platform::notify_error(text::APP_NAME, text::ERR_ALREADY_RUNNING);
+                return None;
+            }
+            Err(err) => {
+                platform::notify_error(
+                    text::APP_NAME,
+                    &format!("Single-instance check failed: {err}"),
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 fn init_logging(portable_root: &Path) -> PathBuf {

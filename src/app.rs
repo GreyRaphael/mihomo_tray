@@ -37,6 +37,7 @@ pub struct MihomoTrayApp {
     pending_menu_rebuild: bool,
     last_click: Instant,
     quitting: bool,
+    restart_on_exit: bool,
 }
 
 impl MihomoTrayApp {
@@ -66,7 +67,12 @@ impl MihomoTrayApp {
             pending_menu_rebuild: false,
             last_click: Instant::now() - CLICK_DEBOUNCE,
             quitting: false,
+            restart_on_exit: false,
         }
+    }
+
+    pub fn should_restart(&self) -> bool {
+        self.restart_on_exit
     }
 
     fn init_tray_and_worker(&mut self) {
@@ -200,24 +206,96 @@ impl MihomoTrayApp {
             MenuAction::TestGroupLatency(group) => {
                 self.send_worker(WorkerCommand::TestGroupLatency(group));
             }
-            MenuAction::RefreshProvider(name) => {
-                self.send_worker(WorkerCommand::RefreshProvider(name));
+            MenuAction::RefreshSubscription => {
+                self.send_worker(WorkerCommand::RefreshSubscriptions);
             }
-            MenuAction::StartCore => self.send_worker(WorkerCommand::StartCore),
-            MenuAction::StopCore => self.send_worker(WorkerCommand::StopCore),
+            MenuAction::CopyEnvVars => self.copy_env_vars(),
             MenuAction::RestartCore => self.send_worker(WorkerCommand::RestartCore),
-            MenuAction::ForceRestartCore => self.send_worker(WorkerCommand::ForceRestartCore),
-            MenuAction::ReloadConfig => self.send_worker(WorkerCommand::ReloadConfig),
-            MenuAction::CloseConnections => self.send_worker(WorkerCommand::CloseConnections),
-            MenuAction::RefreshNow => self.send_worker(WorkerCommand::RefreshNow),
+            MenuAction::RestartApp => {
+                if !self.quitting {
+                    self.quitting = true;
+                    self.restart_on_exit = true;
+                    self.send_worker(WorkerCommand::Quit);
+                }
+            }
             MenuAction::ToggleAutostart => self.send_worker(WorkerCommand::ToggleAutostart),
+            MenuAction::ShowVersion => self.show_version_dialog(),
             MenuAction::Quit => {
                 if !self.quitting {
                     self.quitting = true;
+                    self.restart_on_exit = false;
                     self.send_worker(WorkerCommand::Quit);
                 }
             }
         }
+    }
+
+    fn copy_env_vars(&self) {
+        let port = {
+            let snap = self.shared.lock().unwrap();
+            if snap.mixed_port > 0 {
+                snap.mixed_port
+            } else if let Some(cfg_path) = &snap.resolved_config {
+                mihomo::read_file(cfg_path)
+                    .map(|info| info.mixed_port)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        };
+        if port == 0 {
+            let mut snap = self.shared.lock().unwrap();
+            snap.action_error =
+                Some("No mixed-port/port found in running core or config.yaml.".to_string());
+            drop(snap);
+            let _ = self
+                .proxy
+                .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+            return;
+        }
+
+        let cmd = platform::format_env_vars_command(port);
+        match platform::copy_to_clipboard(&cmd) {
+            Ok(()) => {
+                tracing::info!("Copied proxy environment variables for port {port}");
+            }
+            Err(err) => {
+                let mut snap = self.shared.lock().unwrap();
+                snap.action_error = Some(err);
+                drop(snap);
+                let _ = self
+                    .proxy
+                    .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+            }
+        }
+    }
+
+    fn show_version_dialog(&self) {
+        let (core_ver, cfg_path) = {
+            let snap = self.shared.lock().unwrap();
+            (snap.version.clone(), snap.resolved_config.clone())
+        };
+        let portable = self.portable_root.clone();
+        std::thread::Builder::new()
+            .name("version-dialog".to_string())
+            .spawn(move || {
+                let core_line = if core_ver.is_empty() {
+                    "not running".to_string()
+                } else {
+                    core_ver
+                };
+                let cfg_line = cfg_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let msg = format!(
+                    "{app} v{ver}\nMihomo Core: {core_line}\nPortable Folder: {portable}\nConfig File: {cfg_line}",
+                    app = crate::text::APP_NAME,
+                    ver = crate::text::APP_VERSION,
+                    portable = portable.display(),
+                );
+                platform::notify_info("Version", &msg);
+            })
+            .ok();
     }
 
     fn prompt_and_set_subscription(&self) {

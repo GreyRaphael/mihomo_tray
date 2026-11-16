@@ -1,12 +1,14 @@
 //! Static English UI labels, status strings, and formatted error messages.
 
 pub const APP_NAME: &str = "mihomo-tray";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TRAY_FILE_NAME: &str = "tray.yml";
 pub const MIHOMO_CONFIG_NAME: &str = "config.yaml";
 pub const RUNTIME_LOCK_NAME: &str = ".runtime.json";
+pub const STATE_FILE_NAME: &str = ".tray-state.json";
 
 pub const MENU_OPEN_WEB_UI: &str = "Open WebUI";
-pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription URL...";
+pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription URL";
 pub const MENU_MODE_RULE: &str = "Rule";
 pub const MENU_MODE_GLOBAL: &str = "Global";
 pub const MENU_MODE_DIRECT: &str = "Direct";
@@ -15,21 +17,17 @@ pub const MENU_TUN_MODE: &str = "TUN Mode";
 pub const MENU_PROXY_GROUPS: &str = "Proxy Groups";
 pub const MENU_TEST_LATENCY: &str = "Test Group Latency";
 pub const MENU_AUTO_UNPIN: &str = "Auto (Unpin)";
-pub const MENU_CORE: &str = "Core";
-pub const MENU_CORE_START: &str = "Start Core";
-pub const MENU_CORE_STOP: &str = "Stop Core";
-pub const MENU_CORE_RESTART: &str = "Restart Core";
-pub const MENU_CORE_FORCE_RESTART: &str = "Force Restart / Rescan Core";
-pub const MENU_CORE_RELOAD_CONFIG: &str = "Reload Config";
-pub const MENU_CORE_CLOSE_CONNECTIONS: &str = "Close All Connections";
-pub const MENU_REFRESH_STATE: &str = "Refresh Status";
-pub const MENU_REFRESH_SUBSCRIPTIONS: &str = "Refresh Subscriptions";
 pub const MENU_OPEN: &str = "Open";
 pub const MENU_OPEN_TRAY_CONFIG: &str = "Open tray.yml";
 pub const MENU_OPEN_MIHOMO_CONFIG: &str = "Open config.yaml";
 pub const MENU_OPEN_PORTABLE_DIR: &str = "Open Portable Folder";
 pub const MENU_OPEN_UI_DIR: &str = "Open WebUI Folder (ui/)";
 pub const MENU_OPEN_LOG_FILE: &str = "Open Log File";
+pub const MENU_MORE: &str = "More";
+pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
+pub const MENU_REFRESH_SUBSCRIPTION: &str = "Refresh Subscription";
+pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
+pub const MENU_RESTART_APP: &str = "Restart Application";
 pub const MENU_AUTOSTART: &str = "Start with Windows";
 pub const MENU_QUIT: &str = "Quit";
 
@@ -38,6 +36,7 @@ pub const STATUS_WAITING_CONTROLLER: &str = "Waiting for mihomo controller...";
 pub const STATUS_RESTARTING_CORE: &str = "Restarting mihomo core...";
 pub const STATUS_ELEVATING_CORE: &str = "Waiting for elevation prompt...";
 pub const STATUS_STOPPING_CORE: &str = "Stopping mihomo core...";
+pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
 
 pub const ERR_ALREADY_RUNNING: &str = "mihomo-tray is already running for this portable folder.\nCheck the system tray overflow area if the icon is hidden.";
 pub const ERR_CORE_NOT_FOUND: &str = "No mihomo binary found beside mihomo-tray, in ./core, ./bin, or on PATH. Place mihomo.exe in ./core or set mihomo.path in tray.yml.";
@@ -86,26 +85,10 @@ pub fn format_node_label(name: &str, delay: Option<u32>) -> String {
     }
 }
 
-pub fn format_provider_label(name: &str, age_text: &str) -> String {
-    format!("{name} ({age_text})")
-}
-
 pub fn format_page_label(start: usize, end: usize) -> String {
     format!("{start}-{end}")
 }
 
-pub fn format_relative_age(updated_at_secs: Option<i64>, now_secs: i64) -> String {
-    let Some(ts) = updated_at_secs else {
-        return "never updated".to_string();
-    };
-    let delta = now_secs.saturating_sub(ts);
-    if delta < 60 {
-        "just now".to_string()
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86_400 {
-        format!("{}h ago", delta / 3600)
-    } else {
-        format!("{}d ago", delta / 86_400)
-    }
+pub fn format_version_label(version: &str) -> String {
+    format!("Version: v{version}")
 }

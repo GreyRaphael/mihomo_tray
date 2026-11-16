@@ -9,13 +9,14 @@
 ## 核心特性
 
 - **完全绿色便携**：所有配置文件（`tray.yml`、`config.yaml`）、内核缓存与 GeoData（`-d`）、运行日志（`./logs/mihomo-tray.log`）和本地 WebUI 均收敛在可执行文件所在目录；`tray.yml` 内支持直接填写相对路径，整个文件夹打包拷贝或移动盘符即可使用，不往 `%APPDATA%` 写脏数据。
-- **停机随意替换内核**：点击托盘菜单 `Core -> Stop Core` 即可停止内核并解除文件占用；将新版或改名后的 `mihomo*.exe` 放入 `./core/`（只要目录下只有一个 `mihomo*.exe`，甚至无需改名即可自动识别），点击 `Start Core` 即可启动新内核。
+- **停机随意替换内核**：点击托盘菜单 `Quit` 退出托盘（自动停止受管内核并解除文件占用）；将新版或改名后的 `mihomo*.exe` 放入 `./core/`（只要目录下只有一个 `mihomo*.exe`，甚至无需改名即可自动识别），重新打开即可启动新内核，也可随时点击 `More -> Restart Mihomo Core` 重启内核。
 - **停机随意替换 WebUI**：不内置、不离线托管固定前端，零重编译更换面板：
   - 将任意静态面板（如 `zashboard`、`metacubexd`、`yacd-meta`）解压放入 `./ui/`，启动内核时检测到 `./ui/index.html` 且配置未显式指定时会自动传入 `-ext-ui`；
   - 或者直接在 `tray.yml` 中配置 `ui.web_url`（支持 `{host}`、`{port}`、`{secret}` 占位符）；
   - 点击 `Open WebUI` 或左键单击托盘图标，直接调用系统默认浏览器打开。
 - **免安装、无服务、按需 TUN 提权**：绝不注册 Windows Service；日常以普通权限启动内核，仅在启用 TUN 模式且需要管理员权限时，通过隐藏自身 UAC 辅助进程（`--elevate-start` / `--elevate-stop`）拉起提权内核。
-- **托盘一键填订阅**：点击菜单 `Set Subscription URL...` 输入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `Proxy` / `Auto` / `Fallback` 分组），同时立即拉取节点，下载 Release 后填完订阅就能用。
+- **托盘一键填订阅**：点击菜单 `Set Subscription URL` 打开带应用图标且自动居中适配 DPI 的输入框，填入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `Proxy` / `Auto` / `Fallback` 分组），同时立即拉取节点。
+- **跨重启状态持久化**：在 `./config/.tray-state.json` 中记住退出前的 **`System Proxy`、代理模式、TUN 模式**状态；退出时清理系统代理避免断网，下次启动或点击 `More -> Restart Application` 后自动恢复。
 - **开箱即用 Release 便携包**：GitHub Releases 自动打包 `mihomo-tray.exe`（内嵌可执行文件图标）、最新 `mihomo-windows-amd64-v3` 内核、最新 `zashboard`（`dist-no-fonts`）、默认 `config/config.yaml` 以及 Loyalsoldier 最新 `geoip.dat` / `geosite.dat` / `Country.mmdb`。
 - **两阶段菜单刷新与纯代码双轴图标**：
   - 托盘图标由代码实时生成 32x32 RGBA 图像：外圈代表运行状态（蓝 = TUN、橙 = 系统代理、绿 = 运行中、灰 = 未运行/控制器不可达），中心点代表代理模式（浅白 = Rule、红 = Global、深灰 = Direct）；
@@ -35,6 +36,7 @@ mihomo-tray/
 ├── config/
 │   ├── config.yaml          # mihomo 主配置文件（-f）
 │   ├── cache.db / GeoSite   # mihomo 运行目录（-d 默认锁定在 ./config）
+│   ├── .tray-state.json     # 记住上次退出前的 System Proxy / 模式 / TUN 状态
 │   └── .runtime.json        # 托管内核运行期间的临时 PID 记录（退出自动清理）
 ├── ui/                      # 可选：自行放入的静态 WebUI（如 zashboard/dist）
 │   └── index.html
@@ -63,14 +65,19 @@ mihomo-tray/
 
 - **状态行**：显示 `Mihomo <version>: Running (<mode>)` / `Mihomo: Stopped` / `Mihomo: Controller Unreachable` 及最近错误。
 - **Open WebUI**：用默认浏览器打开面板（左键单击托盘图标同样触发）。
-- **Set Subscription URL...**：弹窗输入并保存订阅地址到 `config/config.yaml`（默认 12 小时更新），并立即触发加载与刷新节点。
+- **Set Subscription URL**：居中适配 DPI 的弹窗输入并保存订阅地址到 `config/config.yaml`（默认 12 小时更新），并立即触发加载与刷新节点。
 - **模式切换**：`Rule` / `Global` / `Direct`。
-- **接管开关**：`System Proxy` / `TUN Mode`。
+- **接管开关**：`System Proxy` / `TUN Mode`（状态跨重启记忆）。
 - **Proxy Groups**：各策略组子菜单（支持 `Test Group Latency`、`Auto (Unpin)`、延迟排序与分页）。
-- **Core**：`Start Core` / `Stop Core`、`Restart Core`、`Force Restart / Rescan Core`、`Reload Config`、`Close All Connections`、`Refresh Status`、`Refresh Subscriptions`（列举 `HTTP` / `File` 类型 provider）。
 - **Open**：快捷打开 `tray.yml`、`config.yaml`、便携根目录、`ui/` 目录及日志文件。
-- **Start with Windows**：注册/取消开机自启（基于当前便携 exe 路径）。
-- **Quit**：退出托盘，自动停止受管内核并清理系统代理。
+- **More**：
+  - `Copy Environment Variables`：复制终端代理环境变量命令到剪贴板；
+  - `Refresh Subscription`：立即刷新订阅/代理提供者；
+  - `Restart Mihomo Core`：重新扫描并重启 mihomo 内核；
+  - `Restart Application`：重启 `mihomo-tray` 应用（无单实例冲突并自动恢复运行状态）；
+  - `Start with Windows`：注册/取消开机自启（基于当前便携 exe 路径）；
+  - `Version: v...`：显示应用与核心版本信息弹窗。
+- **Quit**：保存运行状态、停止受管内核、清理系统代理并退出托盘。
 
 ---
 

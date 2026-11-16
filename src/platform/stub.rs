@@ -63,8 +63,22 @@ pub fn notify_error(title: &str, message: &str) {
     tracing::error!("{title}: {message}");
 }
 
+pub fn notify_info(title: &str, message: &str) {
+    tracing::info!("{title}: {message}");
+}
+
 pub fn confirm_yes_no(_title: &str, _message: &str) -> bool {
     false
+}
+
+pub fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+    Err("clipboard copy is not yet implemented for this OS".to_string())
+}
+
+pub fn format_env_vars_command(port: u16) -> String {
+    format!(
+        "export http_proxy=http://127.0.0.1:{port} https_proxy=http://127.0.0.1:{port} all_proxy=socks5://127.0.0.1:{port}"
+    )
 }
 
 pub fn after_event_loop_ready() {}

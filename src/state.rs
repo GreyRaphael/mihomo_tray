@@ -166,16 +166,10 @@ pub enum WorkerCommand {
     SelectProxy { group: String, member: String },
     UnfixGroup(String),
     TestGroupLatency(String),
-    RefreshProvider(String),
-    ReloadConfig,
-    CloseConnections,
+    RefreshSubscriptions,
     SetSubscriptionUrl(String),
-    StartCore,
-    StopCore,
     RestartCore,
-    ForceRestartCore,
     ToggleAutostart,
-    RefreshNow,
     Quit,
 }
 

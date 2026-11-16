@@ -199,24 +199,6 @@ impl Client {
         Ok(())
     }
 
-    fn post_empty(&self, path: &str, timeout_ms: u64) -> Result<(), String> {
-        let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(timeout_ms);
-        let mut req = agent.post(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req
-            .send_empty()
-            .map_err(|e| format!("POST {path} failed: {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("POST {path} returned HTTP {status}: {body}"));
-        }
-        Ok(())
-    }
-
     fn delete(&self, path: &str) -> Result<(), String> {
         let url = format!("{}{path}", self.base_url());
         let agent = self.agent(self.timeout_ms as u64);
@@ -286,14 +268,6 @@ impl Client {
 
     pub fn reload_configs(&self) -> Result<(), String> {
         self.put_json("/configs?force=true", &json!({}), self.timeout_ms as u64)
-    }
-
-    pub fn restart(&self) -> Result<(), String> {
-        self.post_empty("/restart", self.timeout_ms as u64)
-    }
-
-    pub fn close_all_connections(&self) -> Result<(), String> {
-        self.delete("/connections")
     }
 
     pub fn select_proxy(&self, group: &str, member: &str) -> Result<(), String> {

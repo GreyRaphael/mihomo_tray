@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::mihomo;
+use crate::config::state_store::{self, PersistedState};
 use crate::config::tray::{self, TraySettings};
-use crate::core::api::Client;
+use crate::core::api::{Client, CoreConfigs};
 use crate::core::discover;
 use crate::core::process::{self, ManagedChild, RunningProcess, RuntimeRecord};
 use crate::platform;
-use crate::state::{AppEvent, Group, SharedSnapshot, WorkerCommand};
+use crate::state::{AppEvent, Group, Provider, SharedSnapshot, WorkerCommand};
 use crate::text;
 
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
@@ -59,6 +60,9 @@ struct Worker {
     cached_version: String,
     home_dir: PathBuf,
     config_file: PathBuf,
+    persisted_state: PersistedState,
+    has_persisted_state: bool,
+    pending_restore: Option<PersistedState>,
 }
 
 impl Worker {
@@ -93,6 +97,9 @@ impl Worker {
             cached_version: String::new(),
             home_dir,
             config_file,
+            persisted_state: PersistedState::default(),
+            has_persisted_state: false,
+            pending_restore: None,
         }
     }
 
@@ -127,6 +134,7 @@ impl Worker {
 
     fn startup(&mut self) {
         self.reload_paths_and_runtime();
+        self.load_initial_persisted_state();
         let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         self.re_resolve_controller(&running);
 
@@ -134,9 +142,28 @@ impl Worker {
 
         if !controller_alive && running.is_empty() && self.settings.mihomo.auto_start {
             let _ = self.start_core_internal();
-        } else {
-            self.refresh(true);
         }
+        self.refresh(true);
+    }
+
+    fn load_initial_persisted_state(&mut self) {
+        match state_store::load(&self.home_dir) {
+            Some(st) => {
+                self.has_persisted_state = true;
+                self.pending_restore = Some(st.clone());
+                self.persisted_state = st;
+            }
+            None => {
+                self.has_persisted_state = false;
+                self.pending_restore = None;
+                self.persisted_state = PersistedState::default();
+            }
+        }
+    }
+
+    fn save_persisted_state(&mut self) {
+        self.has_persisted_state = true;
+        state_store::save(&self.home_dir, &self.persisted_state);
     }
 
     fn reload_paths_and_runtime(&mut self) {
@@ -196,7 +223,7 @@ impl Worker {
 
     fn handle_command(&mut self, cmd: WorkerCommand) {
         let result: Result<(), String> = match cmd {
-            WorkerCommand::SetMode(mode) => self.with_client(|c| c.set_mode(&mode)),
+            WorkerCommand::SetMode(mode) => self.set_mode(&mode),
             WorkerCommand::ToggleSystemProxy => self.toggle_system_proxy(),
             WorkerCommand::ToggleTun => self.toggle_tun(),
             WorkerCommand::SelectProxy { group, member } => {
@@ -206,23 +233,12 @@ impl Worker {
             WorkerCommand::TestGroupLatency(group) => {
                 self.with_client(|c| c.test_group_delay(&group))
             }
-            WorkerCommand::RefreshProvider(name) => self.with_client(|c| c.refresh_provider(&name)),
-            WorkerCommand::ReloadConfig => self.with_client(Client::reload_configs),
-            WorkerCommand::CloseConnections => self.with_client(Client::close_all_connections),
+            WorkerCommand::RefreshSubscriptions => self.refresh_subscriptions(),
             WorkerCommand::SetSubscriptionUrl(url) => self.set_subscription_url(&url),
-            WorkerCommand::StartCore => self.start_core_internal(),
-            WorkerCommand::StopCore => self.stop_core_internal(true),
-            WorkerCommand::RestartCore => self.restart_core_api(),
-            WorkerCommand::ForceRestartCore => self.force_restart_core(),
+            WorkerCommand::RestartCore => self.force_restart_core(),
             WorkerCommand::ToggleAutostart => {
                 let enabled = platform::autostart_is_enabled();
                 platform::autostart_set(!enabled)
-            }
-            WorkerCommand::RefreshNow => {
-                self.reload_paths_and_runtime();
-                let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
-                self.re_resolve_controller(&running);
-                Ok(())
             }
             WorkerCommand::Quit => return,
         };
@@ -232,6 +248,13 @@ impl Worker {
             Err(err) => self.set_action_error(Some(err)),
         }
         self.refresh(true);
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<(), String> {
+        self.with_client(|c| c.set_mode(mode))?;
+        self.persisted_state.mode = Some(mode.to_string());
+        self.save_persisted_state();
+        Ok(())
     }
 
     fn with_client<F>(&self, f: F) -> Result<(), String>
@@ -245,9 +268,12 @@ impl Worker {
         f(client)
     }
 
-    fn toggle_system_proxy(&self) -> Result<(), String> {
+    fn toggle_system_proxy(&mut self) -> Result<(), String> {
         if platform::proxy_is_enabled() {
-            return platform::proxy_disable();
+            platform::proxy_disable()?;
+            self.persisted_state.system_proxy = false;
+            self.save_persisted_state();
+            return Ok(());
         }
         let client = self
             .client
@@ -260,7 +286,10 @@ impl Worker {
                     .to_string(),
             );
         }
-        platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)
+        platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)?;
+        self.persisted_state.system_proxy = true;
+        self.save_persisted_state();
+        Ok(())
     }
 
     fn toggle_tun(&mut self) -> Result<(), String> {
@@ -270,10 +299,21 @@ impl Worker {
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
         let current = client.get_configs()?;
         let want_enable = !current.tun_enable;
+        self.apply_tun_state(want_enable)?;
+        self.persisted_state.tun = Some(want_enable);
+        self.save_persisted_state();
+        Ok(())
+    }
+
+    fn apply_tun_state(&mut self, want_enable: bool) -> Result<bool, String> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
         client.set_tun(want_enable)?;
         let after = client.get_configs()?;
         if !want_enable || after.tun_enable {
-            return Ok(());
+            return Ok(after.tun_enable);
         }
 
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
@@ -328,7 +368,7 @@ impl Worker {
         if !verify.tun_enable {
             return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
         }
-        Ok(())
+        Ok(true)
     }
 
     fn with_client_read_configs(&self) -> Result<crate::core::api::CoreConfigs, String> {
@@ -405,30 +445,16 @@ impl Worker {
         Ok(())
     }
 
-    fn restart_core_api(&mut self) -> Result<(), String> {
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
-        client.restart()?;
-        self.managed = None;
-        self.recorded_pid = None;
-        self.cached_version.clear();
-        process::clear_runtime_record(&self.home_dir);
-
-        let res = self.wait_for_controller(KERNEL_RESTART_BUDGET, text::ERR_CORE_RESTART_TIMEOUT);
-        self.set_status_note(None);
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
-        self.re_resolve_controller(&running);
-        res
-    }
-
     fn force_restart_core(&mut self) -> Result<(), String> {
+        let saved = self.capture_live_or_persisted_state();
+        self.pending_restore = Some(saved);
         self.reload_paths_and_runtime();
         let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         if !running.is_empty() {
-            self.stop_active_kernel(true)?;
+            self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
+            let stop_res = self.stop_active_kernel(true);
+            self.set_status_note(None);
+            stop_res?;
         }
         self.start_core_internal()
     }
@@ -527,6 +553,34 @@ impl Worker {
         Err(timeout_msg.to_string())
     }
 
+    fn refresh_subscriptions(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
+        self.set_status_note(Some(text::STATUS_REFRESHING_SUBSCRIPTION));
+        let res = (|| {
+            let providers = client.get_providers()?.providers;
+            let refreshable: Vec<String> = providers
+                .into_iter()
+                .filter(Provider::refreshable)
+                .map(|p| p.name)
+                .collect();
+            if refreshable.is_empty() {
+                return Err(
+                    "No subscription provider configured. Use Set Subscription URL first."
+                        .to_string(),
+                );
+            }
+            for name in refreshable {
+                client.refresh_provider(&name)?;
+            }
+            Ok(())
+        })();
+        self.set_status_note(None);
+        res
+    }
+
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
         self.set_status_note(Some("Updating subscription..."));
         let res = (|| {
@@ -544,7 +598,73 @@ impl Worker {
         res
     }
 
+    fn capture_live_or_persisted_state(&self) -> PersistedState {
+        if let Some(pending) = &self.pending_restore {
+            return pending.clone();
+        }
+        let snap = self.shared.lock().unwrap();
+        if snap.controller_ok {
+            PersistedState {
+                system_proxy: platform::proxy_is_enabled(),
+                mode: (!snap.mode.is_empty()).then(|| snap.mode.clone()),
+                tun: Some(snap.tun),
+            }
+        } else {
+            PersistedState {
+                system_proxy: self.persisted_state.system_proxy || platform::proxy_is_enabled(),
+                mode: self.persisted_state.mode.clone(),
+                tun: self.persisted_state.tun,
+            }
+        }
+    }
+
+    fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) {
+        let Some(restore) = self.pending_restore.take() else {
+            return;
+        };
+
+        if let Some(want_tun) = restore.tun
+            && want_tun != cfg.tun_enable
+        {
+            match self.apply_tun_state(want_tun) {
+                Ok(actual) => {
+                    if let Some(client) = &self.client
+                        && let Ok(updated) = client.get_configs()
+                    {
+                        *cfg = updated;
+                    } else {
+                        cfg.tun_enable = actual;
+                    }
+                }
+                Err(err) => {
+                    self.persisted_state.tun = Some(false);
+                    self.save_persisted_state();
+                    self.set_action_error(Some(err));
+                }
+            }
+        }
+
+        if let Some(ref mode) = restore.mode
+            && !mode.is_empty()
+            && !cfg.mode.eq_ignore_ascii_case(mode)
+            && let Some(client) = &self.client
+            && client.set_mode(mode).is_ok()
+        {
+            cfg.mode = mode.clone();
+        }
+
+        if restore.system_proxy
+            && cfg.mixed_port > 0
+            && let Err(err) = platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)
+        {
+            self.set_action_error(Some(err));
+        }
+    }
+
     fn handle_quit(&mut self) {
+        let final_state = self.capture_live_or_persisted_state();
+        self.persisted_state = final_state;
+        self.save_persisted_state();
         let _ = self.stop_core_internal(true);
         let _ = self.proxy.send_event(AppEvent::QuitCompleted);
     }
@@ -591,9 +711,6 @@ impl Worker {
             self.re_resolve_controller(&running);
         }
 
-        let sysproxy = platform::proxy_is_enabled();
-        let autostart = platform::autostart_is_enabled();
-
         let client_opt = self.client.clone();
         let mut controller_ok = false;
         let mut mode = String::new();
@@ -605,7 +722,8 @@ impl Worker {
         if let Some(client) = &client_opt {
             web_ui_url = Some(client.format_web_ui_url(&self.settings.ui.web_url));
             match client.get_configs() {
-                Ok(cfg) => {
+                Ok(mut cfg) => {
+                    self.apply_pending_restore_if_needed(&mut cfg);
                     controller_ok = true;
                     mode = cfg.mode;
                     mixed_port = cfg.mixed_port;
@@ -622,6 +740,21 @@ impl Worker {
             }
         } else {
             controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
+        }
+
+        let sysproxy = platform::proxy_is_enabled();
+        let autostart = platform::autostart_is_enabled();
+
+        if controller_ok && self.pending_restore.is_none() {
+            let live = PersistedState {
+                system_proxy: sysproxy,
+                mode: (!mode.is_empty()).then(|| mode.clone()),
+                tun: Some(tun),
+            };
+            if !self.has_persisted_state || live != self.persisted_state {
+                self.persisted_state = live;
+                self.save_persisted_state();
+            }
         }
 
         // Phase 1 snapshot: immediate state + controls update.

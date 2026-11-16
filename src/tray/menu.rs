@@ -1,7 +1,5 @@
 //! Cross-platform native tray menu builder built on `tray_icon::menu` (`muda 0.21`).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::state::{Group, ProxyMode, Snapshot};
@@ -17,20 +15,17 @@ pub enum MenuAction {
     SelectProxy { group: String, member: String },
     UnfixGroup(String),
     TestGroupLatency(String),
-    RefreshProvider(String),
-    StartCore,
-    StopCore,
-    RestartCore,
-    ForceRestartCore,
-    ReloadConfig,
-    CloseConnections,
-    RefreshNow,
     OpenTrayConfig,
     OpenMihomoConfig,
     OpenPortableDir,
     OpenUiDir,
     OpenLogFile,
+    CopyEnvVars,
+    RefreshSubscription,
+    RestartCore,
+    RestartApp,
     ToggleAutostart,
+    ShowVersion,
     Quit,
 }
 
@@ -46,10 +41,8 @@ pub struct MenuFingerprint {
     sysproxy: bool,
     tun: bool,
     autostart: bool,
-    kernel_running: bool,
     groups: Vec<Group>,
     node_latency: Vec<(String, Option<u32>)>,
-    providers: Vec<crate::state::Provider>,
     resolved_config: Option<std::path::PathBuf>,
     page_size: usize,
 }
@@ -67,10 +60,8 @@ impl MenuFingerprint {
             sysproxy: snap.sysproxy,
             tun: snap.tun,
             autostart: snap.autostart,
-            kernel_running: snap.kernel_running,
             groups: snap.groups.clone(),
             node_latency: snap.node_latency.clone(),
-            providers: snap.providers.clone(),
             resolved_config: snap.resolved_config.clone(),
             page_size: snap.page_size,
         }
@@ -124,7 +115,7 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
     let mut actions = Vec::new();
     let menu = Menu::new();
 
-    // 1. Status + optional error line (disabled informational rows)
+    // 1. Mihomo status + optional status note / error line
     append_root_item(&menu, &mut actions, &snapshot.status_line(), false, None);
     if let Some(note) = &snapshot.status_note {
         append_root_item(&menu, &mut actions, note, false, None);
@@ -133,7 +124,7 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
         append_root_item(&menu, &mut actions, &format!("! {short}"), false, None);
     }
 
-    // 2. WebUI & subscription onboarding actions
+    // 2. WebUI & subscription onboarding
     append_root_item(
         &menu,
         &mut actions,
@@ -150,7 +141,7 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
     );
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // 3. Proxy mode selection
+    // 3. Proxy routing modes
     let active_mode = snapshot.proxy_mode();
     let mode_enabled = snapshot.controller_ok;
     for (label, mode_variant) in [
@@ -167,7 +158,6 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
             MenuAction::SetMode(mode_variant.as_api_str().to_string()),
         );
     }
-
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     // 4. System Proxy & TUN toggles
@@ -189,43 +179,28 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
         snapshot.tun,
         MenuAction::ToggleTun,
     );
+    let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // 5. Proxy groups submenu
+    // 5. Proxy Groups submenu (only shown when groups exist)
     if snapshot.controller_ok && !snapshot.groups.is_empty() {
-        let _ = menu.append(&PredefinedMenuItem::separator());
         let groups_sub = Submenu::new(text::MENU_PROXY_GROUPS, true);
         for group in &snapshot.groups {
             let sub = build_group_submenu(group, snapshot, page_size, &mut actions);
             let _ = groups_sub.append(&sub);
         }
         let _ = menu.append(&groups_sub);
+        let _ = menu.append(&PredefinedMenuItem::separator());
     }
 
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // 6. Core control submenu (supports stop-and-replace workflow)
-    let core_sub = Submenu::new(text::MENU_CORE, true);
-    append_core_items(&core_sub, snapshot, &mut actions);
-    let _ = menu.append(&core_sub);
-
-    // 7. Open portable files/folders submenu
+    // 6. Open & More submenus + Quit
     let open_sub = Submenu::new(text::MENU_OPEN, true);
     append_open_items(&open_sub, snapshot, &mut actions);
     let _ = menu.append(&open_sub);
 
-    // 8. Start with Windows
-    append_root_check(
-        &menu,
-        &mut actions,
-        text::MENU_AUTOSTART,
-        true,
-        snapshot.autostart,
-        MenuAction::ToggleAutostart,
-    );
+    let more_sub = Submenu::new(text::MENU_MORE, true);
+    append_more_items(&more_sub, snapshot, &mut actions);
+    let _ = menu.append(&more_sub);
 
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    // 9. Quit (stops managed core and cleans up system proxy)
     append_root_item(
         &menu,
         &mut actions,
@@ -248,22 +223,22 @@ fn build_group_submenu(
     let sub = Submenu::new(text::format_group_label(&group.name, is_pinned), true);
 
     if group.switchable && !group.members.is_empty() {
-        let test_item = MenuItem::with_id(
-            next_action_id(actions, MenuAction::TestGroupLatency(group.name.clone())),
+        append_sub_item(
+            &sub,
+            actions,
             text::MENU_TEST_LATENCY,
             true,
-            None,
+            MenuAction::TestGroupLatency(group.name.clone()),
         );
-        let _ = sub.append(&test_item);
 
         if is_pinned {
-            let unfix_item = MenuItem::with_id(
-                next_action_id(actions, MenuAction::UnfixGroup(group.name.clone())),
+            append_sub_item(
+                &sub,
+                actions,
                 text::MENU_AUTO_UNPIN,
                 true,
-                None,
+                MenuAction::UnfixGroup(group.name.clone()),
             );
-            let _ = sub.append(&unfix_item);
         }
         let _ = sub.append(&PredefinedMenuItem::separator());
     }
@@ -344,87 +319,22 @@ fn append_sub_item(
     let _ = sub.append(&item);
 }
 
-fn append_core_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuAction>) {
-    if snapshot.kernel_running {
-        append_sub_item(
-            sub,
-            actions,
-            text::MENU_CORE_STOP,
-            true,
-            MenuAction::StopCore,
-        );
-    } else {
-        append_sub_item(
-            sub,
-            actions,
-            text::MENU_CORE_START,
-            true,
-            MenuAction::StartCore,
-        );
-    }
-    append_sub_item(
-        sub,
-        actions,
-        text::MENU_CORE_RESTART,
-        snapshot.controller_ok,
-        MenuAction::RestartCore,
+fn append_sub_check(
+    sub: &Submenu,
+    actions: &mut Vec<MenuAction>,
+    label: &str,
+    enabled: bool,
+    checked: bool,
+    action: MenuAction,
+) {
+    let item = CheckMenuItem::with_id(
+        next_action_id(actions, action),
+        label,
+        enabled,
+        checked,
+        None,
     );
-    append_sub_item(
-        sub,
-        actions,
-        text::MENU_CORE_FORCE_RESTART,
-        true,
-        MenuAction::ForceRestartCore,
-    );
-
-    let _ = sub.append(&PredefinedMenuItem::separator());
-
-    append_sub_item(
-        sub,
-        actions,
-        text::MENU_CORE_RELOAD_CONFIG,
-        snapshot.controller_ok,
-        MenuAction::ReloadConfig,
-    );
-    append_sub_item(
-        sub,
-        actions,
-        text::MENU_CORE_CLOSE_CONNECTIONS,
-        snapshot.controller_ok,
-        MenuAction::CloseConnections,
-    );
-    append_sub_item(
-        sub,
-        actions,
-        text::MENU_REFRESH_STATE,
-        true,
-        MenuAction::RefreshNow,
-    );
-
-    let refreshable: Vec<_> = snapshot
-        .providers
-        .iter()
-        .filter(|p| p.refreshable())
-        .collect();
-    if snapshot.controller_ok && !refreshable.is_empty() {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let prov_sub = Submenu::new(text::MENU_REFRESH_SUBSCRIPTIONS, true);
-        for provider in refreshable {
-            let age = text::format_relative_age(provider.updated_at, now_secs);
-            let label = text::format_provider_label(&provider.name, &age);
-            append_sub_item(
-                &prov_sub,
-                actions,
-                &label,
-                true,
-                MenuAction::RefreshProvider(provider.name.clone()),
-            );
-        }
-        let _ = sub.append(&prov_sub);
-    }
+    let _ = sub.append(&item);
 }
 
 fn append_open_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuAction>) {
@@ -465,6 +375,52 @@ fn append_open_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuA
     );
 }
 
+fn append_more_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuAction>) {
+    append_sub_item(
+        sub,
+        actions,
+        text::MENU_COPY_ENV_VARS,
+        true,
+        MenuAction::CopyEnvVars,
+    );
+    append_sub_item(
+        sub,
+        actions,
+        text::MENU_REFRESH_SUBSCRIPTION,
+        snapshot.controller_ok,
+        MenuAction::RefreshSubscription,
+    );
+    append_sub_item(
+        sub,
+        actions,
+        text::MENU_RESTART_CORE,
+        true,
+        MenuAction::RestartCore,
+    );
+    append_sub_item(
+        sub,
+        actions,
+        text::MENU_RESTART_APP,
+        true,
+        MenuAction::RestartApp,
+    );
+    append_sub_check(
+        sub,
+        actions,
+        text::MENU_AUTOSTART,
+        true,
+        snapshot.autostart,
+        MenuAction::ToggleAutostart,
+    );
+    append_sub_item(
+        sub,
+        actions,
+        &text::format_version_label(text::APP_VERSION),
+        true,
+        MenuAction::ShowVersion,
+    );
+}
+
 fn truncate_label(raw: &str, max_chars: usize) -> String {
     let first_line = raw.lines().next().unwrap_or(raw).trim();
     let mut out = String::new();
@@ -483,7 +439,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_actions_without_id_collisions() {
+    fn builds_requested_hierarchy_without_id_collisions() {
         let snap = Snapshot {
             controller_ok: true,
             mode: "rule".to_string(),
@@ -501,15 +457,73 @@ mod tests {
         };
 
         let built = build(&snap, 0);
-        assert!(built.actions.len() >= 10);
         assert!(matches!(built.actions[0], MenuAction::OpenWebUi));
-        let has_select = built.actions.iter().any(|a| {
-            matches!(
-                a,
-                MenuAction::SelectProxy { group, member } if group == "Proxy_Group" && member == "Node_A"
-            )
-        });
-        assert!(has_select);
+        assert!(matches!(built.actions[1], MenuAction::SetSubscriptionUrl));
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::CopyEnvVars))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::RefreshSubscription))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::RestartCore))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::RestartApp))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::ShowVersion))
+        );
+        assert!(matches!(built.actions.last(), Some(MenuAction::Quit)));
+
+        let root_texts: Vec<String> = built
+            .menu
+            .items()
+            .into_iter()
+            .map(|item| match item {
+                tray_icon::menu::MenuItemKind::MenuItem(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Check(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Submenu(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Predefined(_) => "---".to_string(),
+                tray_icon::menu::MenuItemKind::Icon(i) => i.text(),
+            })
+            .collect();
+        assert_eq!(
+            root_texts,
+            vec![
+                "Mihomo: Running (rule)",
+                "Open WebUI",
+                "Set Subscription URL",
+                "---",
+                "Rule",
+                "Global",
+                "Direct",
+                "---",
+                "System Proxy",
+                "TUN Mode",
+                "---",
+                "Proxy Groups",
+                "---",
+                "Open",
+                "More",
+                "Quit",
+            ]
+        );
     }
 
     #[test]

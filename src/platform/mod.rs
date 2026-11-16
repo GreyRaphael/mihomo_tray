@@ -15,6 +15,7 @@ use windows as imp;
 pub const ELEVATE_START_FLAG: &str = "--elevate-start";
 pub const ELEVATE_STOP_FLAG: &str = "--elevate-stop";
 pub const ELEVATE_REPLACE_FLAG: &str = "--elevate-replace";
+pub const AFTER_RESTART_FLAG: &str = "--after-restart";
 
 /// Returns the directory containing the portable layout.
 /// On Windows, this is the directory containing `mihomo-tray.exe`.
@@ -130,9 +131,32 @@ pub fn notify_error(title: &str, message: &str) {
     imp::notify_error(title, message);
 }
 
+/// Displays a blocking modal informational box to the user on desktop platforms.
+pub fn notify_info(title: &str, message: &str) {
+    imp::notify_info(title, message);
+}
+
 /// Displays a blocking modal confirmation (Yes/No) returning `true` only on Yes.
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
     imp::confirm_yes_no(title, message)
+}
+
+/// Writes UTF-8 text to the OS clipboard.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    imp::copy_to_clipboard(text)
+}
+
+/// Formats shell commands that configure HTTP/HTTPS/ALL proxy environment variables.
+pub fn format_env_vars_command(port: u16) -> String {
+    imp::format_env_vars_command(port)
+}
+
+/// Spawns a fresh instance of the current executable detached from this process.
+pub fn spawn_detached_self(args: &[String]) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
+    imp::spawn_hidden(&exe, args, None)
+        .map(|_| ())
+        .map_err(|e| format!("failed to relaunch application: {e}"))
 }
 
 /// Platform hook invoked right after the main event loop initializes.

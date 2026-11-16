@@ -16,6 +16,7 @@ pub struct MihomoConfigInfo {
     pub external_controller: Option<String>,
     pub secret: Option<String>,
     pub external_ui: Option<String>,
+    pub mixed_port: u16,
     pub other_controller_family: bool,
     pub tun_enabled: bool,
 }
@@ -33,6 +34,9 @@ struct PartialMihomoYaml {
     secret: Option<String>,
     #[serde(rename = "external-ui")]
     external_ui: Option<String>,
+    #[serde(rename = "mixed-port")]
+    mixed_port: Option<u16>,
+    port: Option<u16>,
     #[serde(default)]
     tun: PartialTunYaml,
 }
@@ -67,10 +71,17 @@ pub fn parse_str(text: &str) -> MihomoConfigInfo {
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty());
 
+    let proxy_port = parsed
+        .mixed_port
+        .filter(|&p| p > 0)
+        .or_else(|| parsed.port.filter(|&p| p > 0))
+        .unwrap_or(0);
+
     MihomoConfigInfo {
         external_controller: non_empty(parsed.external_controller),
         secret: non_empty(parsed.secret),
         external_ui: non_empty(parsed.external_ui),
+        mixed_port: proxy_port,
         other_controller_family: other_family,
         tun_enabled: parsed.tun.enable,
     }
@@ -306,8 +317,12 @@ tun:
         assert_eq!(info.external_controller.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(info.secret.as_deref(), Some("my#secret"));
         assert_eq!(info.external_ui.as_deref(), Some("./ui"));
+        assert_eq!(info.mixed_port, 7890);
         assert!(info.tun_enabled);
         assert!(!info.other_controller_family);
+
+        let fallback_port = parse_str("port: 7891\n");
+        assert_eq!(fallback_port.mixed_port, 7891);
     }
 
     #[test]

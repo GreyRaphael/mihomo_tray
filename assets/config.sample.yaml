@@ -1,5 +1,5 @@
 # Default portable configuration for mihomo (generated for mihomo-tray).
-# Use "Set Subscription URL..." in the tray menu to configure your subscription;
+# Use "Set Subscription URL" in the tray menu to configure your subscription;
 # it updates every 12 hours automatically once set.
 
 mixed-port: 7890

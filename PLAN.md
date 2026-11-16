@@ -16,7 +16,7 @@
    - Users can drop any WebUI distribution (e.g., `zashboard`, `metacubexd`, `yacd-meta`) into `./ui/` and replace it anytime while stopped, or configure `ui.web_url` in `tray.yml` (with `{host}`, `{port}`, `{secret}` placeholders).
    - Opens WebUI via the **system default browser** (`open` crate) — no Edge `--app` wrapper or WebView2 runtime management.
 5. **Swappable `mihomo` Core (Stop-and-Replace Friendly)**:
-   - Users can stop the core from the tray menu (`Core -> Stop Core`), replace `mihomo*.exe` in `./core/` (or beside the tray binary), and start/rescan without restarting the tray or manually hunting down processes.
+   - Users can click `Quit` to stop the managed kernel cleanly, replace `mihomo*.exe` in `./core/` (or beside the tray binary), and relaunch (previous `System Proxy`, mode, and `TUN Mode` states restore automatically via `.tray-state.json`), or click `More -> Restart Mihomo Core` to rescan and restart.
    - Auto-discovery supports both exact `mihomo.exe` and a single unambiguous `mihomo*.exe` inside `./core/` or `./`.
 6. **No Dark/Light Theme Polling**: Fixed high-contrast procedural RGBA tray icons (outer ring = operational state, inner dot = proxy mode).
 7. **Mature `crates.io` Ecosystem**: Prefer latest stable `crates.io` crates over hand-rolled Win32 HTTP/PEB/YAML parsers or Git forks.
@@ -132,8 +132,8 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
 
 ### 5.2 Core Lifecycle & Safe Swapping
 - **Stop-and-Replace**:
-  - Clicking `Core -> Stop Core` stops the managed mihomo process (using UAC `--elevate-stop <pid>` if it is elevated) and clears `.runtime.json`, releasing Windows file locks on `./core/*.exe` and `./ui/*`.
-  - Users can overwrite or swap binaries in `./core/` and UI bundles in `./ui/`, then click `Core -> Start Core` (or `Force Restart Core`) to re-run discovery and launch the new core.
+  - Clicking `Quit` (or stopping the core) terminates the managed mihomo process cleanly (using UAC `--elevate-stop <pid>` if elevated) and clears `.runtime.json`, releasing Windows file locks on `./core/*.exe` and `./ui/*`.
+  - Users can overwrite or swap binaries in `./core/` and UI bundles in `./ui/`, then relaunch `mihomo-tray` (which preserves `System Proxy`, routing mode, and `TUN Mode` in `.tray-state.json`) or click `More -> Restart Mihomo Core`.
 - **TUN Elevation (Zero-Service)**:
   - Normal launches spawn `mihomo` without elevation.
   - When toggling TUN ON fails to stick (`tun == false` on readback) or an elevated restart is needed, the worker resolves the running kernel PID, spawns a hidden elevated copy of `mihomo-tray.exe --elevate-start <pid>` (or `--elevate-replace <pid> <args...>`) via `runas`.
@@ -142,8 +142,8 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
 ### 5.3 Two-Phase Menu Rebuild & Controls
 1. **Menu debounce & non-blocking UI**: Tray/menu callbacks pass events over `EventLoopProxy` and debounce rapid clicks (`300ms`). All HTTP calls run on the worker thread.
 2. **Two-phase menu updates**:
-   - Phase 1: Immediate menu update with status line, `Open WebUI`, Modes (`Rule`/`Global`/`Direct`), `System Proxy`, `TUN Mode`, `Core` actions, `Open` shortcuts, `Start with Windows`, and `Quit`.
-   - Phase 2: Worker fetches `/proxies` & `/providers/proxies` (bounded timeout) and pushes updated proxy group submenus (latency suffixes like `(45ms)` / `(timeout)`, sorted fastest-first, optional `groups.page_size` pagination, `Test Latency`, and `Auto (Unpin)`).
+   - Phase 1: Immediate menu update with status line, `Open WebUI`, `Set Subscription URL`, Modes (`Rule`/`Global`/`Direct`), `System Proxy`, `TUN Mode`, `Open`, `More` (`Copy Environment Variables`, `Refresh Subscription`, `Restart Mihomo Core`, `Restart Application`, `Start with Windows`, `Version`), and `Quit`.
+   - Phase 2: Worker fetches `/proxies` & `/providers/proxies` (bounded timeout) and pushes updated proxy group submenus (latency suffixes like `(45ms)` / `(timeout)`, sorted fastest-first, optional `groups.page_size` pagination, `Test Group Latency`, and `Auto (Unpin)`).
 3. **High-DPI procedural icons**: 32x32 RGBA circle + inner dot (`icon.rs`), updated whenever state (`Running`/`SysProxy`/`Tun`/`Stopped`/`Unreachable`) or mode (`rule`/`global`/`direct`) changes.
 
 ---

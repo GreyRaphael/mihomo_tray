@@ -33,12 +33,15 @@ jobs:
           function Get-LatestTag([string]$repo) {
             $resp = curl.exe -fsSI "https://github.com/$repo/releases/latest"
             if ($LASTEXITCODE -ne 0) { throw "Failed to query latest release for $repo" }
-            $locLine = $resp | Where-Object { $_ -match '^(?i)location:\s*(.+)$' } | Select-Object -First 1
-            if (-not $locLine) { throw "Missing location header for $repo" }
-            $loc = $Matches[1].Trim()
-            $tag = ($loc.TrimEnd('/') -split '/')[-1]
-            if (-not $tag) { throw "Failed to parse tag from $loc" }
-            return $tag
+            foreach ($line in $resp) {
+              if ($line -match '^(?i)location:\s*(.+)$') {
+                $loc = $Matches[1].Trim().TrimEnd('/')
+                $tag = ($loc -split '/')[-1]
+                if (-not $tag) { throw "Failed to parse tag from $loc" }
+                return $tag
+              }
+            }
+            throw "Missing location header for $repo"
           }
 
           New-Item -ItemType Directory -Force -Path dist, dist\core, dist\config, dist\ui, tmp_ui | Out-Null
@@ -84,10 +87,10 @@ jobs:
 
           Compress-Archive -Path dist\* -DestinationPath mihomo-tray-windows-amd64.zip -Force
 
-          $body = (Get-Content -Raw -Encoding utf8 .github/release-body.md) `
-            .Replace('{{TAG}}', $env:GITHUB_REF_NAME) `
-            .Replace('{{MIHOMO_TAG}}', $mihomoTag) `
-            .Replace('{{ZASHBOARD_TAG}}', $zashTag)
+          $body = Get-Content -Raw -Encoding utf8 .github/release-body.md
+          $body = $body.Replace('{{TAG}}', $env:GITHUB_REF_NAME)
+          $body = $body.Replace('{{MIHOMO_TAG}}', $mihomoTag)
+          $body = $body.Replace('{{ZASHBOARD_TAG}}', $zashTag)
           Set-Content -Path release-notes.md -Value $body -Encoding utf8
 
       - name: Publish GitHub Release

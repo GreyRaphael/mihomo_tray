@@ -67,20 +67,32 @@ proxy-groups:
       - DIRECT
     url: https://www.gstatic.com/generate_204
     interval: 300
+    timeout: 3000
     tolerance: 50
+    lazy: true
+    max-failed-times: 3
   - name: Fallback
     type: fallback
     proxies:
       - DIRECT
     url: https://www.gstatic.com/generate_204
     interval: 300
+    timeout: 3000
+    lazy: true
+    max-failed-times: 3
+  - name: 🤖AI
+    type: select
+    include-all: true
+    exclude-filter: "HK|MO|CN"
 
 rules:
   - GEOSITE,private,DIRECT
   - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,category-ads-all,REJECT
   - GEOSITE,apple-cn,DIRECT
   - GEOSITE,google-cn,DIRECT
   - GEOSITE,cn,DIRECT
+  - GEOSITE,category-ai-!cn,🤖AI
   - GEOSITE,geolocation-!cn,Proxy
   - GEOIP,cn,DIRECT
   - MATCH,Proxy

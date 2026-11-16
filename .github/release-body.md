@@ -11,13 +11,15 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 - **WebUI 面板**：`ui/`（`Zephyruso/zashboard` `{{ZASHBOARD_TAG}}` `dist-no-fonts`）
 - **默认配置与 Loyalsoldier 分流数据**：`config/config.yaml` + `geoip.dat` + `geosite.dat` + `Country.mmdb`（已开启 24h 自动更新与国内/海外分流规则）
 
-### 本次更新（v0.3.0）
+### 本次更新（{{TAG}}）
 
-- **优化订阅地址弹出框**：重写原生 Win32 输入弹窗，按当前显示器工作区居中定位并适配 PerMonitorV2 DPI，标题栏自动继承应用图标，采用 `Segoe UI` 字体与对称留白、`WS_EX_CLIENTEDGE` 输入框垂直居中对齐。
-- **跨重启记忆运行状态**：新增便携状态文件 `config/.tray-state.json`，退出/重启时清理系统代理保证断流不影响上网，同时完整记忆退出前的 **`System Proxy` / 代理模式 / `TUN Mode`** 状态，并在下次启动或重启应用后自动恢复。
-- **精简与重排托盘菜单**：
-  - 根菜单：`Mihomo Status` / `Open WebUI` / `Set Subscription URL` / `Rule | Global | Direct` / `System Proxy | TUN Mode` / `Proxy Groups` / `Open` / `More` / `Quit`。
-  - `More` 子菜单：`Copy Environment Variables`（复制 PowerShell 代理环境变量命令）、`Refresh Subscription`、`Restart Mihomo Core`、`Restart Application`（无互斥冲突重启应用）、`Start with Windows`、`Version: v...`。
+- **优化默认 `config/config.yaml` 策略组与分流规则**：
+  - 为 `Auto` 与 `Fallback` 策略组补充 `timeout: 3000`、`lazy: true`、`max-failed-times: 3` 参数，减少空闲测速开销并降低偶发丢包时的频繁切换；
+  - 新增 **`🤖AI`** 策略组（`include-all: true`、`exclude-filter: "HK|MO|CN"`），配合 **`GEOSITE,category-ai-!cn,🤖AI`** 将 OpenAI / Gemini / Claude / Grok 等海外 AI 服务自动路由至非港澳大陆节点；
+  - 新增 **`GEOSITE,category-ads-all,REJECT`** 拦截常见广告与隐私追踪域名；
+  - 新增 **`Local_HTTP_1080`**（`127.0.0.1:1080`）本地节点与 **`HTTP_1080_Node`** 策略组便于按需切换；
+  - 默认启用 `allow-lan: true`，保持 `MATCH,Proxy` 与 `geosite:geolocation-!cn` 统一出口调度。
+- **沿用核心托盘能力**：支持带图标 DPI 居中对齐的 `Set Subscription URL` 订阅输入弹窗（默认 12h 更新）、跨重启状态持久化（`config/.tray-state.json`）、悬停防自动关闭以及完整 `More` 工具子菜单。
 
 ---
 

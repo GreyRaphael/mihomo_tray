@@ -54,7 +54,19 @@ tun:
   dns-hijack:
     - any:53
 
+proxies:
+  - name: Local_HTTP_1080
+    type: http
+    server: 127.0.0.1
+    port: 1080
+
 proxy-groups:
+  - name: HTTP_1080_Node
+    type: select
+    proxies:
+      - Local_HTTP_1080
+      - DIRECT
+      - 🤖AI
   - name: Proxy
     type: select
     proxies:

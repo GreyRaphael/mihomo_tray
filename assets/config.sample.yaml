@@ -61,19 +61,19 @@ proxies:
     port: 1080
 
 proxy-groups:
-  - name: HTTP_1080_Node
+  - name: 🏡HTTP_1080_Node
     type: select
     proxies:
       - Local_HTTP_1080
       - DIRECT
       - 🤖AI
-  - name: Proxy
+  - name: 🚀Proxy
     type: select
     proxies:
-      - Auto
-      - Fallback
+      - ⚡Auto
+      - 🚑Fallback
       - DIRECT
-  - name: Auto
+  - name: ⚡Auto
     type: url-test
     proxies:
       - DIRECT
@@ -83,7 +83,7 @@ proxy-groups:
     tolerance: 50
     lazy: true
     max-failed-times: 3
-  - name: Fallback
+  - name: 🚑Fallback
     type: fallback
     proxies:
       - DIRECT
@@ -105,6 +105,6 @@ rules:
   - GEOSITE,google-cn,DIRECT
   - GEOSITE,cn,DIRECT
   - GEOSITE,category-ai-!cn,🤖AI
-  - GEOSITE,geolocation-!cn,Proxy
+  - GEOSITE,geolocation-!cn,🚀Proxy
   - GEOIP,cn,DIRECT
-  - MATCH,Proxy
+  - MATCH,🚀Proxy

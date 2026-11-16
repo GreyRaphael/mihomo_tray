@@ -223,9 +223,12 @@ fn wire_subscription_into_groups(root_map: &mut Mapping) {
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        let is_standard_group = matches!(name, "Proxy" | "Auto" | "Fallback");
-        let strip_direct =
-            matches!(name, "Auto" | "Fallback") && matches!(kind, "url-test" | "fallback");
+        let is_standard_group = matches!(
+            name,
+            "Proxy" | "🚀Proxy" | "Auto" | "⚡Auto" | "Fallback" | "🚑Fallback"
+        );
+        let strip_direct = matches!(name, "Auto" | "⚡Auto" | "Fallback" | "🚑Fallback")
+            && matches!(kind, "url-test" | "fallback");
         let already_uses_providers = group_map
             .get(Value::String("use".to_string()))
             .is_some_and(Value::is_sequence);
@@ -355,12 +358,16 @@ tun:
         assert_eq!(sub["path"].as_str(), Some("./providers/subscription.yaml"));
 
         let groups = root["proxy-groups"].as_sequence().unwrap();
-        let auto = groups
-            .iter()
-            .find(|g| g["name"].as_str() == Some("Auto"))
-            .unwrap();
-        assert_eq!(auto["use"][0].as_str(), Some("subscription"));
-        assert!(auto.get("proxies").is_none());
+        for name in ["🚀Proxy", "⚡Auto", "🚑Fallback"] {
+            let group = groups
+                .iter()
+                .find(|g| g["name"].as_str() == Some(name))
+                .unwrap();
+            assert_eq!(group["use"][0].as_str(), Some("subscription"));
+            if name != "🚀Proxy" {
+                assert!(group.get("proxies").is_none());
+            }
+        }
 
         assert!(apply_subscription_url(&cfg, "ftp://invalid").is_err());
         let _ = std::fs::remove_dir_all(&dir);

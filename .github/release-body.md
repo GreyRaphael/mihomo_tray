@@ -9,17 +9,16 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 - **托盘主程序**：`mihomo-tray.exe`（已嵌入应用图标与 DPI 清单）
 - **mihomo 内核**：`core/mihomo-windows-amd64-v3.exe`（`{{MIHOMO_TAG}}`）
 - **WebUI 面板**：`ui/`（`Zephyruso/zashboard` `{{ZASHBOARD_TAG}}` `dist-no-fonts`）
-- **默认配置与 Loyalsoldier 分流数据**：`config/config.yaml` + `geoip.dat` + `geosite.dat` + `Country.mmdb`（已开启 24h 自动更新与国内/海外分流规则）
+- **默认配置与轻量化分流数据**：`config/config.yaml` + `Country.mmdb` + `rules/*.mrs`（`private` / `category-ads` / `cn` / `category-ai-!cn` 二进制 `.mrs` 规则集，支持 24h 自动更新且大幅降低内存与安装包体积）
 
 ### 本次更新（{{TAG}}）
 
-- **优化默认 `config/config.yaml` 策略组与分流规则**：
-  - 为 `Auto` 与 `Fallback` 策略组补充 `timeout: 3000`、`lazy: true`、`max-failed-times: 3` 参数，减少空闲测速开销并降低偶发丢包时的频繁切换；
-  - 新增 **`🤖AI`** 策略组（`include-all: true`、`exclude-filter: "HK|MO|CN"`），配合 **`GEOSITE,category-ai-!cn,🤖AI`** 将 OpenAI / Gemini / Claude / Grok 等海外 AI 服务自动路由至非港澳大陆节点；
-  - 新增 **`GEOSITE,category-ads-all,REJECT`** 拦截常见广告与隐私追踪域名；
-  - 新增 **`Local_HTTP_1080`**（`127.0.0.1:1080`）本地节点与 **`HTTP_1080_Node`** 策略组便于按需切换；
-  - 默认启用 `allow-lan: true`，保持 `MATCH,Proxy` 与 `geosite:geolocation-!cn` 统一出口调度。
-- **沿用核心托盘能力**：支持带图标 DPI 居中对齐的 `Set Subscription URL` 订阅输入弹窗（默认 12h 更新）、跨重启状态持久化（`config/.tray-state.json`）、悬停防自动关闭以及完整 `More` 工具子菜单。
+- **大幅降低内核内存占用**：从加载全量 `geosite.dat` / `geoip.dat` 切换为 **`Country.mmdb` + `.mrs` 二进制规则集 + `MATCH,🚀Proxy` 漏网之鱼兜底**（空载 `VmRSS` 从约 `108.7 MiB` 降至约 `47 MiB` 量级）。
+- **优化策略组与规则结构**：
+  - 为 `🚀Proxy`、`⚡Auto`、`🚑Fallback`、`🤖AI` 分组统一添加 Emoji 前缀，补充 `timeout: 3000`、`lazy: true`、`max-failed-times: 3`；
+  - `🚀Proxy` 可直接选择 **`⚡Auto`**、**`🚑Fallback`**、**`Local_HTTP_1080`**（`127.0.0.1:1080`）、`DIRECT` 或手动点选订阅节点；
+  - `category-ads.mrs` 拦截简单广告，`private` 与 `cn` 全走 `DIRECT`，`🤖AI`（排除 `HK|MO|CN`）承接海外 AI 流量，其余走 `🚀Proxy`。
+- **DNS 防污染精简**：使用 `proxy-server-nameserver` + `rule-set` 国内分流与 `fallback-filter(CN)`（不再重复加载 `geosite.dat`）。
 
 ---
 

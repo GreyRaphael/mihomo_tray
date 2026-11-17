@@ -15,9 +15,9 @@
   - 或者直接在 `tray.yml` 中配置 `ui.web_url`（支持 `{host}`、`{port}`、`{secret}` 占位符）；
   - 点击 `Open WebUI` 或左键单击托盘图标，直接调用系统默认浏览器打开。
 - **免安装、无服务、按需 TUN 提权**：绝不注册 Windows Service；日常以普通权限启动内核，仅在启用 TUN 模式且需要管理员权限时，通过隐藏自身 UAC 辅助进程（`--elevate-start` / `--elevate-stop`）拉起提权内核。
-- **托盘一键填订阅**：点击菜单 `Set Subscription URL` 打开带应用图标且自动居中适配 DPI 的输入框，填入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `Proxy` / `Auto` / `Fallback` 分组），同时立即拉取节点。
+- **托盘一键填订阅**：点击菜单 `Set Subscription URL` 打开带应用图标且自动居中适配 DPI 的输入框，填入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `🚀Proxy` / `⚡Auto` / `🚑Fallback` 与 `🤖AI` 分组），同时立即拉取节点。
 - **跨重启状态持久化**：在 `./config/.tray-state.json` 中记住退出前的 **`System Proxy`、代理模式、TUN 模式**状态；退出时清理系统代理避免断网，下次启动或点击 `More -> Restart Application` 后自动恢复。
-- **开箱即用 Release 便携包**：GitHub Releases 自动打包 `mihomo-tray.exe`（内嵌可执行文件图标）、最新 `mihomo-windows-amd64-v3` 内核、最新 `zashboard`（`dist-no-fonts`）、默认 `config/config.yaml` 以及 Loyalsoldier 最新 `geoip.dat` / `geosite.dat` / `Country.mmdb`。
+- **低内存开箱即用 Release 便携包**：GitHub Releases 自动打包 `mihomo-tray.exe`（内嵌可执行文件图标）、最新 `mihomo-windows-amd64-v3` 内核、最新 `zashboard`（`dist-no-fonts`）、默认 `config/config.yaml`、`Country.mmdb` 以及轻量化 `.mrs` 二进制规则集（`./config/rules/*.mrs`）。
 - **两阶段菜单刷新与纯代码双轴图标**：
   - 托盘图标由代码实时生成 32x32 RGBA 图像：外圈代表运行状态（蓝 = TUN、橙 = 系统代理、绿 = 运行中、灰 = 未运行/控制器不可达），中心点代表代理模式（浅白 = Rule、红 = Global、深灰 = Direct）；
   - 菜单采用两阶段刷新并具备菜单展开防打断保护（悬停浏览不会自动消失），支持节点延迟展示与快慢排序、超长列表分页（`groups.page_size`）、测速、解除固定、订阅刷新等操作。

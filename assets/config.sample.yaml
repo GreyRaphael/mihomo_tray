@@ -9,12 +9,10 @@ mode: rule
 log-level: info
 external-controller: 127.0.0.1:9090
 
-geodata-mode: true
+geodata-mode: false
 geo-auto-update: true
 geo-update-interval: 24
 geox-url:
-  geoip: https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-  geosite: https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
   mmdb: https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb
 
 dns:
@@ -27,13 +25,22 @@ dns:
     - "*.local"
     - "+.msftconnecttest.com"
     - "+.msftncsi.com"
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
   nameserver-policy:
-    "geosite:geolocation-!cn":
-      - https://1.1.1.1/dns-query
-      - https://8.8.8.8/dns-query
+    "rule-set:private,cn":
+      - 223.5.5.5
+      - 119.29.29.29
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
 
 sniffer:
   enable: true
@@ -61,17 +68,12 @@ proxies:
     port: 1080
 
 proxy-groups:
-  - name: 🏡HTTP_1080_Node
-    type: select
-    proxies:
-      - Local_HTTP_1080
-      - DIRECT
-      - 🤖AI
   - name: 🚀Proxy
     type: select
     proxies:
       - ⚡Auto
       - 🚑Fallback
+      - Local_HTTP_1080
       - DIRECT
   - name: ⚡Auto
     type: url-test
@@ -97,14 +99,41 @@ proxy-groups:
     include-all: true
     exclude-filter: "HK|MO|CN"
 
+rule-providers:
+  private:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs
+    path: ./rules/private.mrs
+    interval: 86400
+  category-ads:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads.mrs
+    path: ./rules/category-ads.mrs
+    interval: 86400
+  cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs
+    path: ./rules/cn.mrs
+    interval: 86400
+  ai:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ai-!cn.mrs
+    path: ./rules/category-ai-!cn.mrs
+    interval: 86400
+
 rules:
-  - GEOSITE,private,DIRECT
-  - GEOIP,private,DIRECT,no-resolve
-  - GEOSITE,category-ads-all,REJECT
-  - GEOSITE,apple-cn,DIRECT
-  - GEOSITE,google-cn,DIRECT
-  - GEOSITE,cn,DIRECT
-  - GEOSITE,category-ai-!cn,🤖AI
-  - GEOSITE,geolocation-!cn,🚀Proxy
-  - GEOIP,cn,DIRECT
+  - RULE-SET,private,DIRECT
+  - GEOIP,LAN,DIRECT,no-resolve
+  - RULE-SET,category-ads,REJECT
+  - RULE-SET,cn,DIRECT
+  - RULE-SET,ai,🤖AI
+  - GEOIP,CN,DIRECT
   - MATCH,🚀Proxy

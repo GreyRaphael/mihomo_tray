@@ -368,6 +368,21 @@ tun:
                 assert!(group.get("proxies").is_none());
             }
         }
+        let proxy_group = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some("🚀Proxy"))
+            .unwrap();
+        let proxy_entries: Vec<&str> = proxy_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            proxy_entries,
+            vec!["⚡Auto", "🚑Fallback", "Local_HTTP_1080", "DIRECT"]
+        );
+        assert_eq!(root["rule-providers"]["cn"]["format"].as_str(), Some("mrs"));
 
         assert!(apply_subscription_url(&cfg, "ftp://invalid").is_err());
         let _ = std::fs::remove_dir_all(&dir);

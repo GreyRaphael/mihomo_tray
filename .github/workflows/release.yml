@@ -44,7 +44,7 @@ jobs:
             throw "Missing location header for $repo"
           }
 
-          New-Item -ItemType Directory -Force -Path dist, dist\core, dist\config, dist\ui, tmp_ui | Out-Null
+          New-Item -ItemType Directory -Force -Path dist, dist\core, dist\config, dist\config\rules, dist\ui, tmp_ui | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\mihomo-tray.exe dist\mihomo-tray.exe
           Copy-Item assets\tray.sample.yml dist\tray.yml
           Copy-Item assets\config.sample.yaml dist\config\config.yaml
@@ -73,13 +73,13 @@ jobs:
           $kernelExe = Get-ChildItem -Path dist\core -Filter "mihomo*.exe" | Select-Object -First 1
           if (-not $kernelExe) { throw "mihomo executable missing after extraction" }
 
-          # 3. Latest Loyalsoldier geoip.dat, geosite.dat, and Country.mmdb -> dist\config\
-          curl.exe -fsSL -o dist\config\geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download geoip.dat" }
-          curl.exe -fsSL -o dist\config\geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download geosite.dat" }
+          # 3. Latest Country.mmdb & MetaCubeX binary .mrs rule-sets -> dist\config\
           curl.exe -fsSL -o dist\config\Country.mmdb "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download Country.mmdb" }
+          foreach ($rule in @("private", "category-ads", "cn", "category-ai-!cn")) {
+            curl.exe -fsSL -o "dist\config\rules\$rule.mrs" "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/$rule.mrs"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download $rule.mrs" }
+          }
 
           # 4. Validate packaged config.yaml & geodata using the bundled mihomo kernel
           & $kernelExe.FullName -t -d dist\config -f dist\config\config.yaml

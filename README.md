@@ -31,6 +31,36 @@ mihomo-tray/
     └── mihomo-tray.log
 ```
 
+## Tray Icon Colors & States
+
+`mihomo-tray` dynamically renders a high-contrast 32×32 RGBA dual-axis tray icon ([`src/tray/icon.rs`](src/tray/icon.rs)): the **outer ring** shows the operational state (by priority), and the **center dot** shows the active routing mode.
+
+### Outer Ring (Operational State, in Priority Order)
+
+| Color | RGB | State | Condition & Meaning |
+| :--- | :--- | :--- | :--- |
+| **Gray** | `rgb(130, 140, 152)` | `Unreachable` | Controller API unreachable (core stopped, still starting, or query failed) |
+| **Blue** | `rgb(33, 150, 243)` | `Tun` | `TUN Mode` enabled (takes precedence even if `System Proxy` is also enabled) |
+| **Amber** | `rgb(251, 140, 0)` | `SysProxy` | `System Proxy` enabled without `TUN Mode` |
+| **Green** | `rgb(46, 204, 113)` | `Running` | Core reachable with neither `System Proxy` nor `TUN Mode` enabled |
+
+### Center Dot (Proxy Mode)
+
+| Color | RGB | Mode | Meaning |
+| :--- | :--- | :--- | :--- |
+| **Light White** | `rgb(244, 247, 250)` | `Rule` | Rule-based routing |
+| **Red** | `rgb(229, 57, 53)` | `Global` | Global proxy routing |
+| **Dark Charcoal** | `rgb(34, 39, 46)` | `Direct` | Direct routing |
+| **None (matches ring)** | — | `Unknown` | Controller unreachable or unrecognized mode (e.g. solid gray circle when unreachable) |
+
+### Common Combinations
+
+- **Solid Gray**: Core stopped / controller unreachable
+- **Green ring + White dot**: Core running (`Rule` mode), neither System Proxy nor TUN enabled
+- **Amber ring + White dot**: `Rule` mode + `System Proxy` enabled
+- **Blue ring + White dot**: `Rule` mode + `TUN Mode` enabled
+- Center dot switches to **Red** (`Global`) or **Dark Charcoal** (`Direct`) when changing modes.
+
 ## Build & Check
 
 ```powershell

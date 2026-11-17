@@ -584,12 +584,18 @@ impl Worker {
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
         self.set_status_note(Some("Updating subscription..."));
         let res = (|| {
+            let saved = self.capture_live_or_persisted_state();
+            self.pending_restore = Some(saved);
             mihomo::apply_subscription_url(&self.config_file, url)?;
             if let Some(client) = &self.client
                 && client.probe().is_ok()
             {
+                let sub_cache = self.home_dir.join("providers").join("subscription.yaml");
+                let had_cached_sub = sub_cache.is_file();
                 client.reload_configs()?;
-                client.refresh_provider("subscription")?;
+                if had_cached_sub || !sub_cache.is_file() {
+                    client.refresh_provider("subscription")?;
+                }
                 return Ok(());
             }
             self.start_core_internal()

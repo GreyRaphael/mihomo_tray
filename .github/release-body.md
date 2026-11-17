@@ -13,12 +13,10 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 
 ### 本次更新（{{TAG}}）
 
-- **大幅降低内核内存占用**：从加载全量 `geosite.dat` / `geoip.dat` 切换为 **`Country.mmdb` + `.mrs` 二进制规则集 + `MATCH,🚀Proxy` 漏网之鱼兜底**（空载 `VmRSS` 从约 `108.7 MiB` 降至约 `47 MiB` 量级）。
-- **优化策略组与规则结构**：
-  - 为 `🚀Proxy`、`⚡Auto`、`🚑Fallback`、`🤖AI` 分组统一添加 Emoji 前缀，补充 `timeout: 3000`、`lazy: true`、`max-failed-times: 3`；
-  - `🚀Proxy` 可直接选择 **`⚡Auto`**、**`🚑Fallback`**、**`Local_HTTP_1080`**（`127.0.0.1:1080`）、`DIRECT` 或手动点选订阅节点；
-  - `category-ads.mrs` 拦截简单广告，`private` 与 `cn` 全走 `DIRECT`，`🤖AI`（排除 `HK|MO|CN`）承接海外 AI 流量，其余走 `🚀Proxy`。
-- **DNS 防污染精简**：使用 `proxy-server-nameserver` + `rule-set` 国内分流与 `fallback-filter(CN)`（不再重复加载 `geosite.dat`）。
+- **彻底修复首次设置订阅时的超时与 `providers` 未落盘问题**：
+  - 修复 `src/core/api.rs` 中 `PUT /configs?force=true` 误用 `2000ms` 轮询超时导致订阅尚未下载完即报错 `timeout: global` 的问题，改为专用的 `45s` 重载超时，并在 `src/core/worker.rs` 中仅在覆盖已有缓存或首次初始化未落盘时补发刷新，同时保留重载前运行状态（`System Proxy` / 模式 / `TUN Mode`）。
+  - 修复默认 `config/config.yaml` 中无代理冷启动下 `dns.fallback`（`1.1.1.1` / `8.8.8.8` DoH）在直连网络阻塞/超时导致机场订阅域名无法解析、进而 `providers/subscription.yaml` 无法下载落盘的问题；补充 `direct-nameserver` 确保直连与首次拉取订阅稳定毫秒级解析。
+- **沿用低内存 `.mrs` + `Country.mmdb` 结构**：保留约 `47 MiB` 量级空载内存优化、Emoji 策略组（`🚀Proxy` / `⚡Auto` / `🚑Fallback` / `🤖AI` + `Local_HTTP_1080`）与全部托盘交互能力。
 
 ---
 

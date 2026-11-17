@@ -12,6 +12,8 @@ const PROBE_TIMEOUT_MS: u64 = 800;
 const DELAY_QUERY_TIMEOUT_MS: u32 = 3000;
 const DELAY_HTTP_TIMEOUT_MS: u64 = 10_000;
 const PROVIDER_HTTP_TIMEOUT_MS: u64 = 30_000;
+// Reloading config runs synchronous provider initialization on mihomo's side.
+const RELOAD_HTTP_TIMEOUT_MS: u64 = 45_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
@@ -267,7 +269,7 @@ impl Client {
     }
 
     pub fn reload_configs(&self) -> Result<(), String> {
-        self.put_json("/configs?force=true", &json!({}), self.timeout_ms as u64)
+        self.put_json("/configs?force=true", &json!({}), RELOAD_HTTP_TIMEOUT_MS)
     }
 
     pub fn select_proxy(&self, group: &str, member: &str) -> Result<(), String> {
@@ -560,6 +562,25 @@ mod tests {
         assert_eq!(cfg.mode, "rule");
         assert_eq!(cfg.mixed_port, 7890);
         assert!(cfg.tun_enable);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn reload_configs_allows_slow_provider_bootstrap_beyond_poll_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).unwrap();
+            std::thread::sleep(Duration::from_millis(350));
+            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+        });
+
+        // Short poll timeout (200ms) must not abort `PUT /configs?force=true`.
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 200).unwrap();
+        client.reload_configs().unwrap();
         handle.join().unwrap();
     }
 }

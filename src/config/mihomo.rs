@@ -383,6 +383,10 @@ tun:
             vec!["⚡Auto", "🚑Fallback", "Local_HTTP_1080", "DIRECT"]
         );
         assert_eq!(root["rule-providers"]["cn"]["format"].as_str(), Some("mrs"));
+        assert_eq!(
+            root["rule-providers"]["binance"]["format"].as_str(),
+            Some("mrs")
+        );
 
         assert!(apply_subscription_url(&cfg, "ftp://invalid").is_err());
         let _ = std::fs::remove_dir_all(&dir);

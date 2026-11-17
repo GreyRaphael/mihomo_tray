@@ -128,6 +128,13 @@ rule-providers:
     url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ai-!cn.mrs
     path: ./rules/category-ai-!cn.mrs
     interval: 86400
+  binance:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/binance.mrs
+    path: ./rules/binance.mrs
+    interval: 86400
 
 rules:
   - RULE-SET,private,DIRECT
@@ -136,5 +143,6 @@ rules:
   - DOMAIN-SUFFIX,cn,DIRECT
   - RULE-SET,cn,DIRECT
   - RULE-SET,ai,🤖AI
+  - RULE-SET,binance,🚑Fallback
   - GEOIP,CN,DIRECT,no-resolve
   - MATCH,🚀Proxy

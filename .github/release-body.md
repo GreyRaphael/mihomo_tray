@@ -9,16 +9,13 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 - **托盘主程序**：`mihomo-tray.exe`（已嵌入应用图标与 DPI 清单）
 - **mihomo 内核**：`core/mihomo-windows-amd64-v3.exe`（`{{MIHOMO_TAG}}`）
 - **WebUI 面板**：`ui/`（`Zephyruso/zashboard` `{{ZASHBOARD_TAG}}` `dist-no-fonts`）
-- **默认配置与轻量化分流数据**：`config/config.yaml` + `Country.mmdb` + `rules/*.mrs`（`private` / `category-ads` / `cn` / `category-ai-!cn` 二进制 `.mrs` 规则集，支持 24h 自动更新且大幅降低内存与安装包体积）
+- **默认配置与轻量化分流数据**：`config/config.yaml` + `Country.mmdb` + `rules/*.mrs`（`private` / `category-ads` / `cn` / `category-ai-!cn` / `binance` 二进制 `.mrs` 规则集，支持 24h 自动更新且大幅降低内存与安装包体积）
 
 ### 本次更新（{{TAG}}）
 
-- **默认配置升级国内 DoH 与无解析分流**：
-  - 在 `config/config.yaml` 中将 `direct-nameserver`、`proxy-server-nameserver`、`nameserver` 与 `nameserver-policy` 升级为国内加密 DoH（`dns.alidns.com` / `doh.pub`，配合 `default-nameserver: [223.5.5.5, 119.29.29.29]`），防止运营商 UDP 53 劫持，同时保证首次 `Set Subscription URL` 冷启动直连秒级解析写盘；
-  - 在 `RULE-SET,cn,DIRECT` 前补充 `DOMAIN-SUFFIX,cn,DIRECT`，并将 `GEOIP,CN,DIRECT` 调整为 `GEOIP,CN,DIRECT,no-resolve`，使海外域名不再触发本地 DNS 查询，直接交由代理节点远端解析以消除明文 DNS 泄露与污染误判；保留 `🤖AI` 分组原配置（含 `Local_HTTP_1080`）。
-- **菜单交互与更新时间展示优化**：
-  - 将 `More -> Refresh Subscription` 改名为 `Update Subscription`，并直接内联显示距上次成功更新的相对时间（`just now` / `Xm ago` / `Xh ago` / `Xd ago`），配合 `MenuFingerprint` 按粗粒度时间桶防抖动刷新；控制器不可达时自动清理过期订阅时间戳。
-- **文档完善**：在中英文 README 中补充 32×32 双轴托盘图标外圈颜色（灰 / 蓝 / 橙 / 绿）与中心圆点颜色（白 / 红 / 深炭灰 / 隐藏）的完整状态映射表。
+- **新增 `binance` 二进制规则集与 `🚑Fallback` 专线分流**：
+  - 在默认 `config/config.yaml` 的 `rule-providers` 中新增 `binance`（`MetaCubeX/meta-rules-dat` `binance.mrs`，24h 自动更新），并在 `rules` 中紧接 `ai` 规则后配置 `- RULE-SET,binance,🚑Fallback`，使 Binance 相关域名优先通过自动故障转移策略组 `🚑Fallback` 稳定代理。
+  - 在 GitHub Release 打包流程中预下载 `./config/rules/binance.mrs` 随压缩包一同分发，并补充配置单测校验；沿用 `v0.3.4` 的国内加密 DoH + `GEOIP,CN,DIRECT,no-resolve` 与 `Update Subscription` 相对时间菜单交互。
 
 ---
 

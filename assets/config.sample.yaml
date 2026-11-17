@@ -25,19 +25,22 @@ dns:
     - "*.local"
     - "+.msftconnecttest.com"
     - "+.msftncsi.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   direct-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
   proxy-server-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
   nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
   nameserver-policy:
     "rule-set:private,cn":
-      - 223.5.5.5
-      - 119.29.29.29
+      - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
 
 sniffer:
   enable: true
@@ -130,7 +133,8 @@ rules:
   - RULE-SET,private,DIRECT
   - GEOIP,LAN,DIRECT,no-resolve
   - RULE-SET,category-ads,REJECT
+  - DOMAIN-SUFFIX,cn,DIRECT
   - RULE-SET,cn,DIRECT
   - RULE-SET,ai,🤖AI
-  - GEOIP,CN,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
   - MATCH,🚀Proxy

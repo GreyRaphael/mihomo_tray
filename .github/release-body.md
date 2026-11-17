@@ -13,10 +13,12 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 
 ### 本次更新（{{TAG}}）
 
-- **彻底修复首次设置订阅时的超时与 `providers` 未落盘问题**：
-  - 修复 `src/core/api.rs` 中 `PUT /configs?force=true` 误用 `2000ms` 轮询超时导致订阅尚未下载完即报错 `timeout: global` 的问题，改为专用的 `45s` 重载超时，并在 `src/core/worker.rs` 中仅在覆盖已有缓存或首次初始化未落盘时补发刷新，同时保留重载前运行状态（`System Proxy` / 模式 / `TUN Mode`）。
-  - 修复默认 `config/config.yaml` 中无代理冷启动下 `dns.fallback`（`1.1.1.1` / `8.8.8.8` DoH）在直连网络阻塞/超时导致机场订阅域名无法解析、进而 `providers/subscription.yaml` 无法下载落盘的问题；补充 `direct-nameserver` 确保直连与首次拉取订阅稳定毫秒级解析。
-- **沿用低内存 `.mrs` + `Country.mmdb` 结构**：保留约 `47 MiB` 量级空载内存优化、Emoji 策略组（`🚀Proxy` / `⚡Auto` / `🚑Fallback` / `🤖AI` + `Local_HTTP_1080`）与全部托盘交互能力。
+- **默认配置升级国内 DoH 与无解析分流**：
+  - 在 `config/config.yaml` 中将 `direct-nameserver`、`proxy-server-nameserver`、`nameserver` 与 `nameserver-policy` 升级为国内加密 DoH（`dns.alidns.com` / `doh.pub`，配合 `default-nameserver: [223.5.5.5, 119.29.29.29]`），防止运营商 UDP 53 劫持，同时保证首次 `Set Subscription URL` 冷启动直连秒级解析写盘；
+  - 在 `RULE-SET,cn,DIRECT` 前补充 `DOMAIN-SUFFIX,cn,DIRECT`，并将 `GEOIP,CN,DIRECT` 调整为 `GEOIP,CN,DIRECT,no-resolve`，使海外域名不再触发本地 DNS 查询，直接交由代理节点远端解析以消除明文 DNS 泄露与污染误判；保留 `🤖AI` 分组原配置（含 `Local_HTTP_1080`）。
+- **菜单交互与更新时间展示优化**：
+  - 将 `More -> Refresh Subscription` 改名为 `Update Subscription`，并直接内联显示距上次成功更新的相对时间（`just now` / `Xm ago` / `Xh ago` / `Xd ago`），配合 `MenuFingerprint` 按粗粒度时间桶防抖动刷新；控制器不可达时自动清理过期订阅时间戳。
+- **文档完善**：在中英文 README 中补充 32×32 双轴托盘图标外圈颜色（灰 / 蓝 / 橙 / 绿）与中心圆点颜色（白 / 红 / 深炭灰 / 隐藏）的完整状态映射表。
 
 ---
 

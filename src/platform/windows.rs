@@ -119,12 +119,6 @@ pub fn resolve_shim_target(path: &Path) -> Option<PathBuf> {
     target.is_file().then_some(target)
 }
 
-pub fn is_elevated() -> bool {
-    deelevate::Token::with_current_process()
-        .and_then(|token| token.privilege_level())
-        .is_ok_and(|lvl| lvl != deelevate::PrivilegeLevel::NotPrivileged)
-}
-
 pub fn proxy_is_enabled() -> bool {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ)
@@ -338,8 +332,6 @@ pub fn format_env_vars_command(port: u16) -> String {
         "$env:HTTP_PROXY=\"http://127.0.0.1:{port}\"; $env:HTTPS_PROXY=\"http://127.0.0.1:{port}\"; $env:ALL_PROXY=\"socks5://127.0.0.1:{port}\""
     )
 }
-
-pub fn after_event_loop_ready() {}
 
 pub fn is_tray_menu_open() -> bool {
     unsafe {

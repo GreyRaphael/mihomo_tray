@@ -23,14 +23,12 @@ pub struct RunningProcess {
 pub struct RuntimeRecord {
     pub pid: u32,
     pub kernel_path: PathBuf,
-    pub elevated: bool,
 }
 
 #[derive(Debug)]
 pub struct ManagedChild {
     pub child: Option<Child>,
     pub pid: u32,
-    pub elevated: bool,
 }
 
 pub fn runtime_record_path(home_dir: &Path) -> PathBuf {
@@ -74,9 +72,7 @@ pub fn list_running_mihomo(expected_kernel: Option<&Path>) -> Vec<RunningProcess
         let name = proc_info.name().to_string_lossy();
         let exe = proc_info.exe().map(Path::to_path_buf);
 
-        let name_matches = platform::is_kernel_candidate_name(&name)
-            && !name.to_ascii_lowercase().starts_with("mihomo-tray")
-            && !name.to_ascii_lowercase().starts_with("mihomo_tray");
+        let name_matches = platform::is_kernel_candidate_name(&name);
         let path_matches = expected_kernel
             .zip(exe.as_deref())
             .is_some_and(|(want, got)| paths_match(want, got));
@@ -103,6 +99,37 @@ pub fn is_pid_alive(pid: u32) -> bool {
     };
     sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     sys.process(Pid::from_u32(pid)).is_some()
+}
+
+/// Checks whether `pid` is still alive and belongs to a mihomo kernel process
+/// (guarding against OS PID reuse after crashes or reboots).
+pub fn is_recorded_kernel_alive(pid: u32, expected_kernel: Option<&Path>) -> bool {
+    let Ok(mut sys) = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)),
+    ) else {
+        return false;
+    };
+    let sys_pid = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+    let Some(proc_info) = sys.process(sys_pid) else {
+        return false;
+    };
+    let name = proc_info.name().to_string_lossy();
+    matches_recorded_kernel(&name, proc_info.exe(), expected_kernel)
+}
+
+fn matches_recorded_kernel(name: &str, exe: Option<&Path>, expected_kernel: Option<&Path>) -> bool {
+    if let (Some(want), Some(got)) = (expected_kernel, exe) {
+        return paths_match(want, got);
+    }
+    if platform::is_kernel_candidate_name(name) {
+        return true;
+    }
+    expected_kernel
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|want_name| want_name.eq_ignore_ascii_case(name))
 }
 
 pub fn pick_target_process<'a>(
@@ -133,7 +160,6 @@ pub fn spawn_normal(exe: &Path, args: &[String]) -> Result<ManagedChild, String>
     Ok(ManagedChild {
         child: Some(child),
         pid,
-        elevated: platform::is_elevated(),
     })
 }
 
@@ -193,7 +219,7 @@ pub fn helper_stop_pid(pid: u32) -> i32 {
     }
 }
 
-/// Elevated helper entrypoint (`--elevate-start <pid> <args...>` / `--elevate-replace <pid> <args...>`).
+/// Elevated helper entrypoint (`--elevate-start <pid> <args...>`).
 /// Reads the real executable image from `<pid>` so the caller never injects an arbitrary executable path.
 pub fn helper_start_from_pid(pid: u32, args: &[String]) -> i32 {
     let Some(exe) = process_exe_for_pid(pid) else {
@@ -220,12 +246,39 @@ fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
     let proc_info = sys.process(sys_pid)?;
     let name = proc_info.name().to_string_lossy();
     let exe = proc_info.exe()?.to_path_buf();
-    if platform::is_kernel_candidate_name(&name)
-        && !name.to_ascii_lowercase().starts_with("mihomo-tray")
-        && !name.to_ascii_lowercase().starts_with("mihomo_tray")
-    {
-        Some(exe)
-    } else {
-        None
+    platform::is_kernel_candidate_name(&name).then_some(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_reused_non_kernel_pid_and_accepts_matching_kernel() {
+        assert!(!is_recorded_kernel_alive(std::process::id(), None));
+        assert!(!matches_recorded_kernel(
+            "notepad.exe",
+            Some(Path::new(r"C:\Windows\System32\notepad.exe")),
+            Some(Path::new(r"C:\Tools\mihomo\core\mihomo.exe")),
+        ));
+        assert!(!matches_recorded_kernel(
+            "mihomo.exe",
+            Some(Path::new(r"C:\Other\mihomo.exe")),
+            Some(Path::new(r"C:\Tools\mihomo\core\mihomo.exe")),
+        ));
+        assert!(matches_recorded_kernel(
+            "mihomo-windows-amd64",
+            None,
+            Some(Path::new("/opt/core/mihomo-windows-amd64")),
+        ));
+        assert!(!matches_recorded_kernel("mihomo-tray", None, None,));
+    }
+
+    #[test]
+    fn deserializes_legacy_runtime_record_with_elevated_field() {
+        let json = r#"{"pid":1234,"kernel_path":"/opt/mihomo","elevated":true}"#;
+        let rec: RuntimeRecord = serde_json::from_str(json).expect("legacy record should parse");
+        assert_eq!(rec.pid, 1234);
+        assert_eq!(rec.kernel_path, PathBuf::from("/opt/mihomo"));
     }
 }

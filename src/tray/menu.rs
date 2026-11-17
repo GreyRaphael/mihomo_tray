@@ -1,5 +1,6 @@
 //! Cross-platform native tray menu builder built on `tray_icon::menu` (`muda 0.21`).
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -44,7 +45,7 @@ pub struct MenuFingerprint {
     tun: bool,
     autostart: bool,
     groups: Vec<Group>,
-    node_latency: Vec<(String, Option<u32>)>,
+    node_latency: BTreeMap<String, Option<u32>>,
     update_subscription_label: String,
     resolved_config: Option<std::path::PathBuf>,
     page_size: usize,
@@ -91,21 +92,43 @@ pub struct BuiltMenu {
     pub actions: Vec<MenuAction>,
 }
 
-fn next_action_id(actions: &mut Vec<MenuAction>, action: MenuAction) -> String {
-    let id = format!("act_{}", actions.len());
-    actions.push(action);
-    id
+/// Parses a generation-scoped menu item ID formatted as `act_{generation}_{index}`.
+pub fn parse_action_id(id_str: &str) -> Option<(u64, usize)> {
+    let (gen_str, idx_str) = id_str.strip_prefix("act_")?.split_once('_')?;
+    let generation = gen_str.parse::<u64>().ok()?;
+    let idx = idx_str.parse::<usize>().ok()?;
+    Some((generation, idx))
+}
+
+struct ActionRecorder {
+    generation: u64,
+    actions: Vec<MenuAction>,
+}
+
+impl ActionRecorder {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            actions: Vec::new(),
+        }
+    }
+
+    fn next_id(&mut self, action: MenuAction) -> String {
+        let id = format!("act_{}_{}", self.generation, self.actions.len());
+        self.actions.push(action);
+        id
+    }
 }
 
 fn append_root_item(
     menu: &Menu,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
     action: Option<MenuAction>,
 ) {
     let item = match action {
-        Some(act) => MenuItem::with_id(next_action_id(actions, act), label, enabled, None),
+        Some(act) => MenuItem::with_id(recorder.next_id(act), label, enabled, None),
         None => MenuItem::new(label, enabled, None),
     };
     let _ = menu.append(&item);
@@ -113,50 +136,49 @@ fn append_root_item(
 
 fn append_root_check(
     menu: &Menu,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
     checked: bool,
     action: MenuAction,
 ) {
-    let item = CheckMenuItem::with_id(
-        next_action_id(actions, action),
-        label,
-        enabled,
-        checked,
-        None,
-    );
+    let item = CheckMenuItem::with_id(recorder.next_id(action), label, enabled, checked, None);
     let _ = menu.append(&item);
 }
 
-pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
-    build_at(snapshot, page_size, current_unix_secs())
+pub fn build(snapshot: &Snapshot, page_size: usize, generation: u64) -> BuiltMenu {
+    build_at(snapshot, page_size, generation, current_unix_secs())
 }
 
-pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMenu {
-    let mut actions = Vec::new();
+pub fn build_at(
+    snapshot: &Snapshot,
+    page_size: usize,
+    generation: u64,
+    now_unix: i64,
+) -> BuiltMenu {
+    let mut recorder = ActionRecorder::new(generation);
     let menu = Menu::new();
 
     // 1. Mihomo status + optional status note / error line
-    append_root_item(&menu, &mut actions, &snapshot.status_line(), false, None);
+    append_root_item(&menu, &mut recorder, &snapshot.status_line(), false, None);
     if let Some(note) = &snapshot.status_note {
-        append_root_item(&menu, &mut actions, note, false, None);
+        append_root_item(&menu, &mut recorder, note, false, None);
     } else if let Some(err) = snapshot.error() {
         let short = truncate_label(err, 90);
-        append_root_item(&menu, &mut actions, &format!("! {short}"), false, None);
+        append_root_item(&menu, &mut recorder, &format!("! {short}"), false, None);
     }
 
     // 2. WebUI & subscription onboarding
     append_root_item(
         &menu,
-        &mut actions,
+        &mut recorder,
         text::MENU_OPEN_WEB_UI,
         snapshot.web_ui_url.is_some(),
         Some(MenuAction::OpenWebUi),
     );
     append_root_item(
         &menu,
-        &mut actions,
+        &mut recorder,
         text::MENU_SET_SUBSCRIPTION,
         true,
         Some(MenuAction::SetSubscriptionUrl),
@@ -173,7 +195,7 @@ pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMe
     ] {
         append_root_check(
             &menu,
-            &mut actions,
+            &mut recorder,
             label,
             mode_enabled,
             active_mode == mode_variant,
@@ -187,7 +209,7 @@ pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMe
         snapshot.sysproxy || (snapshot.controller_ok && snapshot.mixed_port > 0);
     append_root_check(
         &menu,
-        &mut actions,
+        &mut recorder,
         text::MENU_SYSTEM_PROXY,
         can_toggle_sysproxy,
         snapshot.sysproxy,
@@ -195,7 +217,7 @@ pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMe
     );
     append_root_check(
         &menu,
-        &mut actions,
+        &mut recorder,
         text::MENU_TUN_MODE,
         snapshot.controller_ok,
         snapshot.tun,
@@ -207,7 +229,7 @@ pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMe
     if snapshot.controller_ok && !snapshot.groups.is_empty() {
         let groups_sub = Submenu::new(text::MENU_PROXY_GROUPS, true);
         for group in &snapshot.groups {
-            let sub = build_group_submenu(group, snapshot, page_size, &mut actions);
+            let sub = build_group_submenu(group, snapshot, page_size, &mut recorder);
             let _ = groups_sub.append(&sub);
         }
         let _ = menu.append(&groups_sub);
@@ -216,29 +238,32 @@ pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMe
 
     // 6. Open & More submenus + Quit
     let open_sub = Submenu::new(text::MENU_OPEN, true);
-    append_open_items(&open_sub, snapshot, &mut actions);
+    append_open_items(&open_sub, snapshot, &mut recorder);
     let _ = menu.append(&open_sub);
 
     let more_sub = Submenu::new(text::MENU_MORE, true);
-    append_more_items(&more_sub, snapshot, now_unix, &mut actions);
+    append_more_items(&more_sub, snapshot, now_unix, &mut recorder);
     let _ = menu.append(&more_sub);
 
     append_root_item(
         &menu,
-        &mut actions,
+        &mut recorder,
         text::MENU_QUIT,
         true,
         Some(MenuAction::Quit),
     );
 
-    BuiltMenu { menu, actions }
+    BuiltMenu {
+        menu,
+        actions: recorder.actions,
+    }
 }
 
 fn build_group_submenu(
     group: &Group,
     snapshot: &Snapshot,
     page_size: usize,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
 ) -> Submenu {
     let is_pinned =
         !group.fixed.is_empty() && matches!(group.kind.as_str(), "URLTest" | "Fallback");
@@ -247,7 +272,7 @@ fn build_group_submenu(
     if group.switchable && !group.members.is_empty() {
         append_sub_item(
             &sub,
-            actions,
+            recorder,
             text::MENU_TEST_LATENCY,
             true,
             MenuAction::TestGroupLatency(group.name.clone()),
@@ -256,7 +281,7 @@ fn build_group_submenu(
         if is_pinned {
             append_sub_item(
                 &sub,
-                actions,
+                recorder,
                 text::MENU_AUTO_UNPIN,
                 true,
                 MenuAction::UnfixGroup(group.name.clone()),
@@ -293,7 +318,7 @@ fn build_group_submenu(
 
     if effective_page_size == 0 {
         for (member, delay) in members {
-            append_member_item(&sub, group, member, delay, actions);
+            append_member_item(&sub, group, member, delay, recorder);
         }
     } else {
         for (idx, chunk) in members.chunks(effective_page_size).enumerate() {
@@ -301,7 +326,7 @@ fn build_group_submenu(
             let end = start + chunk.len() - 1;
             let page_sub = Submenu::new(text::format_page_label(start, end), true);
             for &(member, delay) in chunk {
-                append_member_item(&page_sub, group, member, delay, actions);
+                append_member_item(&page_sub, group, member, delay, recorder);
             }
             let _ = sub.append(&page_sub);
         }
@@ -315,82 +340,73 @@ fn append_member_item(
     group: &Group,
     member: &str,
     delay: Option<u32>,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
 ) {
     let label = text::format_node_label(member, delay);
     let selected = member == group.now;
-    let id = next_action_id(
-        actions,
-        MenuAction::SelectProxy {
-            group: group.name.clone(),
-            member: member.to_string(),
-        },
-    );
+    let id = recorder.next_id(MenuAction::SelectProxy {
+        group: group.name.clone(),
+        member: member.to_string(),
+    });
     let item = CheckMenuItem::with_id(id, label, group.switchable, selected, None);
     let _ = target.append(&item);
 }
 
 fn append_sub_item(
     sub: &Submenu,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
     action: MenuAction,
 ) {
-    let item = MenuItem::with_id(next_action_id(actions, action), label, enabled, None);
+    let item = MenuItem::with_id(recorder.next_id(action), label, enabled, None);
     let _ = sub.append(&item);
 }
 
 fn append_sub_check(
     sub: &Submenu,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
     checked: bool,
     action: MenuAction,
 ) {
-    let item = CheckMenuItem::with_id(
-        next_action_id(actions, action),
-        label,
-        enabled,
-        checked,
-        None,
-    );
+    let item = CheckMenuItem::with_id(recorder.next_id(action), label, enabled, checked, None);
     let _ = sub.append(&item);
 }
 
-fn append_open_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuAction>) {
+fn append_open_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRecorder) {
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_OPEN_TRAY_CONFIG,
         true,
         MenuAction::OpenTrayConfig,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_OPEN_MIHOMO_CONFIG,
         snapshot.resolved_config.is_some(),
         MenuAction::OpenMihomoConfig,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_OPEN_PORTABLE_DIR,
         true,
         MenuAction::OpenPortableDir,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_OPEN_UI_DIR,
         true,
         MenuAction::OpenUiDir,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_OPEN_LOG_FILE,
         true,
         MenuAction::OpenLogFile,
@@ -401,11 +417,11 @@ fn append_more_items(
     sub: &Submenu,
     snapshot: &Snapshot,
     now_unix: i64,
-    actions: &mut Vec<MenuAction>,
+    recorder: &mut ActionRecorder,
 ) {
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_COPY_ENV_VARS,
         true,
         MenuAction::CopyEnvVars,
@@ -414,28 +430,28 @@ fn append_more_items(
         text::format_update_subscription_label(snapshot.subscription_updated_at(), now_unix);
     append_sub_item(
         sub,
-        actions,
+        recorder,
         &update_label,
         snapshot.controller_ok,
         MenuAction::RefreshSubscription,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_RESTART_CORE,
         true,
         MenuAction::RestartCore,
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         text::MENU_RESTART_APP,
         true,
         MenuAction::RestartApp,
     );
     append_sub_check(
         sub,
-        actions,
+        recorder,
         text::MENU_AUTOSTART,
         true,
         snapshot.autostart,
@@ -443,7 +459,7 @@ fn append_more_items(
     );
     append_sub_item(
         sub,
-        actions,
+        recorder,
         &text::format_version_label(text::APP_VERSION),
         true,
         MenuAction::ShowVersion,
@@ -498,7 +514,7 @@ mod tests {
             ..Default::default()
         };
 
-        let built = build(&snap, 0);
+        let built = build(&snap, 0, 1);
         assert!(matches!(built.actions[0], MenuAction::OpenWebUi));
         assert!(matches!(built.actions[1], MenuAction::SetSubscriptionUrl));
         assert!(
@@ -573,7 +589,7 @@ mod tests {
             ..Default::default()
         };
 
-        let built = build(&snap, 2);
+        let built = build(&snap, 2, 1);
         let selected_count = built
             .actions
             .iter()
@@ -629,7 +645,7 @@ mod tests {
             MenuFingerprint::from_snapshot_at(&s_2m, now)
         );
 
-        let built = build_at(&s_2m, 0, now);
+        let built = build_at(&s_2m, 0, 1, now);
         let more_sub = built
             .menu
             .items()
@@ -656,6 +672,52 @@ mod tests {
         assert_eq!(
             make_snap(false, "HTTP", Some(now - 120)).subscription_updated_at(),
             None
+        );
+    }
+
+    #[test]
+    fn parses_generation_scoped_action_ids() {
+        assert_eq!(parse_action_id("act_7_12"), Some((7, 12)));
+        assert_eq!(parse_action_id("act_0_0"), Some((0, 0)));
+        assert_eq!(parse_action_id("act_12"), None);
+        assert_eq!(parse_action_id("bad_1_2"), None);
+
+        let snap = Snapshot::default();
+        let built = build_at(&snap, 0, 42, 1_700_000_000);
+        let last_id = built
+            .menu
+            .items()
+            .last()
+            .map(|item| match item {
+                tray_icon::menu::MenuItemKind::MenuItem(i) => i.id().as_ref().to_string(),
+                _ => String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            parse_action_id(&last_id),
+            Some((42, built.actions.len() - 1))
+        );
+    }
+
+    #[test]
+    fn menu_fingerprint_is_stable_across_latency_insertion_order() {
+        let mut s1 = Snapshot {
+            controller_ok: true,
+            ..Default::default()
+        };
+        s1.node_latency.insert("Node-B".to_string(), Some(120));
+        s1.node_latency.insert("Node-A".to_string(), Some(45));
+
+        let mut s2 = Snapshot {
+            controller_ok: true,
+            ..Default::default()
+        };
+        s2.node_latency.insert("Node-A".to_string(), Some(45));
+        s2.node_latency.insert("Node-B".to_string(), Some(120));
+
+        assert_eq!(
+            MenuFingerprint::from_snapshot_at(&s1, 1_700_000_000),
+            MenuFingerprint::from_snapshot_at(&s2, 1_700_000_000)
         );
     }
 }

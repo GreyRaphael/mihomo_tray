@@ -31,6 +31,7 @@ pub struct MihomoTrayApp {
     worker_tx: Option<Sender<WorkerCommand>>,
     tray_icon: Option<TrayIcon>,
     actions: Vec<MenuAction>,
+    menu_generation: u64,
     last_icon: Option<IconKey>,
     last_tooltip: String,
     last_menu_fingerprint: Option<MenuFingerprint>,
@@ -61,6 +62,7 @@ impl MihomoTrayApp {
             worker_tx: None,
             tray_icon: None,
             actions: Vec::new(),
+            menu_generation: 1,
             last_icon: None,
             last_tooltip: String::new(),
             last_menu_fingerprint: None,
@@ -90,7 +92,7 @@ impl MihomoTrayApp {
 
         if self.tray_icon.is_none() {
             let snap = self.shared.lock().unwrap().clone();
-            let built = menu::build(&snap, snap.page_size);
+            let built = menu::build(&snap, snap.page_size, self.menu_generation);
             self.actions = built.actions;
             self.last_menu_fingerprint = Some(MenuFingerprint::from_snapshot(&snap));
 
@@ -123,7 +125,6 @@ impl MihomoTrayApp {
                     tracing::warn!("Failed to create tray icon: {err}");
                 }
             }
-            platform::after_event_loop_ready();
         }
     }
 
@@ -142,12 +143,16 @@ impl MihomoTrayApp {
     }
 
     fn handle_menu_event(&mut self, id_str: &str) {
-        let Some(idx) = id_str
-            .strip_prefix("act_")
-            .and_then(|s| s.parse::<usize>().ok())
-        else {
+        let Some((generation, idx)) = menu::parse_action_id(id_str) else {
             return;
         };
+        if generation != self.menu_generation {
+            tracing::debug!(
+                "Ignoring stale menu event from generation {generation} (current {})",
+                self.menu_generation
+            );
+            return;
+        }
         let Some(action) = self.actions.get(idx).cloned() else {
             return;
         };
@@ -355,8 +360,10 @@ impl MihomoTrayApp {
                 if platform::is_tray_menu_open() {
                     self.pending_menu_rebuild = true;
                 } else {
-                    let built = menu::build(&snap, snap.page_size);
+                    let next_gen = self.menu_generation.wrapping_add(1).max(1);
+                    let built = menu::build(&snap, snap.page_size, next_gen);
                     self.actions = built.actions;
+                    self.menu_generation = next_gen;
                     tray.set_menu(Some(Box::new(built.menu)));
                     self.last_menu_fingerprint = Some(fp);
                     self.pending_menu_rebuild = false;

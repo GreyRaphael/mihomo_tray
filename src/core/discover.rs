@@ -10,24 +10,10 @@ use crate::core::process::{self, RunningProcess};
 use crate::platform;
 use crate::text::{ERR_CORE_NOT_FOUND, ERR_NO_CONTROLLER, MIHOMO_CONFIG_NAME};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KernelSource {
-    Declared(PathBuf),
-    Discovered(PathBuf),
-}
-
-impl KernelSource {
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Declared(p) | Self::Discovered(p) => p,
-        }
-    }
-}
-
 pub fn find_kernel(
     portable_root: &Path,
     settings: &TraySettings,
-) -> Result<Option<KernelSource>, String> {
+) -> Result<Option<PathBuf>, String> {
     if let Some(declared) = tray::resolve_portable_path(portable_root, &settings.mihomo.path) {
         if !declared.is_file() {
             return Err(format!(
@@ -35,7 +21,7 @@ pub fn find_kernel(
                 declared.display()
             ));
         }
-        return Ok(Some(KernelSource::Declared(declared)));
+        return Ok(Some(declared));
     }
     Ok(discover_kernel(
         portable_root,
@@ -43,7 +29,7 @@ pub fn find_kernel(
     ))
 }
 
-fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<KernelSource> {
+fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<PathBuf> {
     let exact_name = platform::kernel_exe_name();
     let exact_candidates = [
         portable_root.join(exact_name),
@@ -52,7 +38,7 @@ fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<Ker
     ];
     for candidate in exact_candidates {
         if candidate.is_file() {
-            return Some(KernelSource::Discovered(candidate));
+            return Some(candidate);
         }
     }
 
@@ -60,7 +46,7 @@ fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<Ker
     // into ./core/ or ./ as long as there is an unambiguous single candidate.
     for dir in [portable_root.join("core"), portable_root.to_path_buf()] {
         if let Some(single) = find_single_kernel_in_dir(&dir) {
-            return Some(KernelSource::Discovered(single));
+            return Some(single);
         }
     }
 
@@ -69,7 +55,7 @@ fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<Ker
             let candidate = dir.join(exact_name);
             if candidate.is_file() {
                 let target = platform::resolve_shim_target(&candidate).unwrap_or(candidate);
-                return Some(KernelSource::Discovered(target));
+                return Some(target);
             }
         }
     }
@@ -88,12 +74,6 @@ fn find_single_kernel_in_dir(dir: &Path) -> Option<PathBuf> {
             }
             let name = entry.file_name();
             let name_str = name.to_str()?;
-            // Never pick our own tray executable if named similarly.
-            if name_str.to_ascii_lowercase().starts_with("mihomo-tray")
-                || name_str.to_ascii_lowercase().starts_with("mihomo_tray")
-            {
-                return None;
-            }
             platform::is_kernel_candidate_name(name_str).then_some(path)
         })
         .collect();
@@ -383,7 +363,7 @@ mod tests {
         std::fs::write(&self_bin, b"tray").unwrap();
 
         let found = discover_kernel(&root, None).expect("kernel should be discovered");
-        assert_eq!(found.path(), bin.as_path());
+        assert_eq!(found, bin);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -418,7 +398,7 @@ mod tests {
         let mut settings = TraySettings::default();
         settings.mihomo.path = "./custom/my-core.exe".to_string();
         let found = find_kernel(&root, &settings).unwrap().unwrap();
-        assert_eq!(found, KernelSource::Declared(custom_bin));
+        assert_eq!(found, custom_bin);
         let _ = std::fs::remove_dir_all(&root);
     }
 

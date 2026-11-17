@@ -1,5 +1,6 @@
 //! Shared runtime state, worker commands, and UI wakeup events.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -80,7 +81,7 @@ pub struct Snapshot {
     pub autostart: bool,
     pub kernel_running: bool,
     pub groups: Vec<Group>,
-    pub node_latency: Vec<(String, Option<u32>)>,
+    pub node_latency: BTreeMap<String, Option<u32>>,
     pub providers: Vec<Provider>,
     pub status_note: Option<String>,
     pub action_error: Option<String>,
@@ -118,10 +119,7 @@ impl Snapshot {
     }
 
     pub fn latency_for(&self, node: &str) -> Option<u32> {
-        self.node_latency
-            .iter()
-            .find(|(name, _)| name == node)
-            .and_then(|(_, delay)| *delay)
+        self.node_latency.get(node).copied().flatten()
     }
 
     pub fn subscription_updated_at(&self) -> Option<i64> {

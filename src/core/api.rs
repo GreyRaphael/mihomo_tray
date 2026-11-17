@@ -1,10 +1,10 @@
 //! Mihomo external-controller REST client using `ureq 3.5` (plain local HTTP).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use ureq::Agent;
+use ureq::{Agent, RequestBuilder};
 
 use crate::state::{Group, Provider};
 
@@ -15,12 +15,13 @@ const PROVIDER_HTTP_TIMEOUT_MS: u64 = 30_000;
 // Reloading config runs synchronous provider initialization on mihomo's side.
 const RELOAD_HTTP_TIMEOUT_MS: u64 = 45_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Client {
     pub host: String,
     pub port: u16,
     pub secret: String,
     pub timeout_ms: u32,
+    agent: Agent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,13 +57,21 @@ pub struct CoreConfigs {
 #[derive(Debug, Default)]
 pub struct ProxiesData {
     pub groups: Vec<Group>,
-    pub latency: Vec<(String, Option<u32>)>,
+    pub latency: BTreeMap<String, Option<u32>>,
 }
 
 #[derive(Debug, Default)]
 pub struct ProvidersData {
     pub providers: Vec<Provider>,
-    pub latency: Vec<(String, Option<u32>)>,
+    pub latency: BTreeMap<String, Option<u32>>,
+}
+
+enum RequestOp<'a> {
+    Get,
+    Delete,
+    PatchJson(&'a Value),
+    PutJson(&'a Value),
+    PutEmpty,
 }
 
 impl Client {
@@ -80,12 +89,17 @@ impl Client {
             .unwrap_or(trimmed);
         let authority = without_scheme.split('/').next().unwrap_or("").trim();
         let (host, port) = parse_host_port(authority).ok_or(ClientError::InvalidAddress)?;
+        let agent: Agent = Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
 
         Ok(Self {
             host,
             port,
             secret: secret.to_string(),
             timeout_ms: timeout_ms.clamp(200, 30_000),
+            agent,
         })
     }
 
@@ -116,107 +130,82 @@ impl Client {
             .replace("{secret}", &encoded_secret)
     }
 
-    fn agent(&self, timeout_ms: u64) -> Agent {
-        Agent::config_builder()
-            .timeout_global(Some(Duration::from_millis(timeout_ms)))
-            .http_status_as_error(false)
-            .build()
-            .into()
-    }
-
     fn auth_header(&self) -> Option<String> {
         (!self.secret.is_empty()).then(|| format!("Bearer {}", self.secret))
     }
 
-    fn get_json(&self, path: &str, timeout_ms: u64) -> Result<Value, String> {
+    fn execute_request(
+        &self,
+        op: RequestOp<'_>,
+        path: &str,
+        timeout_ms: u64,
+    ) -> Result<String, String> {
         let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(timeout_ms);
-        let mut req = agent.get(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req.call().map_err(|e| format!("GET {path} failed: {e}"))?;
+        let auth = self.auth_header();
+        let method_name = match op {
+            RequestOp::Get => "GET",
+            RequestOp::Delete => "DELETE",
+            RequestOp::PatchJson(_) => "PATCH",
+            RequestOp::PutJson(_) | RequestOp::PutEmpty => "PUT",
+        };
+
+        let resp_res = match op {
+            RequestOp::Get => {
+                configure_request(self.agent.get(&url), auth.as_deref(), timeout_ms).call()
+            }
+            RequestOp::Delete => {
+                configure_request(self.agent.delete(&url), auth.as_deref(), timeout_ms).call()
+            }
+            RequestOp::PatchJson(payload) => {
+                configure_request(self.agent.patch(&url), auth.as_deref(), timeout_ms)
+                    .send_json(payload)
+            }
+            RequestOp::PutJson(payload) => {
+                configure_request(self.agent.put(&url), auth.as_deref(), timeout_ms)
+                    .send_json(payload)
+            }
+            RequestOp::PutEmpty => {
+                configure_request(self.agent.put(&url), auth.as_deref(), timeout_ms).send_empty()
+            }
+        };
+
+        let mut resp = resp_res.map_err(|e| format!("{method_name} {path} failed: {e}"))?;
         let status = resp.status().as_u16();
         let body = resp
             .body_mut()
             .read_to_string()
-            .map_err(|e| format!("read GET {path} body failed: {e}"))?;
+            .map_err(|e| format!("read {method_name} {path} body failed: {e}"))?;
         if !(200..300).contains(&status) {
-            return Err(format!("GET {path} returned HTTP {status}: {body}"));
+            return Err(format!(
+                "{method_name} {path} returned HTTP {status}: {body}"
+            ));
         }
+        Ok(body)
+    }
+
+    fn get_json(&self, path: &str, timeout_ms: u64) -> Result<Value, String> {
+        let body = self.execute_request(RequestOp::Get, path, timeout_ms)?;
         serde_json::from_str(&body).map_err(|e| format!("invalid JSON from GET {path}: {e}"))
     }
 
     fn patch_json(&self, path: &str, payload: &Value) -> Result<(), String> {
-        let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(self.timeout_ms as u64);
-        let mut req = agent.patch(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req
-            .send_json(payload)
-            .map_err(|e| format!("PATCH {path} failed: {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("PATCH {path} returned HTTP {status}: {body}"));
-        }
-        Ok(())
+        self.execute_request(RequestOp::PatchJson(payload), path, self.timeout_ms as u64)
+            .map(|_| ())
     }
 
     fn put_json(&self, path: &str, payload: &Value, timeout_ms: u64) -> Result<(), String> {
-        let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(timeout_ms);
-        let mut req = agent.put(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req
-            .send_json(payload)
-            .map_err(|e| format!("PUT {path} failed: {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("PUT {path} returned HTTP {status}: {body}"));
-        }
-        Ok(())
+        self.execute_request(RequestOp::PutJson(payload), path, timeout_ms)
+            .map(|_| ())
     }
 
     fn put_empty(&self, path: &str, timeout_ms: u64) -> Result<(), String> {
-        let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(timeout_ms);
-        let mut req = agent.put(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req
-            .send_empty()
-            .map_err(|e| format!("PUT {path} failed: {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("PUT {path} returned HTTP {status}: {body}"));
-        }
-        Ok(())
+        self.execute_request(RequestOp::PutEmpty, path, timeout_ms)
+            .map(|_| ())
     }
 
     fn delete(&self, path: &str) -> Result<(), String> {
-        let url = format!("{}{path}", self.base_url());
-        let agent = self.agent(self.timeout_ms as u64);
-        let mut req = agent.delete(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", &auth);
-        }
-        let mut resp = req
-            .call()
-            .map_err(|e| format!("DELETE {path} failed: {e}"))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("DELETE {path} returned HTTP {status}: {body}"));
-        }
-        Ok(())
+        self.execute_request(RequestOp::Delete, path, self.timeout_ms as u64)
+            .map(|_| ())
     }
 
     pub fn probe(&self) -> Result<(), String> {
@@ -302,10 +291,10 @@ impl Client {
             return Ok(ProxiesData::default());
         };
         let mut groups = Vec::new();
-        let mut latency = Vec::new();
+        let mut latency = BTreeMap::new();
 
         for (name, entry) in map {
-            latency.push((name.clone(), last_history_delay(entry)));
+            latency.insert(name.clone(), last_history_delay(entry));
             let kind = entry
                 .get("type")
                 .and_then(Value::as_str)
@@ -356,7 +345,7 @@ impl Client {
             return Ok(ProvidersData::default());
         };
         let mut providers = Vec::new();
-        let mut latency_map: HashMap<String, Option<u32>> = HashMap::new();
+        let mut latency = BTreeMap::new();
 
         for (name, entry) in map {
             let vehicle = entry
@@ -376,7 +365,7 @@ impl Client {
             if let Some(proxies) = entry.get("proxies").and_then(Value::as_array) {
                 for node in proxies {
                     if let Some(node_name) = node.get("name").and_then(Value::as_str) {
-                        latency_map.insert(node_name.to_string(), last_history_delay(node));
+                        latency.insert(node_name.to_string(), last_history_delay(node));
                     }
                 }
             }
@@ -387,11 +376,23 @@ impl Client {
                 .cmp(&b.name.to_ascii_lowercase())
         });
 
-        Ok(ProvidersData {
-            providers,
-            latency: latency_map.into_iter().collect(),
-        })
+        Ok(ProvidersData { providers, latency })
     }
+}
+
+fn configure_request<B>(
+    builder: RequestBuilder<B>,
+    auth: Option<&str>,
+    timeout_ms: u64,
+) -> RequestBuilder<B> {
+    let mut req = builder
+        .config()
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
+        .build();
+    if let Some(auth) = auth {
+        req = req.header("Authorization", auth);
+    }
+    req
 }
 
 fn last_history_delay(entry: &Value) -> Option<u32> {
@@ -463,7 +464,7 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
     let mut unix = days * 86_400 + hour * 3600 + min * 60 + sec;
 
     // Handle optional timezone offset (`Z` or `+HH:MM` / `-HH:MM`) after fractional seconds.
-    let rest = &raw[19..];
+    let rest = raw.get(19..)?;
     let tz_start = rest.find(['Z', 'z', '+', '-'])?;
     let tz = &rest[tz_start..];
     if !tz.eq_ignore_ascii_case("Z") {
@@ -471,11 +472,8 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
         let clean_tz = &tz[1..];
         let (th, tm) = if let Some((h, m)) = clean_tz.split_once(':') {
             (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
-        } else if clean_tz.len() >= 4 {
-            (
-                clean_tz[..2].parse::<i64>().ok()?,
-                clean_tz[2..4].parse::<i64>().ok()?,
-            )
+        } else if let (Some(h), Some(m)) = (clean_tz.get(..2), clean_tz.get(2..4)) {
+            (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
         } else {
             return None;
         };
@@ -581,6 +579,40 @@ mod tests {
         // Short poll timeout (200ms) must not abort `PUT /configs?force=true`.
         let client = Client::new(&format!("127.0.0.1:{port}"), "", 200).unwrap();
         client.reload_configs().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn parses_providers_into_sorted_latency_map_and_surfaces_http_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).unwrap();
+                let resp = if idx == 0 {
+                    let body = r#"{"providers":{"subscription":{"vehicleType":"HTTP","updatedAt":"2025-01-01T08:00:00+08:00","proxies":[{"name":"Z-Node","history":[{"delay":88}]},{"name":"A-Node","history":[{"delay":24}]}]}}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbad mod".to_string()
+                };
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
+        let data = client.get_providers().unwrap();
+        let keys: Vec<&str> = data.latency.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["A-Node", "Z-Node"]);
+        assert_eq!(data.latency.get("A-Node"), Some(&Some(24)));
+
+        let err = client.set_mode("invalid").unwrap_err();
+        assert!(err.contains("PATCH /configs returned HTTP 400: bad mod"));
         handle.join().unwrap();
     }
 }

@@ -125,7 +125,7 @@ impl Worker {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    self.refresh(true);
+                    self.refresh();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -140,10 +140,18 @@ impl Worker {
 
         let controller_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
 
-        if !controller_alive && running.is_empty() && self.settings.mihomo.auto_start {
-            let _ = self.start_core_internal();
+        if !controller_alive
+            && running.is_empty()
+            && self.settings.mihomo.auto_start
+            && let Err(err) = self.start_core_internal()
+        {
+            tracing::warn!("Auto-start core failed: {err}");
+            let has_error = self.shared.lock().unwrap().action_error.is_some();
+            if !has_error {
+                self.set_action_error(Some(err));
+            }
         }
-        self.refresh(true);
+        self.refresh();
     }
 
     fn load_initial_persisted_state(&mut self) {
@@ -166,23 +174,19 @@ impl Worker {
         state_store::save(&self.home_dir, &self.persisted_state);
     }
 
-    fn reload_paths_and_runtime(&mut self) {
+    fn reload_settings_and_paths(&mut self, report_kernel_error: bool) {
         if let Ok(reloaded) = tray::load(&self.settings_path) {
             self.settings = reloaded;
         }
-        let kernel = discover::find_kernel(&self.portable_root, &self.settings);
-        match kernel {
-            Ok(Some(k)) => {
-                self.known_kernel_path = Some(k.path().to_path_buf());
-            }
-            Ok(None) => {
-                self.known_kernel_path = None;
-            }
+        match discover::find_kernel(&self.portable_root, &self.settings) {
+            Ok(path) => self.known_kernel_path = path,
             Err(err) => {
-                self.set_action_error(Some(err));
+                self.known_kernel_path = None;
+                if report_kernel_error {
+                    self.set_action_error(Some(err));
+                }
             }
         }
-
         let (home, cfg) = discover::resolve_home_and_config(
             &self.portable_root,
             &self.settings,
@@ -190,14 +194,19 @@ impl Worker {
         );
         self.home_dir = home;
         self.config_file = cfg;
+    }
+
+    fn reload_paths_and_runtime(&mut self) {
+        self.reload_settings_and_paths(true);
 
         if let Some(rec) = process::load_runtime_record(&self.home_dir) {
-            if process::is_pid_alive(rec.pid) {
+            if process::is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path)) {
                 self.recorded_pid = Some(rec.pid);
                 if self.known_kernel_path.is_none() {
                     self.known_kernel_path = Some(rec.kernel_path);
                 }
             } else {
+                self.recorded_pid = None;
                 process::clear_runtime_record(&self.home_dir);
             }
         }
@@ -247,7 +256,7 @@ impl Worker {
             Ok(()) => self.set_action_error(None),
             Err(err) => self.set_action_error(Some(err)),
         }
-        self.refresh(true);
+        self.refresh();
     }
 
     fn set_mode(&mut self, mode: &str) -> Result<(), String> {
@@ -358,7 +367,6 @@ impl Worker {
                 &RuntimeRecord {
                     pid: new_pid,
                     kernel_path: kernel,
-                    elevated: true,
                 },
             );
         }
@@ -393,9 +401,8 @@ impl Worker {
             return Ok(());
         }
 
-        let kernel = discover::find_kernel(&self.portable_root, &self.settings)?
+        let kernel_path = discover::find_kernel(&self.portable_root, &self.settings)?
             .ok_or_else(discover::kernel_missing_error)?;
-        let kernel_path = kernel.path().to_path_buf();
         self.known_kernel_path = Some(kernel_path.clone());
 
         let (home_dir, config_file) = discover::resolve_home_and_config(
@@ -414,18 +421,10 @@ impl Worker {
         self.set_status_note(Some(text::STATUS_STARTING_CORE));
         let child = process::spawn_normal(&kernel_path, &args)?;
         let pid = child.pid;
-        let elevated = child.elevated;
         self.managed = Some(child);
         self.recorded_pid = Some(pid);
         self.cached_version.clear();
-        process::save_runtime_record(
-            &self.home_dir,
-            &RuntimeRecord {
-                pid,
-                kernel_path,
-                elevated,
-            },
-        );
+        process::save_runtime_record(&self.home_dir, &RuntimeRecord { pid, kernel_path });
 
         let running_after = process::list_running_mihomo(self.known_kernel_path.as_deref());
         self.re_resolve_controller(&running_after);
@@ -434,12 +433,12 @@ impl Worker {
         res
     }
 
-    fn stop_core_internal(&mut self, disable_proxy: bool) -> Result<(), String> {
+    fn stop_core_internal(&mut self) -> Result<(), String> {
         self.set_status_note(Some(text::STATUS_STOPPING_CORE));
-        let res = self.stop_active_kernel(true);
+        let res = self.stop_active_kernel();
         self.set_status_note(None);
         res?;
-        if disable_proxy && platform::proxy_is_enabled() {
+        if platform::proxy_is_enabled() {
             let _ = platform::proxy_disable();
         }
         Ok(())
@@ -452,14 +451,14 @@ impl Worker {
         let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         if !running.is_empty() {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
-            let stop_res = self.stop_active_kernel(true);
+            let stop_res = self.stop_active_kernel();
             self.set_status_note(None);
             stop_res?;
         }
         self.start_core_internal()
     }
 
-    fn stop_active_kernel(&mut self, prompt_foreign: bool) -> Result<(), String> {
+    fn stop_active_kernel(&mut self) -> Result<(), String> {
         // First try managed non-elevated child directly.
         if let Some(mut managed) = self.managed.take()
             && let Some(ref mut child) = managed.child
@@ -488,7 +487,7 @@ impl Worker {
         )
         .cloned()
         .or_else(|| {
-            if prompt_foreign && running.len() == 1 {
+            if running.len() == 1 {
                 let candidate = &running[0];
                 let exe_label = candidate
                     .exe
@@ -671,7 +670,7 @@ impl Worker {
         let final_state = self.capture_live_or_persisted_state();
         self.persisted_state = final_state;
         self.save_persisted_state();
-        let _ = self.stop_core_internal(true);
+        let _ = self.stop_core_internal();
         let _ = self.proxy.send_event(AppEvent::QuitCompleted);
     }
 
@@ -685,32 +684,21 @@ impl Worker {
             self.managed = None;
         }
         if let Some(pid) = self.recorded_pid {
-            if process::is_pid_alive(pid) {
+            if process::is_recorded_kernel_alive(pid, self.known_kernel_path.as_deref()) {
                 return Some(pid);
             }
             self.recorded_pid = None;
+            process::clear_runtime_record(&self.home_dir);
         }
         None
     }
 
-    fn refresh(&mut self, include_groups: bool) {
+    fn refresh(&mut self) {
         let mut running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         let kernel_running = self.active_pid().is_some() || !running.is_empty();
 
         if !kernel_running {
-            if let Ok(reloaded) = tray::load(&self.settings_path) {
-                self.settings = reloaded;
-            }
-            if let Ok(Some(k)) = discover::find_kernel(&self.portable_root, &self.settings) {
-                self.known_kernel_path = Some(k.path().to_path_buf());
-            }
-            let (home, cfg) = discover::resolve_home_and_config(
-                &self.portable_root,
-                &self.settings,
-                self.known_kernel_path.as_deref(),
-            );
-            self.home_dir = home;
-            self.config_file = cfg;
+            self.reload_settings_and_paths(false);
             running = process::list_running_mihomo(self.known_kernel_path.as_deref());
             self.re_resolve_controller(&running);
         } else if self.client.is_none() {
@@ -791,7 +779,7 @@ impl Worker {
             .proxy
             .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
 
-        if !include_groups || !controller_ok {
+        if !controller_ok {
             return;
         }
 
@@ -806,7 +794,16 @@ impl Worker {
                 let mut latencies = proxies.latency;
                 if let Ok(prov) = providers_res {
                     snap.providers = prov.providers;
-                    latencies.extend(prov.latency);
+                    for (name, delay) in prov.latency {
+                        latencies
+                            .entry(name)
+                            .and_modify(|existing| {
+                                if existing.is_none() {
+                                    *existing = delay;
+                                }
+                            })
+                            .or_insert(delay);
+                    }
                 }
                 snap.node_latency = latencies;
             } else if let Ok(prov) = providers_res {

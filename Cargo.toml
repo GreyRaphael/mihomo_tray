@@ -21,7 +21,6 @@ ureq = { version = "3.5.2", default-features = false, features = ["json"] }
 winit = "0.30.13"
 
 [target.'cfg(windows)'.dependencies]
-deelevate = "0.2.0"
 tray-icon = { version = "0.26.1", default-features = false, features = ["muda-common-controls-v6"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

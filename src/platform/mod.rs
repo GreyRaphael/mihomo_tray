@@ -14,7 +14,6 @@ use windows as imp;
 
 pub const ELEVATE_START_FLAG: &str = "--elevate-start";
 pub const ELEVATE_STOP_FLAG: &str = "--elevate-stop";
-pub const ELEVATE_REPLACE_FLAG: &str = "--elevate-replace";
 pub const AFTER_RESTART_FLAG: &str = "--after-restart";
 
 /// Returns the directory containing the portable layout.
@@ -28,8 +27,13 @@ pub fn kernel_exe_name() -> &'static str {
     imp::kernel_exe_name()
 }
 
-/// Whether `file_name` matches a plausible mihomo kernel binary for auto-discovery.
+/// Whether `file_name` matches a plausible mihomo kernel binary for auto-discovery,
+/// excluding our own tray executable name.
 pub fn is_kernel_candidate_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.starts_with("mihomo-tray") || lower.starts_with("mihomo_tray") {
+        return false;
+    }
     imp::is_kernel_candidate_name(file_name)
 }
 
@@ -41,11 +45,6 @@ pub fn expand_env(value: &str) -> String {
 /// Resolves Scoop `.shim` target on Windows; returns `None` elsewhere or if not a shim.
 pub fn resolve_shim_target(path: &Path) -> Option<PathBuf> {
     imp::resolve_shim_target(path)
-}
-
-/// Whether the current process holds elevated administrator privileges.
-pub fn is_elevated() -> bool {
-    imp::is_elevated()
 }
 
 /// Reads whether the OS system proxy is currently enabled.
@@ -118,7 +117,7 @@ pub fn try_run_helper(
             let pid = args.get(2).and_then(|s| s.parse::<u32>().ok())?;
             Some(stop_pid(pid))
         }
-        ELEVATE_START_FLAG | ELEVATE_REPLACE_FLAG => {
+        ELEVATE_START_FLAG => {
             let pid = args.get(2).and_then(|s| s.parse::<u32>().ok())?;
             Some(start_from_pid(pid, &args[3..]))
         }
@@ -157,11 +156,6 @@ pub fn spawn_detached_self(args: &[String]) -> Result<(), String> {
     imp::spawn_hidden(&exe, args, None)
         .map(|_| ())
         .map_err(|e| format!("failed to relaunch application: {e}"))
-}
-
-/// Platform hook invoked right after the main event loop initializes.
-pub fn after_event_loop_ready() {
-    imp::after_event_loop_ready();
 }
 
 /// Whether a native tray popup menu is currently open on the calling UI thread.

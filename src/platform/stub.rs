@@ -27,10 +27,6 @@ pub fn resolve_shim_target(_path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn is_elevated() -> bool {
-    false
-}
-
 pub fn proxy_is_enabled() -> bool {
     false
 }
@@ -80,8 +76,6 @@ pub fn format_env_vars_command(port: u16) -> String {
         "export http_proxy=http://127.0.0.1:{port} https_proxy=http://127.0.0.1:{port} all_proxy=socks5://127.0.0.1:{port}"
     )
 }
-
-pub fn after_event_loop_ready() {}
 
 pub fn is_tray_menu_open() -> bool {
     false

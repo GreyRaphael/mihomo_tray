@@ -784,6 +784,7 @@ impl Worker {
             snap.page_size = self.settings.groups.page_size;
             if !controller_ok {
                 snap.groups.clear();
+                snap.providers.clear();
             }
         }
         let _ = self

@@ -124,6 +124,17 @@ impl Snapshot {
             .and_then(|(_, delay)| *delay)
     }
 
+    pub fn subscription_updated_at(&self) -> Option<i64> {
+        if !self.controller_ok {
+            return None;
+        }
+        self.providers
+            .iter()
+            .filter(|p| p.refreshable())
+            .filter_map(|p| p.updated_at)
+            .max()
+    }
+
     pub fn tooltip(&self) -> String {
         let mut lines = vec![self.status_line()];
         if let Some(note) = &self.status_note {

@@ -25,7 +25,7 @@ pub const MENU_OPEN_UI_DIR: &str = "Open WebUI Folder (ui/)";
 pub const MENU_OPEN_LOG_FILE: &str = "Open Log File";
 pub const MENU_MORE: &str = "More";
 pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
-pub const MENU_REFRESH_SUBSCRIPTION: &str = "Refresh Subscription";
+pub const MENU_REFRESH_SUBSCRIPTION: &str = "Update Subscription";
 pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
 pub const MENU_RESTART_APP: &str = "Restart Application";
 pub const MENU_AUTOSTART: &str = "Start with Windows";
@@ -91,4 +91,66 @@ pub fn format_page_label(start: usize, end: usize) -> String {
 
 pub fn format_version_label(version: &str) -> String {
     format!("Version: v{version}")
+}
+
+/// Formats `Update Subscription` with a coarse relative age bucket so tray
+/// menus only rebuild when the displayed minute/hour/day label changes.
+pub fn format_update_subscription_label(updated_at: Option<i64>, now_unix: i64) -> String {
+    let Some(ts) = updated_at else {
+        return MENU_REFRESH_SUBSCRIPTION.to_string();
+    };
+    let elapsed = now_unix.saturating_sub(ts);
+    let age = if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    };
+    format!("{MENU_REFRESH_SUBSCRIPTION} ({age})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_update_subscription_label_buckets() {
+        let now = 1_700_000_000;
+        assert_eq!(
+            format_update_subscription_label(None, now),
+            "Update Subscription"
+        );
+        // Clock skew slightly in the future should still read cleanly.
+        assert_eq!(
+            format_update_subscription_label(Some(now + 10), now),
+            "Update Subscription (just now)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 59), now),
+            "Update Subscription (just now)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 60), now),
+            "Update Subscription (1m ago)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 3_599), now),
+            "Update Subscription (59m ago)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 3_600), now),
+            "Update Subscription (1h ago)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 86_399), now),
+            "Update Subscription (23h ago)"
+        );
+        assert_eq!(
+            format_update_subscription_label(Some(now - 86_400), now),
+            "Update Subscription (1d ago)"
+        );
+    }
 }

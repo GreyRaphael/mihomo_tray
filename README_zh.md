@@ -72,7 +72,7 @@ mihomo-tray/
 - **Open**：快捷打开 `tray.yml`、`config.yaml`、便携根目录、`ui/` 目录及日志文件。
 - **More**：
   - `Copy Environment Variables`：复制终端代理环境变量命令到剪贴板；
-  - `Refresh Subscription`：立即刷新订阅/代理提供者；
+  - `Update Subscription`：立即刷新订阅/代理提供者（并在旁侧显示距上次更新的相对时间）；
   - `Restart Mihomo Core`：重新扫描并重启 mihomo 内核；
   - `Restart Application`：重启 `mihomo-tray` 应用（无单实例冲突并自动恢复运行状态）；
   - `Start with Windows`：注册/取消开机自启（基于当前便携 exe 路径）；

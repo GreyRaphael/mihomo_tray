@@ -1,5 +1,7 @@
 //! Cross-platform native tray menu builder built on `tray_icon::menu` (`muda 0.21`).
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::state::{Group, ProxyMode, Snapshot};
@@ -43,12 +45,17 @@ pub struct MenuFingerprint {
     autostart: bool,
     groups: Vec<Group>,
     node_latency: Vec<(String, Option<u32>)>,
+    update_subscription_label: String,
     resolved_config: Option<std::path::PathBuf>,
     page_size: usize,
 }
 
 impl MenuFingerprint {
     pub fn from_snapshot(snap: &Snapshot) -> Self {
+        Self::from_snapshot_at(snap, current_unix_secs())
+    }
+
+    pub fn from_snapshot_at(snap: &Snapshot, now_unix: i64) -> Self {
         Self {
             status_line: snap.status_line(),
             status_note: snap.status_note.clone(),
@@ -62,10 +69,21 @@ impl MenuFingerprint {
             autostart: snap.autostart,
             groups: snap.groups.clone(),
             node_latency: snap.node_latency.clone(),
+            update_subscription_label: text::format_update_subscription_label(
+                snap.subscription_updated_at(),
+                now_unix,
+            ),
             resolved_config: snap.resolved_config.clone(),
             page_size: snap.page_size,
         }
     }
+}
+
+fn current_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub struct BuiltMenu {
@@ -112,6 +130,10 @@ fn append_root_check(
 }
 
 pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
+    build_at(snapshot, page_size, current_unix_secs())
+}
+
+pub fn build_at(snapshot: &Snapshot, page_size: usize, now_unix: i64) -> BuiltMenu {
     let mut actions = Vec::new();
     let menu = Menu::new();
 
@@ -198,7 +220,7 @@ pub fn build(snapshot: &Snapshot, page_size: usize) -> BuiltMenu {
     let _ = menu.append(&open_sub);
 
     let more_sub = Submenu::new(text::MENU_MORE, true);
-    append_more_items(&more_sub, snapshot, &mut actions);
+    append_more_items(&more_sub, snapshot, now_unix, &mut actions);
     let _ = menu.append(&more_sub);
 
     append_root_item(
@@ -375,7 +397,12 @@ fn append_open_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuA
     );
 }
 
-fn append_more_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuAction>) {
+fn append_more_items(
+    sub: &Submenu,
+    snapshot: &Snapshot,
+    now_unix: i64,
+    actions: &mut Vec<MenuAction>,
+) {
     append_sub_item(
         sub,
         actions,
@@ -383,10 +410,12 @@ fn append_more_items(sub: &Submenu, snapshot: &Snapshot, actions: &mut Vec<MenuA
         true,
         MenuAction::CopyEnvVars,
     );
+    let update_label =
+        text::format_update_subscription_label(snapshot.subscription_updated_at(), now_unix);
     append_sub_item(
         sub,
         actions,
-        text::MENU_REFRESH_SUBSCRIPTION,
+        &update_label,
         snapshot.controller_ok,
         MenuAction::RefreshSubscription,
     );
@@ -437,6 +466,19 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item_texts(items: Vec<tray_icon::menu::MenuItemKind>) -> Vec<String> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                tray_icon::menu::MenuItemKind::MenuItem(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Check(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Submenu(i) => i.text(),
+                tray_icon::menu::MenuItemKind::Predefined(_) => "---".to_string(),
+                tray_icon::menu::MenuItemKind::Icon(i) => i.text(),
+            })
+            .collect()
+    }
 
     #[test]
     fn builds_requested_hierarchy_without_id_collisions() {
@@ -491,18 +533,7 @@ mod tests {
         );
         assert!(matches!(built.actions.last(), Some(MenuAction::Quit)));
 
-        let root_texts: Vec<String> = built
-            .menu
-            .items()
-            .into_iter()
-            .map(|item| match item {
-                tray_icon::menu::MenuItemKind::MenuItem(i) => i.text(),
-                tray_icon::menu::MenuItemKind::Check(i) => i.text(),
-                tray_icon::menu::MenuItemKind::Submenu(i) => i.text(),
-                tray_icon::menu::MenuItemKind::Predefined(_) => "---".to_string(),
-                tray_icon::menu::MenuItemKind::Icon(i) => i.text(),
-            })
-            .collect();
+        let root_texts = item_texts(built.menu.items());
         assert_eq!(
             root_texts,
             vec![
@@ -567,6 +598,64 @@ mod tests {
         assert_ne!(
             MenuFingerprint::from_snapshot(&s1),
             MenuFingerprint::from_snapshot(&s2)
+        );
+    }
+
+    #[test]
+    fn update_subscription_menu_tracks_age_buckets_without_churn() {
+        let now = 1_700_000_000;
+        let make_snap = |controller_ok: bool, vehicle: &str, updated_at: Option<i64>| Snapshot {
+            controller_ok,
+            providers: vec![crate::state::Provider {
+                name: "subscription".to_string(),
+                vehicle: vehicle.to_string(),
+                updated_at,
+            }],
+            ..Default::default()
+        };
+
+        // Within the same "just now" (<60s) bucket, fingerprint must not churn.
+        let s_5s = make_snap(true, "HTTP", Some(now - 5));
+        let s_45s = make_snap(true, "HTTP", Some(now - 45));
+        assert_eq!(
+            MenuFingerprint::from_snapshot_at(&s_5s, now),
+            MenuFingerprint::from_snapshot_at(&s_45s, now)
+        );
+
+        // Crossing into the minute bucket updates fingerprint and More submenu item text.
+        let s_2m = make_snap(true, "HTTP", Some(now - 120));
+        assert_ne!(
+            MenuFingerprint::from_snapshot_at(&s_45s, now),
+            MenuFingerprint::from_snapshot_at(&s_2m, now)
+        );
+
+        let built = build_at(&s_2m, 0, now);
+        let more_sub = built
+            .menu
+            .items()
+            .into_iter()
+            .find_map(|item| match item {
+                tray_icon::menu::MenuItemKind::Submenu(sub) if sub.text() == text::MENU_MORE => {
+                    Some(sub)
+                }
+                _ => None,
+            })
+            .expect("More submenu missing");
+        let more_texts = item_texts(more_sub.items());
+        assert!(
+            more_texts
+                .iter()
+                .any(|t| t == "Update Subscription (2m ago)")
+        );
+
+        // Non-refreshable Compatible groups and offline controller states fall back cleanly.
+        assert_eq!(
+            make_snap(true, "Compatible", Some(now - 120)).subscription_updated_at(),
+            None
+        );
+        assert_eq!(
+            make_snap(false, "HTTP", Some(now - 120)).subscription_updated_at(),
+            None
         );
     }
 }

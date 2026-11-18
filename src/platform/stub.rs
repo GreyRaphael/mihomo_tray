@@ -60,9 +60,6 @@ pub fn is_tray_menu_open() -> bool {
 /// Guards `rustydialogs`'s Linux backend `LazyLock`, which panics if no
 /// `kdialog`/`zenity` executable is available or when running headless.
 pub fn can_show_dialog() -> bool {
-    if cfg!(test) {
-        return false;
-    }
     #[cfg(target_os = "macos")]
     {
         true

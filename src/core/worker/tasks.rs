@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{CommandOutcome, Worker};
+use super::{ActionError, CommandOutcome, Worker};
 use crate::config::mihomo;
 use crate::core::api::Client;
 use crate::state::{AsyncTaskKind, Provider, WorkerCommand};
@@ -19,22 +19,13 @@ impl TaskSlot {
         self.active_generation.is_some()
     }
 
-    #[cfg(test)]
-    pub(super) fn mark_started_for_test(&mut self) -> u64 {
-        let generation = self.generation;
-        self.active_generation = Some(generation);
-        generation
-    }
-
-    fn current_generation(&self) -> u64 {
+    pub fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.active_generation = Some(self.generation);
         self.generation
     }
 
-    fn mark_started(&mut self, generation: u64) {
-        self.active_generation = Some(generation);
-    }
-
-    fn bump_generation(&mut self) -> u64 {
+    fn bump_pending_generation(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.generation
     }
@@ -44,7 +35,7 @@ impl TaskSlot {
         self.active_generation = None;
     }
 
-    fn complete(&mut self, task_gen: u64) -> bool {
+    pub fn complete(&mut self, task_gen: u64) -> bool {
         if self.active_generation != Some(task_gen) {
             return false;
         }
@@ -56,33 +47,51 @@ impl TaskSlot {
 #[derive(Default)]
 pub(super) struct SubscriptionTaskState {
     slot: TaskSlot,
-    pending_reload: bool,
+    pending_apply_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskCompletion {
     Stale,
-    ChainedReload,
+    ChainedReload(u64),
     Current,
 }
 
 impl SubscriptionTaskState {
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.slot.is_active()
     }
 
+    fn begin_refresh(&mut self) -> Option<u64> {
+        (!self.slot.is_active()).then(|| self.slot.begin())
+    }
+
+    fn begin_or_queue_apply(&mut self) -> (u64, bool) {
+        if self.slot.is_active() {
+            let generation = self.slot.bump_pending_generation();
+            self.pending_apply_generation = Some(generation);
+            (generation, false)
+        } else {
+            (self.slot.begin(), true)
+        }
+    }
+
+    fn activate_chained_apply(&mut self, generation: u64) {
+        self.slot.active_generation = Some(generation);
+    }
+
     pub fn invalidate(&mut self) {
         self.slot.invalidate();
-        self.pending_reload = false;
+        self.pending_apply_generation = None;
     }
 
     fn complete(&mut self, task_gen: u64) -> TaskCompletion {
         if !self.slot.complete(task_gen) {
             return TaskCompletion::Stale;
         }
-        if self.pending_reload {
-            self.pending_reload = false;
-            return TaskCompletion::ChainedReload;
+        if let Some(next_gen) = self.pending_apply_generation.take() {
+            return TaskCompletion::ChainedReload(next_gen);
         }
         TaskCompletion::Current
     }
@@ -143,12 +152,12 @@ impl Worker {
     pub(super) fn start_test_group_latency(
         &mut self,
         group: String,
-    ) -> Result<CommandOutcome, String> {
+    ) -> Result<CommandOutcome, ActionError> {
         let client = self.require_client()?.clone();
         if self.latency_tasks.is_active() {
             return Ok(CommandOutcome::KeepError);
         }
-        let generation = self.latency_tasks.current_generation();
+        let generation = self.latency_tasks.begin();
         if self.spawn_background_task(
             "mihomo-latency",
             AsyncTaskKind::LatencyTest { generation },
@@ -160,19 +169,18 @@ impl Worker {
                 )
             },
         ) {
-            self.latency_tasks.mark_started(generation);
             Ok(CommandOutcome::ClearError)
         } else {
+            self.latency_tasks.complete(generation);
             Ok(CommandOutcome::KeepError)
         }
     }
 
-    pub(super) fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, String> {
+    pub(super) fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, ActionError> {
         let client = self.require_client()?.clone();
-        if self.sub_tasks.is_active() {
+        let Some(generation) = self.sub_tasks.begin_refresh() else {
             return Ok(CommandOutcome::KeepError);
-        }
-        let generation = self.sub_tasks.slot.current_generation();
+        };
         if self.spawn_background_task(
             "mihomo-sub-refresh",
             AsyncTaskKind::RefreshSubscriptions { generation },
@@ -197,9 +205,9 @@ impl Worker {
                 (AsyncTaskKind::RefreshSubscriptions { generation }, err)
             },
         ) {
-            self.sub_tasks.slot.mark_started(generation);
             Ok(CommandOutcome::ClearError)
         } else {
+            self.sub_tasks.complete(generation);
             Ok(CommandOutcome::KeepError)
         }
     }
@@ -209,7 +217,8 @@ impl Worker {
             .cfg
             .home_dir()
             .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
-        if self.spawn_background_task(
+        self.sub_tasks.activate_chained_apply(generation);
+        if !self.spawn_background_task(
             "mihomo-sub-apply",
             AsyncTaskKind::ApplySubscription {
                 generation,
@@ -245,23 +254,21 @@ impl Worker {
                 )
             },
         ) {
-            self.sub_tasks.slot.mark_started(generation);
-        } else {
+            self.sub_tasks.complete(generation);
             self.state_sync.resolve_deferred(generation, true);
         }
     }
 
-    pub(super) fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
+    pub(super) fn set_subscription_url(&mut self, url: &str) -> Result<(), ActionError> {
         let saved = self.capture_live_or_persisted_state();
         mihomo::apply_subscription_url(self.cfg.config_file(), url)?;
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
-            let generation = self.sub_tasks.slot.bump_generation();
+            let (generation, spawn_now) = self.sub_tasks.begin_or_queue_apply();
             self.state_sync.defer_restore(generation, saved);
-            if self.sub_tasks.is_active() {
-                self.sub_tasks.pending_reload = true;
-                self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
-            } else {
+            if spawn_now {
                 self.spawn_apply_subscription_reload(client, generation);
+            } else {
+                self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
             }
             return Ok(());
         }
@@ -274,7 +281,7 @@ impl Worker {
         &mut self,
         kind: AsyncTaskKind,
         error: Option<String>,
-    ) -> Result<CommandOutcome, String> {
+    ) -> Result<CommandOutcome, ActionError> {
         match kind {
             AsyncTaskKind::LatencyTest { generation } => {
                 if !self.latency_tasks.complete(generation) {
@@ -284,7 +291,7 @@ impl Worker {
                     return Ok(CommandOutcome::KeepError);
                 }
                 match error {
-                    Some(err) => Err(err),
+                    Some(err) => Err(ActionError::general(err)),
                     None => Ok(CommandOutcome::KeepError),
                 }
             }
@@ -297,11 +304,11 @@ impl Worker {
                         }
                         Ok(CommandOutcome::KeepError)
                     }
-                    TaskCompletion::ChainedReload => {
+                    TaskCompletion::ChainedReload(next_gen) => {
                         if let Some(err) = error {
                             tracing::warn!("Superseded subscription task failed: {err}");
                         }
-                        self.chain_pending_sub_reload();
+                        self.chain_pending_sub_reload(next_gen);
                         Ok(CommandOutcome::KeepError)
                     }
                     TaskCompletion::Current => {
@@ -310,7 +317,7 @@ impl Worker {
                             self.state_sync.resolve_deferred(generation, reload_ok);
                         }
                         match error {
-                            Some(err) => Err(err),
+                            Some(err) => Err(ActionError::general(err)),
                             None => Ok(CommandOutcome::KeepError),
                         }
                     }
@@ -319,8 +326,7 @@ impl Worker {
         }
     }
 
-    fn chain_pending_sub_reload(&mut self) {
-        let generation = self.sub_tasks.slot.current_generation();
+    fn chain_pending_sub_reload(&mut self, generation: u64) {
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
             self.spawn_apply_subscription_reload(client, generation);
         } else {
@@ -419,14 +425,11 @@ mod tests {
             }
         });
 
-        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        let (mut worker, rx, _shared) = test_worker(&root, TraySettings::default(), None);
         worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
-        {
-            let mut snap = shared.lock().unwrap();
-            snap.controller_ok = true;
-            snap.mode = "global".to_string();
-            snap.tun = false;
-        }
+        worker.live.controller_ok = true;
+        worker.live.mode = "global".to_string();
+        worker.live.tun = false;
         worker.state_sync.set_persisted_for_test(PersistedState {
             system_proxy: false,
             mode: Some("global".to_string()),
@@ -562,13 +565,11 @@ mod tests {
         let root = crate::config::test_temp_dir("worker_latency_invalidate");
         let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
 
-        let gen0 = worker.latency_tasks.current_generation();
-        worker.latency_tasks.mark_started(gen0);
+        let gen0 = worker.latency_tasks.begin();
         worker.latency_tasks.invalidate();
         assert!(!worker.latency_tasks.is_active());
 
-        let gen1 = worker.latency_tasks.current_generation();
-        worker.latency_tasks.mark_started(gen1);
+        let gen1 = worker.latency_tasks.begin();
 
         // Stale gen0 failure must be ignored without clearing active gen1.
         let outcome = worker
@@ -586,7 +587,7 @@ mod tests {
                 error: Some("real latency error".to_string()),
             })
             .unwrap_err();
-        assert_eq!(err, "real latency error");
+        assert_eq!(err.message, "real latency error");
         assert!(!worker.latency_tasks.is_active());
 
         let _ = std::fs::remove_dir_all(&root);

@@ -1,5 +1,6 @@
 //! Portable process tracking (`.runtime.json` + `sysinfo 0.40`) and UAC helper entrypoints.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -18,7 +19,6 @@ pub const HELPER_EXIT_INVALID_ARGS: i32 = -1;
 const HELPER_EXIT_UNAUTHORIZED: i32 = -2;
 const HELPER_EXIT_STOP_FAILED: i32 = -3;
 const HELPER_EXIT_SPAWN_FAILED: i32 = -4;
-const HELPER_EXIT_PID_OVERFLOW: i32 = -5;
 
 /// Translates an internal elevated helper exit code into a concise diagnostic phrase.
 pub fn helper_exit_reason(code: i32) -> Option<&'static str> {
@@ -29,7 +29,6 @@ pub fn helper_exit_reason(code: i32) -> Option<&'static str> {
         }
         HELPER_EXIT_STOP_FAILED => Some("failed to terminate existing mihomo process"),
         HELPER_EXIT_SPAWN_FAILED => Some("failed to launch elevated mihomo executable"),
-        HELPER_EXIT_PID_OVERFLOW => Some("spawned PID exceeds supported i32 range"),
         _ => None,
     }
 }
@@ -124,10 +123,12 @@ impl ProcessInspector {
             let exe = proc_info.exe().map(Path::to_path_buf);
 
             let matches = platform::is_kernel_candidate_name(&name)
-                || expected_matcher
-                    .as_ref()
-                    .zip(exe.as_deref())
-                    .is_some_and(|(matcher, got)| matcher.matches(got));
+                || expected_matcher.as_ref().is_some_and(|matcher| {
+                    exe.as_deref().map_or_else(
+                        || matcher.matches_filename(proc_info.name()),
+                        |got| matcher.matches(got),
+                    )
+                });
 
             if matches {
                 let cmd = proc_info
@@ -214,6 +215,24 @@ pub fn pick_target_process<'a>(
     None
 }
 
+pub fn pick_spawned_process<'a>(
+    after: &'a [RunningProcess],
+    before_pids: &HashSet<u32>,
+    expected_kernel: Option<&Path>,
+) -> Option<&'a RunningProcess> {
+    let mut fresh = after.iter().filter(|p| !before_pids.contains(&p.pid));
+    if let Some(expected) = expected_kernel {
+        let matcher = ExpectedKernelMatcher::new(expected);
+        let fresh_vec: Vec<&RunningProcess> = fresh.collect();
+        return fresh_vec
+            .iter()
+            .copied()
+            .find(|p| p.exe.as_deref().is_some_and(|e| matcher.matches(e)))
+            .or_else(|| fresh_vec.into_iter().find(|p| p.exe.is_none()));
+    }
+    fresh.next()
+}
+
 pub fn spawn_normal(exe: &Path, args: &[String]) -> Result<ManagedChild, String> {
     let cwd = exe.parent();
     let child = platform::spawn_hidden(exe, args, cwd)
@@ -278,20 +297,23 @@ impl ExpectedKernelMatcher {
         let Some(got_name) = exe.file_name() else {
             return false;
         };
-        let same_filename = [
-            self.raw.file_name(),
-            self.canonical.as_deref().and_then(Path::file_name),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|want_name| eq_path(Path::new(want_name), Path::new(got_name)));
-        if !same_filename {
+        if !self.matches_filename(got_name) {
             return false;
         }
         match (self.canonical.as_deref(), std::fs::canonicalize(exe)) {
             (Some(ca), Ok(cb)) => eq_path(ca, &cb),
             _ => false,
         }
+    }
+
+    fn matches_filename(&self, got_name: &std::ffi::OsStr) -> bool {
+        [
+            self.raw.file_name(),
+            self.canonical.as_deref().and_then(Path::file_name),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|want_name| eq_path(Path::new(want_name), Path::new(got_name)))
     }
 }
 
@@ -344,10 +366,7 @@ pub fn helper_start_from_pid(pid: u32, args: &[String]) -> i32 {
     }
     let cwd = exe.parent();
     match platform::spawn_hidden(&exe, args, cwd) {
-        Ok(child) => match i32::try_from(child.id()) {
-            Ok(id) if id > 0 => id,
-            _ => HELPER_EXIT_PID_OVERFLOW,
-        },
+        Ok(_) => 0,
         Err(_) => HELPER_EXIT_SPAWN_FAILED,
     }
 }
@@ -368,12 +387,9 @@ fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
 
 fn is_authorized_helper_exe(name: &str, exe: &Path, portable_root: &Path) -> bool {
     let settings = tray::load(&tray::settings_path(portable_root)).unwrap_or_default();
-    let declared = tray::resolve_portable_path(portable_root, &settings.mihomo.path);
-    let discovered = declared.or_else(|| {
-        discover::find_kernel(portable_root, &settings)
-            .ok()
-            .flatten()
-    });
+    let discovered = discover::find_kernel(portable_root, &settings)
+        .ok()
+        .flatten();
     if discovered
         .as_deref()
         .is_some_and(|path| paths_match(exe, path))
@@ -509,10 +525,40 @@ mod tests {
             HELPER_EXIT_UNAUTHORIZED,
             HELPER_EXIT_STOP_FAILED,
             HELPER_EXIT_SPAWN_FAILED,
-            HELPER_EXIT_PID_OVERFLOW,
         ] {
             assert!(helper_exit_reason(code).is_some());
         }
         assert_eq!(helper_exit_reason(0), None);
+    }
+
+    #[test]
+    fn picks_newly_spawned_elevated_process_ignoring_preexisting_pids() {
+        let before: HashSet<u32> = [100, 200].into_iter().collect();
+        let expected = Path::new("/opt/core/mihomo.exe");
+        let after = vec![
+            RunningProcess {
+                pid: 100,
+                exe: Some(expected.to_path_buf()),
+                cmd: Vec::new(),
+            },
+            RunningProcess {
+                pid: 300,
+                exe: Some(PathBuf::from("/other/mihomo.exe")),
+                cmd: Vec::new(),
+            },
+            RunningProcess {
+                pid: 400,
+                exe: Some(expected.to_path_buf()),
+                cmd: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            pick_spawned_process(&after, &before, Some(expected)).map(|p| p.pid),
+            Some(400)
+        );
+        assert_eq!(
+            pick_spawned_process(&after[..2], &before, Some(expected)).map(|p| p.pid),
+            None
+        );
     }
 }

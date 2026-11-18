@@ -16,21 +16,80 @@ use std::time::Duration;
 use winit::event_loop::EventLoopProxy;
 
 use self::config_tracker::ConfigTracker;
+use self::lifecycle::KernelRuntime;
 use self::state_sync::StateSync;
 use self::tasks::{SubscriptionTaskState, TaskSlot};
 use crate::config::mihomo;
 use crate::config::state_store::PersistedState;
 use crate::config::tray::{GroupsSettings, TraySettings};
 use crate::core::api::{Client, CoreConfigs, ProvidersData, ProxiesData};
-use crate::core::process::{self, ManagedChild, ProcessInspector, RunningProcess};
+use crate::core::process::RunningProcess;
 use crate::platform;
 use crate::state::{self, AppEvent, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand};
 use crate::text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActionErrorKind {
+    TransientWait,
+    GuiOpen,
+    General,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ActionError {
+    pub kind: ActionErrorKind,
+    pub message: String,
+}
+
+impl ActionError {
+    pub fn general(message: impl Into<String>) -> Self {
+        Self {
+            kind: ActionErrorKind::General,
+            message: message.into(),
+        }
+    }
+
+    pub fn transient_wait(message: impl Into<String>) -> Self {
+        Self {
+            kind: ActionErrorKind::TransientWait,
+            message: message.into(),
+        }
+    }
+
+    pub fn gui_open(message: impl Into<String>) -> Self {
+        Self {
+            kind: ActionErrorKind::GuiOpen,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for ActionError {
+    fn from(message: String) -> Self {
+        Self::general(message)
+    }
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandOutcome {
     ClearError,
+    ClearKind(ActionErrorKind),
     KeepError,
+}
+
+#[derive(Default)]
+struct LiveState {
+    controller_ok: bool,
+    mode: String,
+    mixed_port: u16,
+    tun: bool,
+    sysproxy: bool,
 }
 
 #[derive(Default)]
@@ -124,20 +183,18 @@ pub fn spawn(
 struct Worker {
     cfg: ConfigTracker,
     state_sync: StateSync,
+    kernel: KernelRuntime,
+    live: LiveState,
     shared: SharedSnapshot,
     proxy: UiNotifier,
     stop_requested: Arc<AtomicBool>,
     tx: Sender<WorkerCommand>,
     latency_tasks: TaskSlot,
     sub_tasks: SubscriptionTaskState,
-    process_inspector: ProcessInspector,
-    managed: Option<ManagedChild>,
-    recorded_pid: Option<u32>,
     client: Option<Client>,
     last_controller_error: Option<String>,
-    last_gui_error: Option<String>,
+    action_error: Option<ActionError>,
     cached_version: String,
-    last_controller_ok: bool,
 }
 
 impl Worker {
@@ -155,26 +212,24 @@ impl Worker {
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = cfg.settings().groups.page_size;
-            snap.resolved_config = cfg.config_file().to_path_buf();
+            snap.resolved_config = Some(cfg.config_file().to_path_buf());
             snap.config_error = cfg.current_config_error();
         }
         let worker = Self {
             cfg,
             state_sync: StateSync::default(),
+            kernel: KernelRuntime::new(),
+            live: LiveState::default(),
             shared,
             proxy,
             stop_requested,
             tx,
             latency_tasks: TaskSlot::default(),
             sub_tasks: SubscriptionTaskState::default(),
-            process_inspector: ProcessInspector::new(),
-            managed: None,
-            recorded_pid: None,
             client: None,
             last_controller_error: None,
-            last_gui_error: None,
+            action_error: None,
             cached_version: String::new(),
-            last_controller_ok: false,
         };
         (worker, rx)
     }
@@ -187,7 +242,7 @@ impl Worker {
             match rx.recv_timeout(interval) {
                 Ok(first) => {
                     let mut outcome = CommandOutcome::KeepError;
-                    let mut burst_error = None;
+                    let mut burst_error: Option<ActionError> = None;
                     let mut quit_cancelled = false;
                     let mut next = Some(first);
 
@@ -204,6 +259,14 @@ impl Worker {
                             Ok(CommandOutcome::ClearError) => {
                                 burst_error = None;
                                 outcome = CommandOutcome::ClearError;
+                            }
+                            Ok(CommandOutcome::ClearKind(kind)) => {
+                                if burst_error.as_ref().is_some_and(|e| e.kind == kind) {
+                                    burst_error = None;
+                                }
+                                if self.action_error.as_ref().is_some_and(|e| e.kind == kind) {
+                                    outcome = CommandOutcome::ClearError;
+                                }
                             }
                             Ok(CommandOutcome::KeepError) => {}
                             Err(err) => burst_error = Some(err),
@@ -229,9 +292,7 @@ impl Worker {
         self.reload_paths_and_runtime();
         self.state_sync.load_initial(self.cfg.home_dir());
         self.cfg.refresh_autostart_cache();
-        let running = self
-            .process_inspector
-            .list_running_mihomo(self.cfg.known_kernel_path());
+        let running = self.kernel.list_running(self.cfg.known_kernel_path());
         self.startup_with_running(&running);
         if !self.stop_requested.load(Ordering::Acquire) {
             self.refresh();
@@ -250,7 +311,7 @@ impl Worker {
             && let Err(err) = self.start_core_internal()
         {
             tracing::warn!("Auto-start core failed: {err}");
-            if self.cfg.current_config_error().as_deref() != Some(err.as_str()) {
+            if self.cfg.current_config_error().as_deref() != Some(err.message.as_str()) {
                 self.set_action_error(Some(err));
             }
         }
@@ -260,21 +321,17 @@ impl Worker {
         self.cfg.reload_settings_and_paths();
         self.sync_config_error();
 
-        if let Some(rec) = process::load_runtime_record(self.cfg.home_dir()) {
-            if self
-                .process_inspector
-                .is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path))
-            {
-                self.recorded_pid = Some(rec.pid);
-                self.cfg.set_known_kernel_path_if_none(rec.kernel_path);
-            } else {
-                self.recorded_pid = None;
-                process::clear_runtime_record(self.cfg.home_dir());
-            }
+        if let Some(kernel_path) = self.kernel.sync_runtime_record(self.cfg.home_dir()) {
+            self.cfg.set_known_kernel_path_if_none(kernel_path);
         }
     }
 
-    fn handle_command(&mut self, cmd: WorkerCommand) -> Result<CommandOutcome, String> {
+    pub(super) fn invalidate_async_tasks(&mut self) {
+        self.sub_tasks.invalidate();
+        self.latency_tasks.invalidate();
+    }
+
+    fn handle_command(&mut self, cmd: WorkerCommand) -> Result<CommandOutcome, ActionError> {
         match cmd {
             WorkerCommand::SetMode(mode) => {
                 self.set_mode(mode).map(|()| CommandOutcome::ClearError)
@@ -283,14 +340,14 @@ impl Worker {
                 .toggle_system_proxy()
                 .map(|()| CommandOutcome::ClearError),
             WorkerCommand::ToggleTun => self.toggle_tun().map(|()| CommandOutcome::ClearError),
-            WorkerCommand::SelectProxy { group, member } => self
+            WorkerCommand::SelectProxy { group, member } => Ok(self
                 .require_client()?
                 .select_proxy(&group, &member)
-                .map(|()| CommandOutcome::ClearError),
-            WorkerCommand::UnfixGroup(group) => self
+                .map(|()| CommandOutcome::ClearError)?),
+            WorkerCommand::UnfixGroup(group) => Ok(self
                 .require_client()?
                 .unfix_group(&group)
-                .map(|()| CommandOutcome::ClearError),
+                .map(|()| CommandOutcome::ClearError)?),
             WorkerCommand::TestGroupLatency(group) => self.start_test_group_latency(group),
             WorkerCommand::RefreshSubscriptions => self.start_refresh_subscriptions(),
             WorkerCommand::SetSubscriptionUrl(url) => self
@@ -304,19 +361,11 @@ impl Worker {
                 let enabled = platform::autostart_is_enabled();
                 let res = platform::autostart_set(!enabled);
                 self.cfg.refresh_autostart_cache();
-                res.map(|()| CommandOutcome::ClearError)
+                Ok(res.map(|()| CommandOutcome::ClearError)?)
             }
-            WorkerCommand::GuiOpenResult(Err(err)) => {
-                self.last_gui_error = Some(err.clone());
-                Err(err)
-            }
+            WorkerCommand::GuiOpenResult(Err(err)) => Err(ActionError::gui_open(err)),
             WorkerCommand::GuiOpenResult(Ok(())) => {
-                if let Some(gui_err) = self.last_gui_error.take()
-                    && self.shared.lock().unwrap().action_error.as_deref() == Some(gui_err.as_str())
-                {
-                    return Ok(CommandOutcome::ClearError);
-                }
-                Ok(CommandOutcome::KeepError)
+                Ok(CommandOutcome::ClearKind(ActionErrorKind::GuiOpen))
             }
             WorkerCommand::AsyncDone { kind, error } => self.handle_async_done(kind, error),
             WorkerCommand::Quit { .. } => unreachable!("Quit is handled directly in Worker::run"),
@@ -329,58 +378,57 @@ impl Worker {
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())
     }
 
-    fn set_mode(&mut self, mode: ProxyMode) -> Result<(), String> {
+    fn set_mode(&mut self, mode: ProxyMode) -> Result<(), ActionError> {
         let mode_str = mode.as_api_str();
         if mode_str.is_empty() {
-            return Err(text::ERR_UNSUPPORTED_PROXY_MODE.to_string());
+            return Err(ActionError::general(text::ERR_UNSUPPORTED_PROXY_MODE));
         }
         self.require_client()?.set_mode(mode_str)?;
         self.state_sync
             .update(self.cfg.home_dir(), |s| s.mode = Some(mode_str.to_string()));
-        self.shared.lock().unwrap().mode = mode_str.to_string();
+        self.live.mode = mode_str.to_string();
         Ok(())
     }
 
-    fn toggle_system_proxy(&mut self) -> Result<(), String> {
+    fn toggle_system_proxy(&mut self) -> Result<(), ActionError> {
         if platform::proxy_is_enabled() {
             platform::proxy_disable()?;
             self.state_sync
                 .update(self.cfg.home_dir(), |s| s.system_proxy = false);
-            self.shared.lock().unwrap().sysproxy = false;
+            self.live.sysproxy = false;
             return Ok(());
         }
         let cfg = self.require_client()?.get_configs()?;
         if cfg.mixed_port == 0 {
-            return Err(text::ERR_NO_MIXED_PORT_FOR_PROXY.to_string());
+            return Err(ActionError::general(text::ERR_NO_MIXED_PORT_FOR_PROXY));
         }
         platform::proxy_enable(cfg.mixed_port, &self.cfg.settings().proxy.bypass)?;
         self.state_sync
             .update(self.cfg.home_dir(), |s| s.system_proxy = true);
-        self.shared.lock().unwrap().sysproxy = true;
+        self.live.sysproxy = true;
         Ok(())
     }
 
-    fn toggle_tun(&mut self) -> Result<(), String> {
+    fn toggle_tun(&mut self) -> Result<(), ActionError> {
         let current = self.require_client()?.get_configs()?;
         let want_enable = !current.tun_enable;
         self.apply_tun_state(want_enable)?;
         self.state_sync
             .update(self.cfg.home_dir(), |s| s.tun = Some(want_enable));
-        self.shared.lock().unwrap().tun = want_enable;
+        self.live.tun = want_enable;
         Ok(())
     }
 
-    fn copy_env_vars(&self) -> Result<(), String> {
-        let snap_port = self.shared.lock().unwrap().mixed_port;
-        let port = if snap_port > 0 {
-            snap_port
+    fn copy_env_vars(&self) -> Result<(), ActionError> {
+        let port = if self.live.mixed_port > 0 {
+            self.live.mixed_port
         } else {
             mihomo::read_file(self.cfg.config_file())
                 .map(|info| info.mixed_port)
                 .unwrap_or(0)
         };
         if port == 0 {
-            return Err(text::ERR_NO_MIXED_PORT_FOR_ENV.to_string());
+            return Err(ActionError::general(text::ERR_NO_MIXED_PORT_FOR_ENV));
         }
         let cmd = platform::format_env_vars_command(port);
         platform::copy_to_clipboard(&cmd)?;
@@ -389,13 +437,12 @@ impl Worker {
     }
 
     fn capture_live_or_persisted_state(&self) -> PersistedState {
-        let snap = self.shared.lock().unwrap();
-        let sysproxy = if snap.controller_ok {
-            platform::proxy_is_enabled()
-        } else {
-            false
-        };
-        self.state_sync.capture(&snap, sysproxy)
+        self.state_sync.capture(
+            self.live.controller_ok,
+            &self.live.mode,
+            self.live.tun,
+            self.live.sysproxy,
+        )
     }
 
     fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) {
@@ -445,17 +492,19 @@ impl Worker {
         {
             match client.set_mode(mode) {
                 Ok(()) => cfg.mode = mode.clone(),
-                Err(err) => self.set_action_error(Some(err)),
+                Err(err) => self.set_action_error(Some(ActionError::general(err))),
             }
         }
 
         if restore.system_proxy {
             if cfg.mixed_port == 0 {
-                self.set_action_error(Some(text::ERR_NO_MIXED_PORT_FOR_RESTORE.to_string()));
+                self.set_action_error(Some(ActionError::general(
+                    text::ERR_NO_MIXED_PORT_FOR_RESTORE,
+                )));
             } else if let Err(err) =
                 platform::proxy_enable(cfg.mixed_port, &self.cfg.settings().proxy.bypass)
             {
-                self.set_action_error(Some(err));
+                self.set_action_error(Some(ActionError::general(err)));
             }
         }
     }
@@ -471,7 +520,7 @@ impl Worker {
             }
             Err(err) => {
                 self.stop_requested.store(false, Ordering::Release);
-                self.set_action_error(Some(err));
+                self.set_action_error(Some(ActionError::general(err)));
                 self.proxy.send(AppEvent::QuitCancelled);
                 false
             }
@@ -479,7 +528,10 @@ impl Worker {
     }
 
     fn resolve_live_controller(&mut self) -> bool {
-        let tracked_alive = self.active_pid().is_some();
+        let tracked_alive = self
+            .kernel
+            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir())
+            .is_some();
         let changes = self.cfg.poll_changes(tracked_alive);
         if changes.error_changed {
             self.sync_config_error();
@@ -491,11 +543,10 @@ impl Worker {
         let might_resolve = changes.controller_changed
             || changes.config_file_changed
             || self.client.is_none()
-            || !self.last_controller_ok;
+            || !self.live.controller_ok;
 
         let running = if !tracked_alive || might_resolve {
-            self.process_inspector
-                .list_running_mihomo(self.cfg.known_kernel_path())
+            self.kernel.list_running(self.cfg.known_kernel_path())
         } else {
             Vec::new()
         };
@@ -504,7 +555,7 @@ impl Worker {
         let need_resolve = changes.controller_changed
             || (changes.settings_changed && !kernel_running)
             || changes.config_file_changed
-            || (kernel_running && (self.client.is_none() || !self.last_controller_ok));
+            || (kernel_running && (self.client.is_none() || !self.live.controller_ok));
         if need_resolve {
             self.re_resolve_controller(&running);
         }
@@ -515,7 +566,6 @@ impl Worker {
         let Some(client) = self.client.clone() else {
             return PolledConfig::default();
         };
-        let initial_url = Some(client.format_web_ui_url(&self.cfg.settings().ui.web_url));
         match client.get_configs() {
             Ok(mut cfg) => {
                 self.apply_pending_restore_if_needed(&mut cfg);
@@ -539,7 +589,6 @@ impl Worker {
             Err(err) => PolledConfig {
                 controller_ok: false,
                 controller_error: Some(err),
-                web_ui_url: initial_url,
                 ..PolledConfig::default()
             },
         }
@@ -548,10 +597,14 @@ impl Worker {
     fn refresh(&mut self) {
         let kernel_running = self.resolve_live_controller();
         let polled = self.poll_controller_configs();
-        self.last_controller_ok = polled.controller_ok;
-
         let sysproxy = platform::proxy_is_enabled();
         self.cfg.refresh_autostart_if_stale();
+
+        self.live.controller_ok = polled.controller_ok;
+        self.live.mode = polled.mode.clone();
+        self.live.mixed_port = polled.mixed_port;
+        self.live.tun = polled.tun;
+        self.live.sysproxy = sysproxy;
 
         if polled.controller_ok {
             self.state_sync.sync_live_if_idle(
@@ -560,6 +613,13 @@ impl Worker {
                 &polled.mode,
                 polled.tun,
             );
+            if self
+                .action_error
+                .as_ref()
+                .is_some_and(|e| e.kind == ActionErrorKind::TransientWait)
+            {
+                self.action_error = None;
+            }
         }
 
         let (proxies_res, providers_res) = if polled.controller_ok
@@ -574,19 +634,7 @@ impl Worker {
             let mut snap = self.shared.lock().unwrap();
             let controller_ok = polled.controller_ok;
             self.apply_polled_config(&mut snap, polled, sysproxy, kernel_running);
-
-            if controller_ok
-                && matches!(
-                    snap.action_error.as_deref(),
-                    Some(
-                        text::ERR_CORE_NOT_RESPONDING
-                            | text::ERR_CORE_RESTART_TIMEOUT
-                            | text::ERR_CORE_STOPPED_UNEXPECTEDLY
-                    )
-                )
-            {
-                snap.action_error = None;
-            }
+            snap.action_error = self.action_error.as_ref().map(|e| e.message.clone());
 
             if !controller_ok {
                 snap.groups.clear();
@@ -634,7 +682,7 @@ impl Worker {
             None
         };
         snap.web_ui_url = polled.web_ui_url;
-        snap.resolved_config = self.cfg.config_file().to_path_buf();
+        snap.resolved_config = Some(self.cfg.config_file().to_path_buf());
         snap.page_size = self.cfg.settings().groups.page_size;
     }
 
@@ -654,9 +702,11 @@ impl Worker {
         snap.config_error = err;
     }
 
-    fn set_action_error(&self, err: Option<String>) {
+    fn set_action_error(&mut self, err: Option<ActionError>) {
+        self.action_error = err;
+        let msg = self.action_error.as_ref().map(|e| e.message.clone());
         let mut snap = self.shared.lock().unwrap();
-        snap.action_error = err;
+        snap.action_error = msg;
     }
 }
 
@@ -687,8 +737,8 @@ fn apply_proxies_and_providers(
         Some(Ok(prov)) => {
             snap.providers = prov.providers;
             match latencies {
-                Some(ref mut map) => merge_latency(map, prov.latency),
-                None => merge_latency(&mut snap.node_latency, prov.latency),
+                Some(ref mut map) => merge_latency(map, prov.latency, false),
+                None => merge_latency(&mut snap.node_latency, prov.latency, true),
             }
         }
         Some(Err(err)) => {
@@ -702,12 +752,16 @@ fn apply_proxies_and_providers(
     }
 }
 
-fn merge_latency(target: &mut BTreeMap<String, Option<u32>>, extra: BTreeMap<String, Option<u32>>) {
+fn merge_latency(
+    target: &mut BTreeMap<String, Option<u32>>,
+    extra: BTreeMap<String, Option<u32>>,
+    overwrite_with_measured: bool,
+) {
     for (name, delay) in extra {
         target
             .entry(name)
             .and_modify(|existing| {
-                if existing.is_none() {
+                if existing.is_none() || (overwrite_with_measured && delay.is_some()) {
                     *existing = delay;
                 }
             })
@@ -840,18 +894,20 @@ mod tests {
         settings.mihomo.auto_start = false;
         let (mut worker, _rx, shared) = test_worker(&root, settings, None);
         worker.startup();
-        worker.set_action_error(Some(text::ERR_CORE_NOT_FOUND.to_string()));
+        worker.set_action_error(Some(ActionError::general(text::ERR_CORE_NOT_FOUND)));
         worker.refresh();
 
         let snap = shared.lock().unwrap();
         assert!(!snap.controller_ok);
         assert_eq!(snap.controller_error, None);
+        assert_eq!(snap.web_ui_url, None);
         assert_eq!(snap.error(), Some(text::ERR_CORE_NOT_FOUND));
         drop(snap);
 
         worker.set_action_error(None);
         worker.refresh();
         assert_eq!(shared.lock().unwrap().error(), None);
+        assert_eq!(shared.lock().unwrap().web_ui_url, None);
 
         // Missing config.yaml while stopped must not surface ERR_NO_CONTROLLER noise.
         std::fs::remove_file(cfg_dir.join("config.yaml")).unwrap();
@@ -867,8 +923,8 @@ mod tests {
         let root = crate::config::test_temp_dir("worker_async_err");
         let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
 
-        worker.set_action_error(Some("subscription refresh failed".to_string()));
-        let gen0 = worker.latency_tasks.mark_started_for_test();
+        worker.set_action_error(Some(ActionError::general("subscription refresh failed")));
+        let gen0 = worker.latency_tasks.begin();
 
         let outcome = worker
             .handle_command(WorkerCommand::AsyncDone {
@@ -887,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn set_mode_updates_snapshot_immediately_so_capture_keeps_latest_mode() {
+    fn set_mode_updates_live_state_immediately_so_capture_keeps_latest_mode() {
         use std::io::Write;
         use std::net::TcpListener;
 
@@ -903,15 +959,15 @@ mod tests {
                 .unwrap();
         });
 
-        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
         worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
-        shared.lock().unwrap().controller_ok = true;
-        shared.lock().unwrap().mode = "rule".to_string();
+        worker.live.controller_ok = true;
+        worker.live.mode = "rule".to_string();
 
         worker
             .handle_command(WorkerCommand::SetMode(ProxyMode::Global))
             .unwrap();
-        assert_eq!(shared.lock().unwrap().mode, "global");
+        assert_eq!(worker.live.mode, "global");
         assert_eq!(
             worker.capture_live_or_persisted_state().mode.as_deref(),
             Some("global")
@@ -924,13 +980,13 @@ mod tests {
     #[test]
     fn shutdown_interruption_preserves_pending_tun_restore_state() {
         let root = crate::config::test_temp_dir("worker_tun_interrupt");
-        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
         let saved = PersistedState {
             system_proxy: true,
             mode: Some("global".to_string()),
             tun: Some(true),
         };
-        worker.state_sync.arm_ready_restore(saved.clone());
+        worker.state_sync.arm_ready_restore(saved);
         worker.stop_requested.store(true, Ordering::Release);
 
         let mut cfg = CoreConfigs {
@@ -945,8 +1001,8 @@ mod tests {
             worker.state_sync.persisted().and_then(|s| s.tun),
             Some(true)
         );
-        shared.lock().unwrap().controller_ok = true;
-        shared.lock().unwrap().tun = false;
+        worker.live.controller_ok = true;
+        worker.live.tun = false;
         assert_eq!(worker.capture_live_or_persisted_state().tun, Some(true));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -957,11 +1013,13 @@ mod tests {
         let mut snap = Snapshot::default();
         snap.node_latency.insert("Node-A".to_string(), Some(25));
         snap.node_latency.insert("Node-B".to_string(), None);
+        snap.node_latency.insert("Node-D".to_string(), Some(15));
 
         let mut prov_latency = BTreeMap::new();
         prov_latency.insert("Node-A".to_string(), None);
         prov_latency.insert("Node-B".to_string(), Some(40));
         prov_latency.insert("Node-C".to_string(), Some(60));
+        prov_latency.insert("Node-D".to_string(), Some(55));
 
         let prov = ProvidersData {
             providers: Vec::new(),
@@ -977,6 +1035,7 @@ mod tests {
         assert_eq!(snap.node_latency.get("Node-A"), Some(&Some(25)));
         assert_eq!(snap.node_latency.get("Node-B"), Some(&Some(40)));
         assert_eq!(snap.node_latency.get("Node-C"), Some(&Some(60)));
+        assert_eq!(snap.node_latency.get("Node-D"), Some(&Some(55)));
     }
 
     #[test]
@@ -1105,13 +1164,15 @@ mod tests {
         worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
 
         // Transient timeout clears once controller responds.
-        worker.set_action_error(Some(text::ERR_CORE_NOT_RESPONDING.to_string()));
+        worker.set_action_error(Some(ActionError::transient_wait(
+            text::ERR_CORE_NOT_RESPONDING,
+        )));
         worker.refresh();
         assert!(shared.lock().unwrap().controller_ok);
         assert_eq!(shared.lock().unwrap().action_error, None);
 
         // Non-transient action error must be preserved across healthy polls.
-        worker.set_action_error(Some(text::ERR_TUN_ELEVATION_DECLINED.to_string()));
+        worker.set_action_error(Some(ActionError::general(text::ERR_TUN_ELEVATION_DECLINED)));
         worker.refresh();
         assert_eq!(
             shared.lock().unwrap().action_error.as_deref(),
@@ -1128,7 +1189,9 @@ mod tests {
     #[test]
     fn gui_open_result_sets_and_clears_only_matching_action_error() {
         let root = crate::config::test_temp_dir("worker_gui_open_err");
-        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        let mut settings = TraySettings::default();
+        settings.mihomo.auto_start = false;
+        let (mut worker, rx, shared) = test_worker(&root, settings, None);
 
         let err = worker
             .handle_command(WorkerCommand::GuiOpenResult(Err("open failed".to_string())))
@@ -1140,27 +1203,58 @@ mod tests {
         );
 
         // If an unrelated error replaced it, GuiOpenResult(Ok) must not clear the unrelated error.
-        worker.set_action_error(Some("other error".to_string()));
+        worker.set_action_error(Some(ActionError::general("other error")));
         assert_eq!(
             worker
                 .handle_command(WorkerCommand::GuiOpenResult(Ok(())))
                 .unwrap(),
-            CommandOutcome::KeepError
+            CommandOutcome::ClearKind(ActionErrorKind::GuiOpen)
+        );
+        assert_eq!(
+            shared.lock().unwrap().action_error.as_deref(),
+            Some("other error")
         );
 
-        // When it still matches, GuiOpenResult(Ok) returns ClearError.
-        let err2 = worker
-            .handle_command(WorkerCommand::GuiOpenResult(Err(
+        // Same-burst GuiOpenResult(Err) followed by GuiOpenResult(Ok) must cancel itself out
+        // without clobbering the preexisting unrelated "other error".
+        worker
+            .tx
+            .send(WorkerCommand::GuiOpenResult(Err(
                 "open failed 2".to_string()
             )))
-            .unwrap_err();
-        worker.set_action_error(Some(err2));
+            .unwrap();
+        worker
+            .tx
+            .send(WorkerCommand::GuiOpenResult(Ok(())))
+            .unwrap();
+        worker
+            .tx
+            .send(WorkerCommand::Quit { interactive: false })
+            .unwrap();
+        worker.run(&rx);
         assert_eq!(
-            worker
-                .handle_command(WorkerCommand::GuiOpenResult(Ok(())))
-                .unwrap(),
-            CommandOutcome::ClearError
+            shared.lock().unwrap().action_error.as_deref(),
+            Some("other error")
         );
+
+        // When no unrelated error is active, same-burst Err -> Ok ends cleanly with None.
+        worker.set_action_error(None);
+        worker
+            .tx
+            .send(WorkerCommand::GuiOpenResult(Err(
+                "open failed 3".to_string()
+            )))
+            .unwrap();
+        worker
+            .tx
+            .send(WorkerCommand::GuiOpenResult(Ok(())))
+            .unwrap();
+        worker
+            .tx
+            .send(WorkerCommand::Quit { interactive: false })
+            .unwrap();
+        worker.run(&rx);
+        assert_eq!(shared.lock().unwrap().action_error, None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

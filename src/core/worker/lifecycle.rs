@@ -1,13 +1,16 @@
 //! Kernel process lifecycle, controller probing, and TUN UAC elevation for [`super::Worker`].
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::Worker;
+use super::{ActionError, Worker};
 use crate::config::mihomo;
+use crate::config::tray::TraySettings;
 use crate::core::api::{Client, CoreConfigs};
 use crate::core::discover;
-use crate::core::process::{self, RunningProcess, RuntimeRecord};
+use crate::core::process::{self, ManagedChild, ProcessInspector, RunningProcess, RuntimeRecord};
 use crate::platform;
 use crate::text;
 
@@ -19,6 +22,130 @@ pub(super) enum StopOutcome {
     Stopped,
     DeclinedByUser,
     AmbiguousExternal,
+}
+
+pub(super) struct KernelRuntime {
+    inspector: ProcessInspector,
+    managed: Option<ManagedChild>,
+    recorded_pid: Option<u32>,
+}
+
+impl KernelRuntime {
+    pub fn new() -> Self {
+        Self {
+            inspector: ProcessInspector::new(),
+            managed: None,
+            recorded_pid: None,
+        }
+    }
+
+    pub fn has_managed(&self) -> bool {
+        self.managed.is_some()
+    }
+
+    pub fn list_running(&mut self, expected_kernel: Option<&Path>) -> Vec<RunningProcess> {
+        self.inspector.list_running_mihomo(expected_kernel)
+    }
+
+    pub fn active_pid(&mut self, expected_kernel: Option<&Path>, home_dir: &Path) -> Option<u32> {
+        if let Some(ref mut managed) = self.managed {
+            if matches!(managed.child.try_wait(), Ok(None)) {
+                return Some(managed.pid());
+            }
+            self.managed = None;
+        }
+        if let Some(pid) = self.recorded_pid {
+            if self
+                .inspector
+                .is_recorded_kernel_alive(pid, expected_kernel)
+            {
+                return Some(pid);
+            }
+            self.clear_tracking(home_dir);
+        }
+        None
+    }
+
+    pub fn sync_runtime_record(&mut self, home_dir: &Path) -> Option<PathBuf> {
+        let rec = process::load_runtime_record(home_dir)?;
+        if self
+            .inspector
+            .is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path))
+        {
+            self.recorded_pid = Some(rec.pid);
+            Some(rec.kernel_path)
+        } else {
+            self.clear_tracking(home_dir);
+            None
+        }
+    }
+
+    fn record_managed(&mut self, child: ManagedChild, home_dir: &Path, kernel_path: &Path) -> u32 {
+        let pid = child.pid();
+        self.managed = Some(child);
+        self.recorded_pid = Some(pid);
+        process::save_runtime_record(
+            home_dir,
+            &RuntimeRecord {
+                pid,
+                kernel_path: kernel_path.to_path_buf(),
+            },
+        );
+        pid
+    }
+
+    fn record_elevated(&mut self, pid: u32, home_dir: &Path, kernel_path: Option<&Path>) {
+        self.managed = None;
+        self.recorded_pid = Some(pid);
+        if let Some(kernel) = kernel_path {
+            process::save_runtime_record(
+                home_dir,
+                &RuntimeRecord {
+                    pid,
+                    kernel_path: kernel.to_path_buf(),
+                },
+            );
+        } else {
+            process::clear_runtime_record(home_dir);
+        }
+    }
+
+    fn clear_tracking(&mut self, home_dir: &Path) {
+        self.recorded_pid = None;
+        process::clear_runtime_record(home_dir);
+    }
+
+    fn clear_dead(&mut self, home_dir: &Path) {
+        self.managed = None;
+        self.clear_tracking(home_dir);
+    }
+
+    fn kill_managed_if_running(&mut self, home_dir: &Path) -> bool {
+        let Some(ref mut managed) = self.managed else {
+            return false;
+        };
+        if matches!(managed.child.try_wait(), Ok(None)) {
+            if managed.child.kill().is_ok() {
+                let _ = managed.child.wait();
+                self.clear_dead(home_dir);
+                return true;
+            }
+            false
+        } else {
+            self.managed = None;
+            false
+        }
+    }
+
+    fn try_wait_managed_exited(&mut self, home_dir: &Path) -> bool {
+        if let Some(ref mut managed) = self.managed
+            && let Ok(Some(_)) = managed.child.try_wait()
+        {
+            self.clear_dead(home_dir);
+            return true;
+        }
+        false
+    }
 }
 
 impl Worker {
@@ -35,37 +162,17 @@ impl Worker {
         }
     }
 
-    pub(super) fn active_pid(&mut self) -> Option<u32> {
-        if let Some(ref mut managed) = self.managed {
-            if matches!(managed.child.try_wait(), Ok(None)) {
-                return Some(managed.pid());
-            }
-            self.managed = None;
-        }
-        if let Some(pid) = self.recorded_pid {
-            if self
-                .process_inspector
-                .is_recorded_kernel_alive(pid, self.cfg.known_kernel_path())
-            {
-                return Some(pid);
-            }
-            self.recorded_pid = None;
-            process::clear_runtime_record(self.cfg.home_dir());
-        }
-        None
-    }
-
-    pub(super) fn apply_tun_state(&mut self, want_enable: bool) -> Result<(), String> {
+    pub(super) fn apply_tun_state(&mut self, want_enable: bool) -> Result<(), ActionError> {
         let client = self.require_client()?.clone();
         let set_res = client.set_tun(want_enable);
         let after = match client.get_configs() {
             Ok(cfg) => cfg,
-            Err(cfg_err) => return Err(set_res.err().unwrap_or(cfg_err)),
+            Err(cfg_err) => return Err(ActionError::general(set_res.err().unwrap_or(cfg_err))),
         };
         if !want_enable {
             set_res?;
             if after.tun_enable {
-                return Err(text::ERR_TUN_STILL_ENABLED.to_string());
+                return Err(ActionError::general(text::ERR_TUN_STILL_ENABLED));
             }
             return Ok(());
         }
@@ -79,23 +186,28 @@ impl Worker {
         }
 
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
-        let running = self
-            .process_inspector
-            .list_running_mihomo(self.cfg.known_kernel_path());
+        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        let tracked_pid = self
+            .kernel
+            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
         let target =
-            process::pick_target_process(&running, self.active_pid(), self.cfg.known_kernel_path())
-                .ok_or_else(|| text::ERR_LOCATE_ELEVATE_PROCESS.to_string())?;
+            process::pick_target_process(&running, tracked_pid, self.cfg.known_kernel_path())
+                .ok_or_else(|| ActionError::general(text::ERR_LOCATE_ELEVATE_PROCESS))?
+                .clone();
 
         let kernel_path = target
             .exe
             .clone()
             .or_else(|| self.cfg.known_kernel_path().map(ToOwned::to_owned));
-        let launch_args = discover::build_launch_args_for_paths(
+        let launch_args = resolve_elevation_launch_args(
+            tracked_pid == Some(target.pid),
+            &target.cmd,
             self.cfg.portable_root(),
             self.cfg.settings(),
             self.cfg.home_dir(),
             self.cfg.config_file(),
         )?;
+        let before_pids: HashSet<u32> = running.iter().map(|p| p.pid).collect();
 
         self.set_status_note(Some(text::STATUS_ELEVATING_CORE));
         let mut helper_args = vec![
@@ -107,38 +219,48 @@ impl Worker {
         let code = platform::run_elevated_self(&helper_args);
         self.set_status_note(None);
 
-        let new_pid = match code {
-            Ok(c) if c > 0 => c as u32,
+        match code {
+            Ok(0) => {}
             Ok(c) => {
                 let reason = process::helper_exit_reason(c);
                 tracing::error!(
                     "Elevated helper failed while starting mihomo (code {c}: {})",
                     reason.unwrap_or("unknown")
                 );
-                return Err(text::format_elevated_helper_failed(c, reason));
+                return Err(ActionError::general(text::format_elevated_helper_failed(
+                    c, reason,
+                )));
             }
-            Err(_) => return Err(text::ERR_TUN_ELEVATION_DECLINED.to_string()),
-        };
-
-        self.managed = None;
-        self.recorded_pid = Some(new_pid);
-        self.cached_version.clear();
-        if let Some(ref kernel) = kernel_path {
-            process::save_runtime_record(
-                self.cfg.home_dir(),
-                &RuntimeRecord {
-                    pid: new_pid,
-                    kernel_path: kernel.clone(),
-                },
-            );
-        } else {
-            process::clear_runtime_record(self.cfg.home_dir());
+            Err(_) => return Err(ActionError::general(text::ERR_TUN_ELEVATION_DECLINED)),
         }
 
+        self.cached_version.clear();
+        let after_running = self
+            .kernel
+            .list_running(kernel_path.as_deref().or(self.cfg.known_kernel_path()));
+        let Some(spawned) =
+            process::pick_spawned_process(&after_running, &before_pids, kernel_path.as_deref())
+                .cloned()
+        else {
+            self.kernel.clear_dead(self.cfg.home_dir());
+            return Err(ActionError::transient_wait(
+                text::ERR_CORE_STOPPED_UNEXPECTEDLY,
+            ));
+        };
+
+        let resolved_exe = spawned.exe.clone().or(kernel_path);
+        self.kernel
+            .record_elevated(spawned.pid, self.cfg.home_dir(), resolved_exe.as_deref());
+
+        let cmd = if spawned.cmd.is_empty() {
+            synthetic_argv(resolved_exe.as_deref(), &launch_args)
+        } else {
+            spawned.cmd
+        };
         let elevated = [RunningProcess {
-            pid: new_pid,
-            exe: kernel_path,
-            cmd: launch_args,
+            pid: spawned.pid,
+            exe: resolved_exe,
+            cmd,
         }];
         self.re_resolve_controller(&elevated);
         self.wait_for_controller(KERNEL_RESTART_BUDGET, text::ERR_CORE_RESTART_TIMEOUT)?;
@@ -154,15 +276,16 @@ impl Worker {
                 "Failed to restore proxy mode '{previous_mode}' after TUN elevation: {err}"
             );
         }
-        tun_res.map(|_| ())
+        tun_res.map(|_| ()).map_err(ActionError::general)
     }
 
-    pub(super) fn start_core_internal(&mut self) -> Result<(), String> {
+    pub(super) fn start_core_internal(&mut self) -> Result<(), ActionError> {
         self.reload_paths_and_runtime();
-        let running = self
-            .process_inspector
-            .list_running_mihomo(self.cfg.known_kernel_path());
-        if process::pick_target_process(&running, self.active_pid(), self.cfg.known_kernel_path())
+        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        let active_pid = self
+            .kernel
+            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
+        if process::pick_target_process(&running, active_pid, self.cfg.known_kernel_path())
             .is_some()
         {
             self.re_resolve_controller(&running);
@@ -171,8 +294,8 @@ impl Worker {
 
         let kernel_path = match (self.cfg.known_kernel_path(), self.cfg.kernel_path_error()) {
             (Some(path), _) => path.to_path_buf(),
-            (None, Some(err)) => return Err(err.to_string()),
-            (None, None) => return Err(text::ERR_CORE_NOT_FOUND.to_string()),
+            (None, Some(err)) => return Err(ActionError::general(err)),
+            (None, None) => return Err(ActionError::general(text::ERR_CORE_NOT_FOUND)),
         };
 
         let _ = std::fs::create_dir_all(self.cfg.home_dir());
@@ -190,37 +313,35 @@ impl Worker {
             Ok(child) => child,
             Err(err) => {
                 self.set_status_note(None);
-                return Err(err);
+                return Err(ActionError::general(err));
             }
         };
-        let pid = child.pid();
-        self.managed = Some(child);
-        self.recorded_pid = Some(pid);
+        let pid = self
+            .kernel
+            .record_managed(child, self.cfg.home_dir(), &kernel_path);
         self.cached_version.clear();
-        process::save_runtime_record(
-            self.cfg.home_dir(),
-            &RuntimeRecord {
-                pid,
-                kernel_path: kernel_path.clone(),
-            },
-        );
 
+        let cmd = synthetic_argv(Some(&kernel_path), &args);
         let spawned = [RunningProcess {
             pid,
             exe: Some(kernel_path),
-            cmd: args,
+            cmd,
         }];
         self.re_resolve_controller(&spawned);
         self.wait_for_controller(KERNEL_STARTUP_BUDGET, text::ERR_CORE_NOT_RESPONDING)
     }
 
-    pub(super) fn force_restart_core(&mut self) -> Result<(), String> {
+    pub(super) fn force_restart_core(&mut self) -> Result<(), ActionError> {
+        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        self.force_restart_with_running(running)
+    }
+
+    pub(super) fn force_restart_with_running(
+        &mut self,
+        running: Vec<RunningProcess>,
+    ) -> Result<(), ActionError> {
         let saved = self.capture_live_or_persisted_state();
-        self.reload_paths_and_runtime();
-        let running = self
-            .process_inspector
-            .list_running_mihomo(self.cfg.known_kernel_path());
-        if self.managed.is_some() || !running.is_empty() {
+        if self.kernel.has_managed() || !running.is_empty() {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
             let stop_res = self.stop_active_kernel(true, Some(running));
             self.set_status_note(None);
@@ -228,12 +349,11 @@ impl Worker {
                 StopOutcome::Stopped => {}
                 StopOutcome::DeclinedByUser => return Ok(()),
                 StopOutcome::AmbiguousExternal => {
-                    return Err(text::ERR_MULTIPLE_EXTERNAL_CORES.to_string());
+                    return Err(ActionError::general(text::ERR_MULTIPLE_EXTERNAL_CORES));
                 }
             }
         }
-        self.sub_tasks.invalidate();
-        self.latency_tasks.invalidate();
+        self.invalidate_async_tasks();
         self.state_sync.arm_ready_restore(saved);
         self.start_core_internal()
     }
@@ -277,28 +397,18 @@ impl Worker {
         interactive: bool,
         prefetched: Option<Vec<RunningProcess>>,
     ) -> Result<StopOutcome, String> {
-        // First try managed non-elevated child directly.
-        if let Some(ref mut managed) = self.managed {
-            if matches!(managed.child.try_wait(), Ok(None)) {
-                if managed.child.kill().is_ok() {
-                    let _ = managed.child.wait();
-                    self.managed = None;
-                    self.clear_running_tracking();
-                    return Ok(StopOutcome::Stopped);
-                }
-            } else {
-                self.managed = None;
-                self.clear_running_tracking();
-                return Ok(StopOutcome::Stopped);
-            }
+        if self.kernel.kill_managed_if_running(self.cfg.home_dir()) {
+            self.cached_version.clear();
+            return Ok(StopOutcome::Stopped);
         }
 
-        let running = prefetched.unwrap_or_else(|| {
-            self.process_inspector
-                .list_running_mihomo(self.cfg.known_kernel_path())
-        });
+        let running =
+            prefetched.unwrap_or_else(|| self.kernel.list_running(self.cfg.known_kernel_path()));
+        let active_pid = self
+            .kernel
+            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
         let tracked_target =
-            process::pick_target_process(&running, self.active_pid(), self.cfg.known_kernel_path())
+            process::pick_target_process(&running, active_pid, self.cfg.known_kernel_path())
                 .cloned();
         let target = match tracked_target {
             Some(found) => found,
@@ -345,27 +455,31 @@ impl Worker {
     }
 
     fn clear_running_tracking(&mut self) {
-        self.recorded_pid = None;
+        self.kernel.clear_tracking(self.cfg.home_dir());
         self.cached_version.clear();
-        process::clear_runtime_record(self.cfg.home_dir());
     }
 
-    fn wait_for_controller(&mut self, budget: Duration, timeout_msg: &str) -> Result<(), String> {
+    fn wait_for_controller(
+        &mut self,
+        budget: Duration,
+        timeout_msg: &str,
+    ) -> Result<(), ActionError> {
         let start = Instant::now();
         let mut waiting_notified = false;
         let res = loop {
             if start.elapsed() >= budget {
-                break Err(timeout_msg.to_string());
+                break Err(ActionError::transient_wait(timeout_msg));
             }
             if self.stop_requested.load(Ordering::Acquire) {
-                break Err(text::ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN.to_string());
+                break Err(ActionError::general(
+                    text::ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN,
+                ));
             }
-            if let Some(ref mut managed) = self.managed
-                && let Ok(Some(_)) = managed.child.try_wait()
-            {
-                self.managed = None;
-                self.clear_running_tracking();
-                break Err(text::ERR_CORE_STOPPED_UNEXPECTEDLY.to_string());
+            if self.kernel.try_wait_managed_exited(self.cfg.home_dir()) {
+                self.cached_version.clear();
+                break Err(ActionError::transient_wait(
+                    text::ERR_CORE_STOPPED_UNEXPECTEDLY,
+                ));
             }
             if let Some(client) = &self.client
                 && client.probe().is_ok()
@@ -381,6 +495,30 @@ impl Worker {
         self.set_status_note(None);
         res
     }
+}
+
+fn synthetic_argv(exe: Option<&Path>, launch_args: &[String]) -> Vec<String> {
+    let exe_str = exe
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| platform::kernel_exe_name().to_string());
+    let mut cmd = Vec::with_capacity(1 + launch_args.len());
+    cmd.push(exe_str);
+    cmd.extend(launch_args.iter().cloned());
+    cmd
+}
+
+fn resolve_elevation_launch_args(
+    is_tracked: bool,
+    target_cmd: &[String],
+    portable_root: &Path,
+    settings: &TraySettings,
+    home_dir: &Path,
+    config_file: &Path,
+) -> Result<Vec<String>, String> {
+    if !is_tracked && !target_cmd.is_empty() {
+        return Ok(target_cmd[1..].to_vec());
+    }
+    discover::build_launch_args_for_paths(portable_root, settings, home_dir, config_file)
 }
 
 fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<CoreConfigs, String> {
@@ -508,6 +646,8 @@ mod tests {
     #[test]
     fn force_restart_declining_external_stop_preserves_deferred_restore_and_tasks() {
         let root = crate::config::test_temp_dir("worker_restart_preserve");
+        let settings_path = crate::config::tray::settings_path(&root);
+        std::fs::write(&settings_path, "").unwrap();
         let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
         let saved = crate::config::state_store::PersistedState {
             system_proxy: true,
@@ -516,25 +656,54 @@ mod tests {
         };
         worker.state_sync.defer_restore(7, saved);
         worker.sub_tasks.invalidate();
-        worker.latency_tasks.mark_started_for_test();
+        worker.latency_tasks.begin();
 
-        // When stop_active_kernel returns DeclinedByUser (headless confirm_yes_no = false),
-        // deferred restore and active latency task must not be cleared prematurely.
-        assert_eq!(
-            worker
-                .stop_active_kernel(
-                    true,
-                    Some(vec![RunningProcess {
-                        pid: 999_991,
-                        exe: Some(PathBuf::from("/external/mihomo")),
-                        cmd: Vec::new(),
-                    }])
-                )
-                .unwrap(),
-            StopOutcome::DeclinedByUser
-        );
+        // Simulate runtime tray.yml change while external core is running.
+        std::fs::write(&settings_path, "mihomo:\n  home: ./alt-home\n").unwrap();
+        worker.cfg.invalidate_settings_mtime();
+        let _ = worker.cfg.poll_changes(true);
+
+        // Declining external stop in force_restart_with_running must preserve deferred restore,
+        // active latency task, and deferred config paths.
+        worker
+            .force_restart_with_running(vec![RunningProcess {
+                pid: 999_991,
+                exe: Some(PathBuf::from("/external/mihomo")),
+                cmd: Vec::new(),
+            }])
+            .unwrap();
         assert!(worker.state_sync.has_deferred_restore());
         assert!(worker.latency_tasks.is_active());
+        assert_eq!(worker.cfg.home_dir(), root.join("config"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn elevation_launch_args_preserve_external_cmdline_when_untracked() {
+        let root = crate::config::test_temp_dir("elevate_args");
+        let settings = TraySettings::default();
+        let home = root.join("config");
+        let cfg = home.join("config.yaml");
+
+        let external_cmd = vec![
+            "mihomo.exe".to_string(),
+            "-d".to_string(),
+            "/ext/home".to_string(),
+            "-ext-ctl".to_string(),
+            "127.0.0.1:9099".to_string(),
+        ];
+        assert_eq!(
+            resolve_elevation_launch_args(false, &external_cmd, &root, &settings, &home, &cfg)
+                .unwrap(),
+            vec!["-d", "/ext/home", "-ext-ctl", "127.0.0.1:9099"]
+        );
+
+        let managed_args =
+            resolve_elevation_launch_args(true, &external_cmd, &root, &settings, &home, &cfg)
+                .unwrap();
+        assert!(managed_args.contains(&home.display().to_string()));
+        assert!(!managed_args.contains(&"127.0.0.1:9099".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -110,13 +110,17 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     imp::run_elevated_self(args)
 }
 
+fn can_show_dialog() -> bool {
+    !cfg!(test) && imp::can_show_dialog()
+}
+
 fn show_message_dialog(
     icon: rustydialogs::MessageIcon,
     title: &str,
     message: &str,
     buttons: rustydialogs::MessageButtons,
 ) -> Option<rustydialogs::MessageResult> {
-    if !imp::can_show_dialog() {
+    if !can_show_dialog() {
         return None;
     }
     rustydialogs::MessageBox {
@@ -155,7 +159,7 @@ pub fn notify_info(title: &str, message: &str) {
 
 /// Displays a blocking modal confirmation (Yes/No) returning `true` only on Yes.
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
-    if !imp::can_show_dialog() {
+    if !can_show_dialog() {
         tracing::warn!("Confirmation dialog skipped (no native backend): {title}: {message}");
         return false;
     }
@@ -196,7 +200,7 @@ pub fn is_tray_menu_open() -> bool {
 
 /// Prompts the user with a simple modal text input box for a subscription URL.
 pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
-    if !imp::can_show_dialog() {
+    if !can_show_dialog() {
         tracing::warn!("No native text input backend available on this system");
         return None;
     }

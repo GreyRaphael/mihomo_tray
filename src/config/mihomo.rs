@@ -203,14 +203,17 @@ fn upsert_mapping(parent: &Mapping, key: &str, update: impl FnOnce(&Mapping)) {
     parent.set(key, &doc);
 }
 
+fn configure_default_proxy_group(builder: MappingBuilder) -> MappingBuilder {
+    builder
+        .pair("name", "Proxy")
+        .pair("type", "select")
+        .sequence("use", |u| u.item(SUBSCRIPTION_PROVIDER_NAME))
+}
+
 fn wire_subscription_into_groups(root_map: &Mapping) {
     let Some(groups) = root_map.get_sequence("proxy-groups") else {
         let fallback_groups = SequenceBuilder::new()
-            .mapping(|g| {
-                g.pair("name", "Proxy")
-                    .pair("type", "select")
-                    .sequence("use", |u| u.item(SUBSCRIPTION_PROVIDER_NAME))
-            })
+            .mapping(configure_default_proxy_group)
             .build_document();
         root_map.set("proxy-groups", &fallback_groups);
         return;
@@ -255,11 +258,7 @@ fn wire_subscription_into_groups(root_map: &Mapping) {
             }
         }
         if !attached_to_select {
-            let proxy_group = MappingBuilder::new()
-                .pair("name", "Proxy")
-                .pair("type", "select")
-                .sequence("use", |u| u.item(SUBSCRIPTION_PROVIDER_NAME))
-                .build_document();
+            let proxy_group = configure_default_proxy_group(MappingBuilder::new()).build_document();
             groups.insert(0, &proxy_group);
         }
     }

@@ -137,6 +137,9 @@ impl MihomoTrayApp {
     }
 
     fn handle_tray_event(&mut self, event: &TrayIconEvent) {
+        if self.quitting {
+            return;
+        }
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
@@ -151,6 +154,9 @@ impl MihomoTrayApp {
     }
 
     fn handle_menu_event(&mut self, id_str: &str) {
+        if self.quitting {
+            return;
+        }
         let Some((generation, idx)) = menu::parse_action_id(id_str) else {
             return;
         };
@@ -208,22 +214,18 @@ impl MihomoTrayApp {
             }
             MenuAction::CopyEnvVars => self.send_worker(WorkerCommand::CopyEnvVars),
             MenuAction::RestartCore => self.send_worker(WorkerCommand::RestartCore),
-            MenuAction::RestartApp => {
-                if !self.quitting {
-                    self.quitting = true;
-                    self.restart_on_exit = true;
-                    self.send_worker(WorkerCommand::Quit { interactive: true });
-                }
-            }
+            MenuAction::RestartApp => self.begin_quit(true),
             MenuAction::ToggleAutostart => self.send_worker(WorkerCommand::ToggleAutostart),
             MenuAction::ShowVersion => self.show_version_dialog(),
-            MenuAction::Quit => {
-                if !self.quitting {
-                    self.quitting = true;
-                    self.restart_on_exit = false;
-                    self.send_worker(WorkerCommand::Quit { interactive: true });
-                }
-            }
+            MenuAction::Quit => self.begin_quit(false),
+        }
+    }
+
+    fn begin_quit(&mut self, restart_on_exit: bool) {
+        if !self.quitting {
+            self.quitting = true;
+            self.restart_on_exit = restart_on_exit;
+            self.send_worker(WorkerCommand::Quit { interactive: true });
         }
     }
 
@@ -231,8 +233,8 @@ impl MihomoTrayApp {
         self.shared
             .lock()
             .unwrap()
-            .resolved_config_path()
-            .map(PathBuf::from)
+            .resolved_config
+            .clone()
             .unwrap_or_else(|| {
                 self.portable_root
                     .join("config")
@@ -273,10 +275,7 @@ impl MihomoTrayApp {
     fn show_version_dialog(&self) {
         let (core_ver, cfg_path) = {
             let snap = self.shared.lock().unwrap();
-            (
-                snap.version.clone(),
-                snap.resolved_config_path().map(PathBuf::from),
-            )
+            (snap.version.clone(), snap.resolved_config.clone())
         };
         let portable = self.portable_root.clone();
         Self::spawn_singleton_dialog(&self.version_dialog_open, "version-dialog", move || {

@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use crate::config::state_store::{self, PersistedState};
-use crate::state::Snapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreFlag {
@@ -29,15 +28,21 @@ impl StateSync {
         state_store::save(home_dir, state);
     }
 
-    pub fn capture(&self, snap: &Snapshot, sysproxy: bool) -> PersistedState {
+    pub fn capture(
+        &self,
+        controller_ok: bool,
+        mode: &str,
+        tun: bool,
+        sysproxy: bool,
+    ) -> PersistedState {
         if self.restore.is_some() {
             return self.persisted.clone().unwrap_or_default();
         }
-        if snap.controller_ok {
+        if controller_ok {
             PersistedState {
                 system_proxy: sysproxy,
-                mode: (!snap.mode.is_empty()).then(|| snap.mode.clone()),
-                tun: Some(snap.tun),
+                mode: (!mode.is_empty()).then(|| mode.to_string()),
+                tun: Some(tun),
             }
         } else {
             self.persisted.clone().unwrap_or_default()
@@ -127,13 +132,7 @@ mod tests {
         let mut sync = StateSync::default();
         sync.defer_restore(1, saved.clone());
 
-        let reset_snap = Snapshot {
-            controller_ok: true,
-            mode: "rule".to_string(),
-            tun: false,
-            ..Default::default()
-        };
-        assert_eq!(sync.capture(&reset_snap, false), saved);
+        assert_eq!(sync.capture(true, "rule", false, false), saved);
         assert!(sync.take_ready_restore().is_none());
 
         // Live poll must not overwrite deferred state, while explicit user toggles must win.

@@ -162,7 +162,7 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     let exe = std::env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
     let params = super::win_helpers::quote_win32_args(args);
     let verb_w = wide("runas");
-    let file_w = wide(&exe.to_string_lossy());
+    let file_w = wide(&exe);
     let params_w = wide(&params);
 
     struct ComGuard(bool);
@@ -225,9 +225,6 @@ pub fn can_show_dialog() -> bool {
     true
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }

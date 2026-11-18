@@ -437,7 +437,11 @@ fn append_more_items(
 }
 
 fn truncate_label(raw: &str, max_chars: usize) -> String {
-    let first_line = raw.lines().next().unwrap_or(raw).trim();
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| raw.trim());
     let mut out = String::new();
     for (idx, ch) in first_line.chars().enumerate() {
         if idx >= max_chars {

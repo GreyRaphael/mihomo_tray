@@ -73,7 +73,7 @@ pub fn read_file(path: &Path) -> Result<MihomoConfigInfo, String> {
 }
 
 fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
-    let clean = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let clean = crate::config::strip_utf8_bom(text);
     let parsed: PartialMihomoYaml = if clean.trim().is_empty() {
         PartialMihomoYaml::default()
     } else {
@@ -122,7 +122,7 @@ pub fn ensure_default_config(path: &Path) {
 /// Reads the currently configured subscription URL (`proxy-providers.subscription.url`) if present.
 pub fn read_subscription_url(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    let clean = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let clean = crate::config::strip_utf8_bom(&text);
     let doc = Document::from_str(clean).ok()?;
     doc.get_mapping("proxy-providers")?
         .get_mapping(SUBSCRIPTION_PROVIDER_NAME)?
@@ -144,7 +144,7 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
     }
 
     let source_text = match std::fs::read_to_string(path) {
-        Ok(text) if !text.trim_start_matches('\u{feff}').trim().is_empty() => text,
+        Ok(text) if !crate::config::strip_utf8_bom(&text).trim().is_empty() => text,
         Ok(_) => DEFAULT_CONFIG_TEMPLATE.to_string(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             DEFAULT_CONFIG_TEMPLATE.to_string()

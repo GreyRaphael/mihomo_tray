@@ -183,16 +183,14 @@ impl ProcessInspector {
 }
 
 fn matches_recorded_kernel(name: &str, exe: Option<&Path>, expected_kernel: Option<&Path>) -> bool {
-    if let (Some(want), Some(got)) = (expected_kernel, exe) {
-        return paths_match(want, got);
+    if let Some(expected) = expected_kernel {
+        let matcher = ExpectedKernelMatcher::new(expected);
+        return exe.map_or_else(
+            || matcher.matches_filename(std::ffi::OsStr::new(name)),
+            |got| matcher.matches(got),
+        );
     }
-    if platform::is_kernel_candidate_name(name) {
-        return true;
-    }
-    expected_kernel
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .is_some_and(|want_name| want_name.eq_ignore_ascii_case(name))
+    platform::is_kernel_candidate_name(name)
 }
 
 pub fn pick_target_process<'a>(
@@ -205,12 +203,14 @@ pub fn pick_target_process<'a>(
     {
         return Some(found);
     }
-    if let Some(expected) = expected_kernel
-        && let Some(found) = running
+    if let Some(expected) = expected_kernel {
+        let matcher = ExpectedKernelMatcher::new(expected);
+        if let Some(found) = running
             .iter()
-            .find(|p| p.exe.as_deref().is_some_and(|e| paths_match(e, expected)))
-    {
-        return Some(found);
+            .find(|p| p.exe.as_deref().is_some_and(|e| matcher.matches(e)))
+        {
+            return Some(found);
+        }
     }
     None
 }
@@ -433,6 +433,11 @@ mod tests {
             "mihomo-windows-amd64",
             None,
             Some(Path::new("/opt/core/mihomo-windows-amd64")),
+        ));
+        assert!(!matches_recorded_kernel(
+            "mihomo.exe",
+            None,
+            Some(Path::new("/opt/core/custom-proxy.exe")),
         ));
         assert!(!matches_recorded_kernel("mihomo-tray", None, None,));
     }

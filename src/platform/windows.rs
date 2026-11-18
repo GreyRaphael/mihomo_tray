@@ -37,7 +37,7 @@ pub fn is_kernel_candidate_name(lower_name: &str) -> bool {
 }
 
 pub fn expand_env(value: &str) -> String {
-    let source: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let source = wide(value);
     unsafe {
         let needed = ExpandEnvironmentStringsW(source.as_ptr(), std::ptr::null_mut(), 0);
         if needed == 0 {

@@ -281,41 +281,41 @@ fn argv_config(args: &[String]) -> Option<PathBuf> {
     None
 }
 
+fn match_flag<'a>(arg: &'a str, flag: &str) -> Option<Option<&'a str>> {
+    let rest = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    let after = rest.strip_prefix(flag)?;
+    if after.is_empty() {
+        Some(None)
+    } else {
+        after.strip_prefix('=').map(Some)
+    }
+}
+
 fn has_flag(args: &[String], flag: &str) -> bool {
-    let short = format!("-{flag}");
-    let long = format!("--{flag}");
-    args.iter().any(|arg| {
-        arg == &short
-            || arg == &long
-            || arg.starts_with(&format!("{short}="))
-            || arg.starts_with(&format!("{long}="))
-    })
+    args.iter().any(|arg| match_flag(arg, flag).is_some())
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    let short = format!("-{flag}");
-    let long = format!("--{flag}");
     let mut found = None;
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
-        if arg == &short || arg == &long {
-            if let Some(next) = args.get(i + 1)
-                && !next.is_empty()
-            {
-                found = Some(next.clone());
+        match match_flag(&args[i], flag) {
+            Some(None) => {
+                if let Some(next) = args.get(i + 1)
+                    && !next.is_empty()
+                {
+                    found = Some(next.clone());
+                }
+                i += 2;
             }
-            i += 2;
-            continue;
+            Some(Some(val)) => {
+                if !val.is_empty() {
+                    found = Some(val.to_string());
+                }
+                i += 1;
+            }
+            None => i += 1,
         }
-        if let Some(val) = arg
-            .strip_prefix(&format!("{short}="))
-            .or_else(|| arg.strip_prefix(&format!("{long}=")))
-            && !val.is_empty()
-        {
-            found = Some(val.to_string());
-        }
-        i += 1;
     }
     found
 }

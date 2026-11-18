@@ -27,16 +27,14 @@ use crate::state::{AppEvent, Snapshot};
 fn main() {
     // Handle elevated helper invocations before acquiring single-instance locks or GUI loops.
     let cli_args: Vec<String> = std::env::args().collect();
-    if let Some(exit_code) = try_run_helper(
-        &cli_args,
-        process::helper_stop_pid,
-        process::helper_start_from_pid,
-    ) {
-        std::process::exit(exit_code);
+    match parse_helper_command(&cli_args) {
+        Ok(Some(HelperCommand::Stop(pid))) => std::process::exit(process::helper_stop_pid(pid)),
+        Ok(Some(HelperCommand::Start(pid, extra))) => {
+            std::process::exit(process::helper_start_from_pid(pid, extra));
+        }
+        Ok(None) => {}
+        Err(exit_code) => std::process::exit(exit_code),
     }
-
-    let portable_root = platform::portable_root();
-    let log_path = init_logging(&portable_root);
 
     let after_restart_pid = parse_after_restart_pid(&cli_args);
     if let Some(old_pid) = after_restart_pid {
@@ -51,6 +49,9 @@ fn main() {
     let Some(instance) = instance else {
         return;
     };
+
+    let portable_root = platform::portable_root();
+    let log_path = init_logging(&portable_root);
 
     let settings_path = tray_cfg::settings_path(&portable_root);
     tray_cfg::ensure_sample_file(&settings_path);
@@ -111,26 +112,30 @@ fn main() {
     }
 }
 
-fn try_run_helper(
-    args: &[String],
-    stop_pid: fn(u32) -> i32,
-    start_from_pid: fn(u32, &[String]) -> i32,
-) -> Option<i32> {
-    let flag = args.get(1)?.as_str();
+#[derive(Debug, PartialEq, Eq)]
+enum HelperCommand<'a> {
+    Stop(u32),
+    Start(u32, &'a [String]),
+}
+
+fn parse_helper_command(args: &[String]) -> Result<Option<HelperCommand<'_>>, i32> {
+    let Some(flag) = args.get(1).map(String::as_str) else {
+        return Ok(None);
+    };
     match flag {
         platform::ELEVATE_STOP_FLAG => {
             let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
-                return Some(process::HELPER_EXIT_INVALID_ARGS);
+                return Err(process::HELPER_EXIT_INVALID_ARGS);
             };
-            Some(stop_pid(pid))
+            Ok(Some(HelperCommand::Stop(pid)))
         }
         platform::ELEVATE_START_FLAG => {
             let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
-                return Some(process::HELPER_EXIT_INVALID_ARGS);
+                return Err(process::HELPER_EXIT_INVALID_ARGS);
             };
-            Some(start_from_pid(pid, &args[3..]))
+            Ok(Some(HelperCommand::Start(pid, &args[3..])))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -219,18 +224,10 @@ fn init_logging(portable_root: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn fake_stop(pid: u32) -> i32 {
-        (pid as i32) + 10
-    }
-
-    fn fake_start(pid: u32, extra: &[String]) -> i32 {
-        (pid as i32) + (extra.len() as i32)
-    }
-
     #[test]
-    fn dispatches_helper_and_after_restart_cli_args() {
+    fn parses_helper_and_after_restart_cli_args() {
         let normal = vec!["mihomo-tray".to_string()];
-        assert_eq!(try_run_helper(&normal, fake_stop, fake_start), None);
+        assert_eq!(parse_helper_command(&normal), Ok(None));
         assert_eq!(parse_after_restart_pid(&normal), None);
 
         let bad_stop = vec![
@@ -239,8 +236,18 @@ mod tests {
             "not-a-pid".to_string(),
         ];
         assert_eq!(
-            try_run_helper(&bad_stop, fake_stop, fake_start),
-            Some(process::HELPER_EXIT_INVALID_ARGS)
+            parse_helper_command(&bad_stop),
+            Err(process::HELPER_EXIT_INVALID_ARGS)
+        );
+
+        let good_stop = vec![
+            "mihomo-tray".to_string(),
+            platform::ELEVATE_STOP_FLAG.to_string(),
+            "77".to_string(),
+        ];
+        assert_eq!(
+            parse_helper_command(&good_stop),
+            Ok(Some(HelperCommand::Stop(77)))
         );
 
         let good_start = vec![
@@ -250,7 +257,10 @@ mod tests {
             "-d".to_string(),
             "./config".to_string(),
         ];
-        assert_eq!(try_run_helper(&good_start, fake_stop, fake_start), Some(44));
+        assert_eq!(
+            parse_helper_command(&good_start),
+            Ok(Some(HelperCommand::Start(42, &good_start[3..])))
+        );
 
         let restart = vec![
             "mihomo-tray".to_string(),

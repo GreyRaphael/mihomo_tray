@@ -196,6 +196,13 @@ enum CommandOutcome {
     KeepError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreStep {
+    Continue,
+    Requeue,
+    AbortOffline,
+}
+
 #[derive(Default)]
 struct LiveState {
     controller_ok: bool,
@@ -750,6 +757,45 @@ impl Worker {
         )
     }
 
+    fn restore_tun_if_needed(
+        &mut self,
+        cfg: &mut CoreConfigs,
+        restore: &mut PersistedState,
+    ) -> RestoreStep {
+        let Some(want_tun) = restore.tun else {
+            return RestoreStep::Continue;
+        };
+        if want_tun == cfg.tun_enable {
+            return RestoreStep::Continue;
+        }
+        match self.apply_tun_state(want_tun) {
+            Ok(()) => {
+                if let Some(client) = &self.client
+                    && let Ok(updated) = client.get_configs()
+                {
+                    *cfg = updated;
+                } else {
+                    cfg.tun_enable = want_tun;
+                }
+                restore.tun = Some(cfg.tun_enable);
+                RestoreStep::Continue
+            }
+            Err(err) => {
+                if self.stop_requested.load(Ordering::Acquire) {
+                    return RestoreStep::Requeue;
+                }
+                let core_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
+                self.set_action_error(Some(err));
+                if !core_alive {
+                    return RestoreStep::AbortOffline;
+                }
+                self.state_sync
+                    .update(&self.cfg.home_dir, |s| s.tun = Some(cfg.tun_enable));
+                RestoreStep::Continue
+            }
+        }
+    }
+
     fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) -> bool {
         let Some(mut restore) = self.state_sync.take_ready_restore() else {
             return true;
@@ -759,34 +805,13 @@ impl Worker {
             return true;
         }
 
-        if let Some(want_tun) = restore.tun
-            && want_tun != cfg.tun_enable
-        {
-            match self.apply_tun_state(want_tun) {
-                Ok(()) => {
-                    if let Some(client) = &self.client
-                        && let Ok(updated) = client.get_configs()
-                    {
-                        *cfg = updated;
-                    } else {
-                        cfg.tun_enable = want_tun;
-                    }
-                    restore.tun = Some(cfg.tun_enable);
-                }
-                Err(err) => {
-                    if self.stop_requested.load(Ordering::Acquire) {
-                        self.state_sync.arm_ready_restore(restore);
-                        return true;
-                    }
-                    let core_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
-                    self.set_action_error(Some(err));
-                    if !core_alive {
-                        return false;
-                    }
-                    self.state_sync
-                        .update(&self.cfg.home_dir, |s| s.tun = Some(cfg.tun_enable));
-                }
+        match self.restore_tun_if_needed(cfg, &mut restore) {
+            RestoreStep::Continue => {}
+            RestoreStep::Requeue => {
+                self.state_sync.arm_ready_restore(restore);
+                return true;
             }
+            RestoreStep::AbortOffline => return false,
         }
 
         if self.stop_requested.load(Ordering::Acquire) {
@@ -1069,63 +1094,9 @@ fn merge_latency(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::test_http::{read_http_request, send_http_response, stop_mock_server};
     use crate::state::{AsyncTaskKind, SharedSnapshot};
     use std::sync::Mutex;
-
-    pub(super) fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-        use std::io::Read;
-
-        let mut data = Vec::new();
-        let mut buf = [0u8; 1024];
-        let mut header_end = None;
-        let mut content_len = 0usize;
-        loop {
-            let n = stream.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
-            if header_end.is_none()
-                && let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n")
-            {
-                let end = pos + 4;
-                header_end = Some(end);
-                let headers = String::from_utf8_lossy(&data[..end]);
-                content_len = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (k, v) = line.split_once(':')?;
-                        k.trim()
-                            .eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-            }
-            if let Some(end) = header_end
-                && data.len() >= end + content_len
-            {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&data).into_owned()
-    }
-
-    pub(super) fn send_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
-        use std::io::Write;
-        let resp = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).unwrap();
-    }
-
-    fn stop_mock_server(port: u16) {
-        use std::io::Write;
-        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .unwrap()
-            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
-    }
 
     pub(super) fn test_worker(
         root: &std::path::Path,

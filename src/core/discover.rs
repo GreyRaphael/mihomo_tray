@@ -206,9 +206,14 @@ pub fn resolve_controller(
     running: &[RunningProcess],
     config_path: &Path,
 ) -> Result<Client, String> {
-    let cfg_res = mihomo::read_file(config_path);
-
     let argv = matching_running_argv(running, config_path);
+    let effective_config = argv
+        .as_deref()
+        .and_then(argv_config)
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| config_path.to_path_buf());
+    let cfg_res = mihomo::read_file(&effective_config);
+
     let argv_ctl = argv.as_deref().and_then(|a| flag_value(a, "ext-ctl"));
     let argv_secret = argv.as_deref().and_then(|a| flag_value(a, "secret"));
 
@@ -229,12 +234,14 @@ pub fn resolve_controller(
 
     let Some(address) = address else {
         if let Err(err) = cfg_res
-            && config_path.is_file()
+            && effective_config.is_file()
         {
             return Err(err);
         }
         if other_controller_family {
-            return Err(text::format_unsupported_controller_family(config_path));
+            return Err(text::format_unsupported_controller_family(
+                &effective_config,
+            ));
         }
         return Err(ERR_NO_CONTROLLER.to_string());
     };
@@ -431,6 +438,27 @@ mod tests {
         let client_argv = resolve_controller(&settings, &running, &cfg_path).unwrap();
         assert_eq!(client_argv.port, 9095);
         assert_eq!(client_argv.secret, "from_argv");
+
+        // External single process pointing `-f` at another config without `-ext-ctl`
+        // should resolve controller & secret from that external config.
+        let other_cfg = root.join("external.yaml");
+        std::fs::write(
+            &other_cfg,
+            "external-controller: 127.0.0.1:9098\nsecret: from_other\n",
+        )
+        .unwrap();
+        let external_running = vec![RunningProcess {
+            pid: 43,
+            exe: None,
+            cmd: vec![
+                "mihomo.exe".to_string(),
+                "-f".to_string(),
+                other_cfg.display().to_string(),
+            ],
+        }];
+        let client_ext = resolve_controller(&settings, &external_running, &cfg_path).unwrap();
+        assert_eq!(client_ext.port, 9098);
+        assert_eq!(client_ext.secret, "from_other");
 
         let _ = std::fs::remove_dir_all(&root);
     }

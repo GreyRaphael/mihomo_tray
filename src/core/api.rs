@@ -455,7 +455,7 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use crate::core::test_http::{read_http_request, send_http_response};
     use std::net::TcpListener;
 
     #[test]
@@ -516,20 +516,13 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 1024];
-                let n = stream.read(&mut buf).unwrap();
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let req = read_http_request(&mut stream);
                 let body = if req.starts_with("GET /configs ") {
                     r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":true}}"#
                 } else {
                     r#"{"version":"v1.19.0"}"#
                 };
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
+                send_http_response(&mut stream, "200 OK", body);
             }
         });
 
@@ -549,11 +542,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).unwrap();
+            let _ = read_http_request(&mut stream);
             std::thread::sleep(Duration::from_millis(350));
-            let resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
-            stream.write_all(resp.as_bytes()).unwrap();
+            send_http_response(&mut stream, "204 No Content", "");
         });
 
         // Short poll timeout (200ms) must not abort `PUT /configs?force=true`.
@@ -569,19 +560,13 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for idx in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).unwrap();
-                let resp = if idx == 0 {
+                let _ = read_http_request(&mut stream);
+                if idx == 0 {
                     let body = r#"{"providers":{"subscription":{"vehicleType":"HTTP","updatedAt":"2025-01-01T08:00:00+08:00","proxies":[{"name":"Z-Node","history":[{"delay":88}]},{"name":"A-Node","history":[{"delay":24}]}]}}}"#;
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
+                    send_http_response(&mut stream, "200 OK", body);
                 } else {
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbad mod".to_string()
-                };
-                stream.write_all(resp.as_bytes()).unwrap();
+                    send_http_response(&mut stream, "400 Bad Request", "bad mod");
+                }
             }
         });
 

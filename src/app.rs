@@ -40,6 +40,7 @@ pub struct MihomoTrayApp {
     last_click: Option<Instant>,
     version_dialog_open: Arc<AtomicBool>,
     prompt_dialog_open: Arc<AtomicBool>,
+    open_error_dialog_open: Arc<AtomicBool>,
     quitting: bool,
     restart_on_exit: bool,
 }
@@ -73,6 +74,7 @@ impl MihomoTrayApp {
             last_click: None,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             prompt_dialog_open: Arc::new(AtomicBool::new(false)),
+            open_error_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
             restart_on_exit: false,
         }
@@ -376,11 +378,13 @@ impl MihomoTrayApp {
             let display = target.to_string_lossy();
             let msg = crate::text::format_open_target_failed(&display, &err);
             tracing::warn!("{msg}");
-            let _ = std::thread::Builder::new()
-                .name("open-err-dialog".to_string())
-                .spawn(move || {
+            Self::spawn_singleton_dialog(
+                &self.open_error_dialog_open,
+                "open-err-dialog",
+                move || {
                     platform::notify_error(crate::text::APP_NAME, &msg);
-                });
+                },
+            );
         }
     }
 

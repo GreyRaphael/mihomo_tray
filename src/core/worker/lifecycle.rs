@@ -569,7 +569,8 @@ mod tests {
 
     use super::*;
     use crate::config::tray::TraySettings;
-    use crate::core::worker::tests::{read_http_request, send_http_response, test_worker};
+    use crate::core::test_http::{read_http_request, send_http_response};
+    use crate::core::worker::tests::test_worker;
 
     #[test]
     fn verify_or_enable_tun_after_elevation_patches_and_verifies_tun() {

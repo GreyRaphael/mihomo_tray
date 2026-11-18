@@ -1,7 +1,6 @@
 //! Main thread GUI orchestration (`winit 0.30` ApplicationHandler + `tray-icon 0.26`).
 
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -12,7 +11,7 @@ use winit::window::WindowId;
 
 use crate::config::mihomo;
 use crate::config::tray::TraySettings;
-use crate::core::worker;
+use crate::core::worker::{self, WorkerHandle};
 use crate::platform;
 use crate::state::{AppEvent, SharedSnapshot, Snapshot, WorkerCommand};
 use crate::tray::icon::{self, IconKey};
@@ -28,7 +27,7 @@ pub struct MihomoTrayApp {
     startup_error: Option<String>,
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
-    worker_tx: Option<Sender<WorkerCommand>>,
+    worker: Option<WorkerHandle>,
     tray_icon: Option<TrayIcon>,
     actions: Vec<MenuAction>,
     menu_generation: u64,
@@ -59,7 +58,7 @@ impl MihomoTrayApp {
             startup_error,
             shared,
             proxy,
-            worker_tx: None,
+            worker: None,
             tray_icon: None,
             actions: Vec::new(),
             menu_generation: 1,
@@ -78,8 +77,8 @@ impl MihomoTrayApp {
     }
 
     fn init_tray_and_worker(&mut self) {
-        if self.worker_tx.is_none() {
-            let tx = worker::spawn(
+        if self.worker.is_none() {
+            let handle = worker::spawn(
                 self.portable_root.clone(),
                 self.settings_path.clone(),
                 self.initial_settings.clone(),
@@ -87,7 +86,7 @@ impl MihomoTrayApp {
                 self.proxy.clone(),
                 self.startup_error.take(),
             );
-            self.worker_tx = Some(tx);
+            self.worker = Some(handle);
         }
 
         if self.tray_icon.is_none() {
@@ -220,7 +219,7 @@ impl MihomoTrayApp {
                 if !self.quitting {
                     self.quitting = true;
                     self.restart_on_exit = true;
-                    self.send_worker(WorkerCommand::Quit);
+                    self.send_worker(WorkerCommand::Quit { interactive: true });
                 }
             }
             MenuAction::ToggleAutostart => self.send_worker(WorkerCommand::ToggleAutostart),
@@ -229,7 +228,7 @@ impl MihomoTrayApp {
                 if !self.quitting {
                     self.quitting = true;
                     self.restart_on_exit = false;
-                    self.send_worker(WorkerCommand::Quit);
+                    self.send_worker(WorkerCommand::Quit { interactive: true });
                 }
             }
         }
@@ -304,7 +303,7 @@ impl MihomoTrayApp {
     }
 
     fn prompt_and_set_subscription(&self) {
-        let Some(tx) = self.worker_tx.clone() else {
+        let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;
         };
         let cfg_path = self
@@ -398,9 +397,20 @@ impl MihomoTrayApp {
     }
 
     fn send_worker(&self, cmd: WorkerCommand) {
-        if let Some(tx) = &self.worker_tx {
-            let _ = tx.send(cmd);
+        if let Some(worker) = &self.worker {
+            worker.send(cmd);
         }
+    }
+
+    fn shutdown_on_exit(&mut self) {
+        if let Some(mut worker) = self.worker.take() {
+            if !self.quitting {
+                self.quitting = true;
+                worker.send(WorkerCommand::Quit { interactive: false });
+            }
+            worker.join();
+        }
+        self.tray_icon.take();
     }
 
     fn debounce_pass(&mut self) -> bool {
@@ -432,7 +442,7 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::Menu(ev) => self.handle_menu_event(ev.id.as_ref()),
             AppEvent::SnapshotUpdated { rebuild_menu } => self.apply_snapshot(rebuild_menu),
             AppEvent::QuitCompleted => {
-                self.tray_icon.take();
+                self.shutdown_on_exit();
                 event_loop.exit();
             }
         }
@@ -440,5 +450,15 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         self.flush_pending_menu();
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.shutdown_on_exit();
+    }
+}
+
+impl Drop for MihomoTrayApp {
+    fn drop(&mut self) {
+        self.shutdown_on_exit();
     }
 }

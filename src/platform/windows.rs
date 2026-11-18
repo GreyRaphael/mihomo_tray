@@ -150,19 +150,17 @@ pub fn proxy_enable(port: u16, extra_bypass: &[String]) -> Result<(), String> {
         changed = true;
     }
 
-    // Seed ProxyOverride only when absent so user-curated bypass rules are preserved.
-    let has_override = match key.get_raw_value("ProxyOverride") {
-        Ok(_) => true,
-        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    let existing_override = match key.get_value::<String, _>("ProxyOverride") {
+        Ok(val) => Some(val),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(format!("failed to read ProxyOverride: {err}"));
+        }
     };
-    if !has_override {
-        let mut entries: Vec<String> = extra_bypass
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        entries.push("<local>".to_string());
-        key.set_value("ProxyOverride", &entries.join(";"))
+    if let Some(merged) =
+        crate::platform::merge_proxy_override(existing_override.as_deref(), extra_bypass)
+    {
+        key.set_value("ProxyOverride", &merged)
             .map_err(|e| format!("failed to set ProxyOverride: {e}"))?;
         changed = true;
     }

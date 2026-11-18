@@ -100,16 +100,7 @@ pub fn settings_path(portable_root: &Path) -> PathBuf {
 
 /// Writes the commented sample configuration when `tray.yml` is missing or empty.
 pub fn ensure_sample_file(path: &Path) {
-    let exists_and_non_empty = std::fs::read_to_string(path)
-        .map(|s| !s.trim_start_matches('\u{feff}').trim().is_empty())
-        .unwrap_or(false);
-    if exists_and_non_empty {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, DEFAULT_SAMPLE);
+    crate::config::ensure_template_file(path, DEFAULT_SAMPLE);
 }
 
 pub fn load(path: &Path) -> Result<TraySettings, String> {
@@ -207,5 +198,28 @@ mod tests {
             Some(PathBuf::from("/abs/path/config.yaml"))
         );
         assert_eq!(resolve_portable_path(&root, "   "), None);
+    }
+
+    #[test]
+    fn ensure_sample_file_preserves_non_utf8_content() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mihomo_tray_cfg_non_utf8_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tray.yml");
+        let raw_gbk = b"# \xd6\xd0\xce\xc4\nmihomo:\n  auto_start: false\n";
+        std::fs::write(&path, raw_gbk).unwrap();
+
+        ensure_sample_file(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), raw_gbk);
+
+        let empty = dir.join("empty.yml");
+        std::fs::write(&empty, "\u{feff}  \n").unwrap();
+        ensure_sample_file(&empty);
+        assert!(std::fs::read_to_string(&empty).unwrap().contains("mihomo:"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

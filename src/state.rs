@@ -179,7 +179,7 @@ pub enum WorkerCommand {
     SetSubscriptionUrl(String),
     RestartCore,
     ToggleAutostart,
-    Quit,
+    Quit { interactive: bool },
 }
 
 #[derive(Debug)]

@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
 
 use winit::event_loop::EventLoopProxy;
 
@@ -18,6 +19,24 @@ use crate::text;
 
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
 const KERNEL_RESTART_BUDGET: Duration = Duration::from_secs(10);
+const AUTOSTART_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+pub struct WorkerHandle {
+    pub tx: Sender<WorkerCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    pub fn send(&self, cmd: WorkerCommand) {
+        let _ = self.tx.send(cmd);
+    }
+
+    pub fn join(&mut self) {
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 pub fn spawn(
     portable_root: PathBuf,
@@ -26,10 +45,10 @@ pub fn spawn(
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
     startup_error: Option<String>,
-) -> Sender<WorkerCommand> {
+) -> WorkerHandle {
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
 
-    std::thread::Builder::new()
+    let join = std::thread::Builder::new()
         .name("mihomo-worker".to_string())
         .spawn(move || {
             let mut worker = Worker::new(
@@ -44,13 +63,18 @@ pub fn spawn(
         })
         .expect("failed to spawn worker thread");
 
-    tx
+    WorkerHandle {
+        tx,
+        join: Some(join),
+    }
 }
 
 struct Worker {
     portable_root: PathBuf,
     settings_path: PathBuf,
     settings: TraySettings,
+    last_settings_mtime: Option<SystemTime>,
+    settings_parse_error: bool,
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
     managed: Option<ManagedChild>,
@@ -58,6 +82,8 @@ struct Worker {
     recorded_pid: Option<u32>,
     client: Option<Client>,
     cached_version: String,
+    cached_autostart: bool,
+    last_autostart_check: Option<Instant>,
     home_dir: PathBuf,
     config_file: PathBuf,
     persisted_state: PersistedState,
@@ -76,6 +102,8 @@ impl Worker {
     ) -> Self {
         let (home_dir, config_file) =
             discover::resolve_home_and_config(&portable_root, &settings, None);
+        let last_settings_mtime = file_mtime(&settings_path);
+        let has_startup_error = startup_error.is_some();
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = settings.groups.page_size;
@@ -88,6 +116,8 @@ impl Worker {
             portable_root,
             settings_path,
             settings,
+            last_settings_mtime,
+            settings_parse_error: has_startup_error,
             shared,
             proxy,
             managed: None,
@@ -95,6 +125,8 @@ impl Worker {
             recorded_pid: None,
             client: None,
             cached_version: String::new(),
+            cached_autostart: false,
+            last_autostart_check: None,
             home_dir,
             config_file,
             persisted_state: PersistedState::default(),
@@ -109,25 +141,32 @@ impl Worker {
         loop {
             let interval = Duration::from_millis(self.settings.ui.poll_interval_ms as u64);
             match rx.recv_timeout(interval) {
-                Ok(WorkerCommand::Quit) => {
-                    self.handle_quit();
+                Ok(WorkerCommand::Quit { interactive }) => {
+                    self.handle_quit(interactive);
                     break;
                 }
                 Ok(cmd) => {
-                    self.handle_command(cmd);
-                    // Coalesce burst commands before doing a full poll.
+                    let mut burst_error = self.handle_command(cmd).err();
+                    // Coalesce burst commands before doing a single refresh poll.
                     while let Ok(extra) = rx.try_recv() {
-                        if matches!(extra, WorkerCommand::Quit) {
-                            self.handle_quit();
+                        if let WorkerCommand::Quit { interactive } = extra {
+                            self.handle_quit(interactive);
                             return;
                         }
-                        self.handle_command(extra);
+                        if let Err(err) = self.handle_command(extra) {
+                            burst_error = Some(err);
+                        }
                     }
+                    self.set_action_error(burst_error);
+                    self.refresh();
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.refresh();
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.handle_quit(false);
+                    break;
+                }
             }
         }
     }
@@ -135,6 +174,7 @@ impl Worker {
     fn startup(&mut self) {
         self.reload_paths_and_runtime();
         self.load_initial_persisted_state();
+        self.refresh_autostart_cache();
         let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         self.re_resolve_controller(&running);
 
@@ -174,15 +214,35 @@ impl Worker {
         state_store::save(&self.home_dir, &self.persisted_state);
     }
 
-    fn reload_settings_and_paths(&mut self, report_kernel_error: bool) {
-        if let Ok(reloaded) = tray::load(&self.settings_path) {
-            self.settings = reloaded;
+    fn load_settings_from_disk(&mut self, report_error: bool) -> bool {
+        self.last_settings_mtime = file_mtime(&self.settings_path);
+        let prev_controller = self.settings.controller.clone();
+        match tray::load(&self.settings_path) {
+            Ok(reloaded) => {
+                self.settings = reloaded;
+                if self.settings_parse_error {
+                    self.settings_parse_error = false;
+                    self.set_action_error(None);
+                }
+                self.settings.controller != prev_controller
+            }
+            Err(err) => {
+                if report_error {
+                    self.settings_parse_error = true;
+                    self.set_action_error(Some(err));
+                }
+                false
+            }
         }
+    }
+
+    fn reload_settings_and_paths(&mut self, report_error: bool) {
+        self.load_settings_from_disk(report_error);
         match discover::find_kernel(&self.portable_root, &self.settings) {
             Ok(path) => self.known_kernel_path = path,
             Err(err) => {
                 self.known_kernel_path = None;
-                if report_kernel_error {
+                if report_error {
                     self.set_action_error(Some(err));
                 }
             }
@@ -194,6 +254,27 @@ impl Worker {
         );
         self.home_dir = home;
         self.config_file = cfg;
+    }
+
+    fn reload_settings_if_changed(&mut self) -> bool {
+        if file_mtime(&self.settings_path) == self.last_settings_mtime {
+            return false;
+        }
+        self.load_settings_from_disk(true)
+    }
+
+    fn refresh_autostart_cache(&mut self) {
+        self.cached_autostart = platform::autostart_is_enabled();
+        self.last_autostart_check = Some(Instant::now());
+    }
+
+    fn refresh_autostart_if_stale(&mut self) {
+        if self
+            .last_autostart_check
+            .is_none_or(|t| t.elapsed() >= AUTOSTART_REFRESH_INTERVAL)
+        {
+            self.refresh_autostart_cache();
+        }
     }
 
     fn reload_paths_and_runtime(&mut self) {
@@ -230,8 +311,8 @@ impl Worker {
         }
     }
 
-    fn handle_command(&mut self, cmd: WorkerCommand) {
-        let result: Result<(), String> = match cmd {
+    fn handle_command(&mut self, cmd: WorkerCommand) -> Result<(), String> {
+        match cmd {
             WorkerCommand::SetMode(mode) => self.set_mode(&mode),
             WorkerCommand::ToggleSystemProxy => self.toggle_system_proxy(),
             WorkerCommand::ToggleTun => self.toggle_tun(),
@@ -247,16 +328,12 @@ impl Worker {
             WorkerCommand::RestartCore => self.force_restart_core(),
             WorkerCommand::ToggleAutostart => {
                 let enabled = platform::autostart_is_enabled();
-                platform::autostart_set(!enabled)
+                let res = platform::autostart_set(!enabled);
+                self.refresh_autostart_cache();
+                res
             }
-            WorkerCommand::Quit => return,
-        };
-
-        match result {
-            Ok(()) => self.set_action_error(None),
-            Err(err) => self.set_action_error(Some(err)),
+            WorkerCommand::Quit { .. } => Ok(()),
         }
-        self.refresh();
     }
 
     fn set_mode(&mut self, mode: &str) -> Result<(), String> {
@@ -319,10 +396,17 @@ impl Worker {
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        client.set_tun(want_enable)?;
-        let after = client.get_configs()?;
+        let set_res = client.set_tun(want_enable);
+        let after = match client.get_configs() {
+            Ok(cfg) => cfg,
+            Err(cfg_err) => return Err(set_res.err().unwrap_or(cfg_err)),
+        };
         if !want_enable || after.tun_enable {
+            set_res?;
             return Ok(after.tun_enable);
+        }
+        if let Err(err) = &set_res {
+            tracing::info!("Non-elevated set_tun(true) failed ({err}); attempting UAC elevation");
         }
 
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
@@ -332,7 +416,7 @@ impl Worker {
             self.active_pid(),
             self.known_kernel_path.as_deref(),
         )
-        .ok_or_else(|| text::ERR_TUN_ELEVATION_DECLINED.to_string())?;
+        .ok_or_else(|| "Could not locate the running mihomo process to elevate.".to_string())?;
 
         let launch_args = discover::build_launch_args(
             &self.portable_root,
@@ -352,7 +436,12 @@ impl Worker {
 
         let new_pid = match code {
             Ok(c) if c > 0 => c as u32,
-            Ok(_) | Err(_) => return Err(text::ERR_TUN_ELEVATION_DECLINED.to_string()),
+            Ok(c) => {
+                return Err(format!(
+                    "Elevated helper failed while restarting mihomo (code {c})."
+                ));
+            }
+            Err(_) => return Err(text::ERR_TUN_ELEVATION_DECLINED.to_string()),
         };
 
         self.managed = None;
@@ -371,20 +460,13 @@ impl Worker {
             );
         }
 
+        self.re_resolve_controller(&[]);
         self.wait_for_controller(KERNEL_RESTART_BUDGET, text::ERR_CORE_RESTART_TIMEOUT)?;
-        let verify = self.with_client_read_configs()?;
-        if !verify.tun_enable {
-            return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
-        }
-        Ok(true)
-    }
-
-    fn with_client_read_configs(&self) -> Result<crate::core::api::CoreConfigs, String> {
-        let client = self
+        let elevated_client = self
             .client
             .as_ref()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        client.get_configs()
+        verify_or_enable_tun_after_elevation(elevated_client)
     }
 
     fn start_core_internal(&mut self) -> Result<(), String> {
@@ -433,12 +515,12 @@ impl Worker {
         res
     }
 
-    fn stop_core_internal(&mut self) -> Result<(), String> {
+    fn stop_core_internal(&mut self, interactive: bool) -> Result<(), String> {
         self.set_status_note(Some(text::STATUS_STOPPING_CORE));
-        let res = self.stop_active_kernel();
+        let res = self.stop_active_kernel(interactive);
         self.set_status_note(None);
         res?;
-        if platform::proxy_is_enabled() {
+        if self.persisted_state.system_proxy && platform::proxy_is_enabled() {
             let _ = platform::proxy_disable();
         }
         Ok(())
@@ -451,21 +533,19 @@ impl Worker {
         let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
         if !running.is_empty() {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
-            let stop_res = self.stop_active_kernel();
+            let stop_res = self.stop_active_kernel(true);
             self.set_status_note(None);
             stop_res?;
         }
         self.start_core_internal()
     }
 
-    fn stop_active_kernel(&mut self) -> Result<(), String> {
+    fn stop_active_kernel(&mut self, interactive: bool) -> Result<(), String> {
         // First try managed non-elevated child directly.
-        if let Some(mut managed) = self.managed.take()
-            && let Some(ref mut child) = managed.child
-        {
-            if matches!(child.try_wait(), Ok(None)) {
-                if child.kill().is_ok() {
-                    let _ = child.wait();
+        if let Some(mut managed) = self.managed.take() {
+            if matches!(managed.child.try_wait(), Ok(None)) {
+                if managed.child.kill().is_ok() {
+                    let _ = managed.child.wait();
                     self.recorded_pid = None;
                     self.cached_version.clear();
                     process::clear_runtime_record(&self.home_dir);
@@ -487,7 +567,7 @@ impl Worker {
         )
         .cloned()
         .or_else(|| {
-            if running.len() == 1 {
+            if interactive && running.len() == 1 {
                 let candidate = &running[0];
                 let exe_label = candidate
                     .exe
@@ -512,6 +592,9 @@ impl Worker {
         };
 
         if process::terminate_pid_and_wait(target.pid).is_err() {
+            if !interactive {
+                return Err(text::ERR_STOP_ELEVATION_REQUIRED.to_string());
+            }
             let code = platform::run_elevated_self(&[
                 platform::ELEVATE_STOP_FLAG.to_string(),
                 target.pid.to_string(),
@@ -531,8 +614,7 @@ impl Worker {
         let start = Instant::now();
         while start.elapsed() < budget {
             if let Some(ref mut managed) = self.managed
-                && let Some(ref mut child) = managed.child
-                && let Ok(Some(_)) = child.try_wait()
+                && let Ok(Some(_)) = managed.child.try_wait()
             {
                 self.managed = None;
                 self.recorded_pid = None;
@@ -616,7 +698,7 @@ impl Worker {
             }
         } else {
             PersistedState {
-                system_proxy: self.persisted_state.system_proxy || platform::proxy_is_enabled(),
+                system_proxy: self.persisted_state.system_proxy,
                 mode: self.persisted_state.mode.clone(),
                 tun: self.persisted_state.tun,
             }
@@ -666,19 +748,17 @@ impl Worker {
         }
     }
 
-    fn handle_quit(&mut self) {
+    fn handle_quit(&mut self, interactive: bool) {
         let final_state = self.capture_live_or_persisted_state();
         self.persisted_state = final_state;
         self.save_persisted_state();
-        let _ = self.stop_core_internal();
+        let _ = self.stop_core_internal(interactive);
         let _ = self.proxy.send_event(AppEvent::QuitCompleted);
     }
 
     fn active_pid(&mut self) -> Option<u32> {
         if let Some(ref mut managed) = self.managed {
-            if let Some(ref mut child) = managed.child
-                && matches!(child.try_wait(), Ok(None))
-            {
+            if matches!(managed.child.try_wait(), Ok(None)) {
                 return Some(managed.pid);
             }
             self.managed = None;
@@ -694,15 +774,25 @@ impl Worker {
     }
 
     fn refresh(&mut self) {
-        let mut running = process::list_running_mihomo(self.known_kernel_path.as_deref());
-        let kernel_running = self.active_pid().is_some() || !running.is_empty();
+        let tracked_alive = self.active_pid().is_some();
+        let mut running = if !tracked_alive || self.client.is_none() {
+            process::list_running_mihomo(self.known_kernel_path.as_deref())
+        } else {
+            Vec::new()
+        };
+        let kernel_running = tracked_alive || !running.is_empty();
 
         if !kernel_running {
             self.reload_settings_and_paths(false);
-            running = process::list_running_mihomo(self.known_kernel_path.as_deref());
             self.re_resolve_controller(&running);
-        } else if self.client.is_none() {
-            self.re_resolve_controller(&running);
+        } else {
+            let controller_cfg_changed = self.reload_settings_if_changed();
+            if self.client.is_none() || controller_cfg_changed {
+                if running.is_empty() {
+                    running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+                }
+                self.re_resolve_controller(&running);
+            }
         }
 
         let client_opt = self.client.clone();
@@ -737,7 +827,8 @@ impl Worker {
         }
 
         let sysproxy = platform::proxy_is_enabled();
-        let autostart = platform::autostart_is_enabled();
+        self.refresh_autostart_if_stale();
+        let autostart = self.cached_autostart;
 
         if controller_ok && self.pending_restore.is_none() {
             let live = PersistedState {
@@ -837,6 +928,21 @@ impl Worker {
     }
 }
 
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<bool, String> {
+    client
+        .set_tun(true)
+        .map_err(|err| format!("Failed to enable TUN after elevation: {err}"))?;
+    let verify = client.get_configs()?;
+    if !verify.tun_enable {
+        return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
+    }
+    Ok(true)
+}
+
 fn order_and_filter_groups(groups: Vec<Group>, settings: &TraySettings) -> Vec<Group> {
     let include = &settings.groups.include;
     let exclude = &settings.groups.exclude;
@@ -908,5 +1014,116 @@ mod tests {
             .map(|x| x.name)
             .collect();
         assert_eq!(out, vec!["GLOBAL", "Streaming", "Proxy", "Alpha"]);
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_len = 0usize;
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if header_end.is_none()
+                && let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let end = pos + 4;
+                header_end = Some(end);
+                let headers = String::from_utf8_lossy(&data[..end]);
+                content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+            }
+            if let Some(end) = header_end
+                && data.len() >= end + content_len
+            {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    #[test]
+    fn verify_or_enable_tun_after_elevation_patches_and_verifies_tun() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut tun_on = false;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("PATCH /configs ") {
+                    let (_, body) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                    assert_eq!(json["tun"]["enable"].as_bool(), Some(true));
+                    tun_on = true;
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                } else {
+                    let body = format!(
+                        r#"{{"mode":"rule","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
+        assert!(verify_or_enable_tun_after_elevation(&client).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn verify_or_enable_tun_after_elevation_errors_when_still_disabled() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("PATCH /configs ") {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                } else {
+                    let body = r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
+        let err = verify_or_enable_tun_after_elevation(&client).unwrap_err();
+        assert_eq!(err, text::ERR_TUN_FAILED_AFTER_ELEVATION);
+        handle.join().unwrap();
     }
 }

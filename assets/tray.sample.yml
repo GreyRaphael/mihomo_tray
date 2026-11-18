@@ -37,7 +37,7 @@ controller:
   timeout_ms: 2000
 
 proxy:
-  # Extra Windows ProxyOverride bypass entries; "<local>" is always included.
+  # Extra Windows ProxyOverride bypass entries (merged into existing rules when non-empty; "<local>" is always included).
   bypass: []
 
 groups:

@@ -18,7 +18,6 @@ pub struct MihomoConfigInfo {
     pub external_ui: Option<String>,
     pub mixed_port: u16,
     pub other_controller_family: bool,
-    pub tun_enabled: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,14 +36,6 @@ struct PartialMihomoYaml {
     #[serde(rename = "mixed-port")]
     mixed_port: Option<u16>,
     port: Option<u16>,
-    #[serde(default)]
-    tun: PartialTunYaml,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct PartialTunYaml {
-    #[serde(default)]
-    enable: bool,
 }
 
 pub fn read_file(path: &Path) -> std::io::Result<MihomoConfigInfo> {
@@ -83,22 +74,12 @@ pub fn parse_str(text: &str) -> MihomoConfigInfo {
         external_ui: non_empty(parsed.external_ui),
         mixed_port: proxy_port,
         other_controller_family: other_family,
-        tun_enabled: parsed.tun.enable,
     }
 }
 
 /// Writes the default `config/config.yaml` only if missing or empty.
 pub fn ensure_default_config(path: &Path) {
-    let non_empty = std::fs::read_to_string(path)
-        .map(|s| !s.trim_start_matches('\u{feff}').trim().is_empty())
-        .unwrap_or(false);
-    if non_empty {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, DEFAULT_CONFIG_TEMPLATE);
+    crate::config::ensure_template_file(path, DEFAULT_CONFIG_TEMPLATE);
 }
 
 /// Reads the currently configured subscription URL (`proxy-providers.subscription.url`) if present.
@@ -124,7 +105,11 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
 
     let source_text = match std::fs::read_to_string(path) {
         Ok(text) if !text.trim_start_matches('\u{feff}').trim().is_empty() => text,
-        _ => DEFAULT_CONFIG_TEMPLATE.to_string(),
+        Ok(_) => DEFAULT_CONFIG_TEMPLATE.to_string(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_CONFIG_TEMPLATE.to_string()
+        }
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
     let clean = source_text.strip_prefix('\u{feff}').unwrap_or(&source_text);
     let mut root: Value = serde_yaml_ng::from_str(clean)
@@ -307,21 +292,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn extracts_controller_secret_ui_and_tun() {
+    fn extracts_controller_secret_and_ui() {
         let yaml = r#"
 mixed-port: 7890
 external-controller: 127.0.0.1:9090
 secret: "my#secret"
 external-ui: ./ui
-tun:
-  enable: true
 "#;
         let info = parse_str(yaml);
         assert_eq!(info.external_controller.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(info.secret.as_deref(), Some("my#secret"));
         assert_eq!(info.external_ui.as_deref(), Some("./ui"));
         assert_eq!(info.mixed_port, 7890);
-        assert!(info.tun_enabled);
         assert!(!info.other_controller_family);
 
         let fallback_port = parse_str("port: 7891\n");
@@ -389,6 +371,28 @@ tun:
         );
 
         assert!(apply_subscription_url(&cfg, "ftp://invalid").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preserves_non_utf8_config_on_default_init_and_subscription_update() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mihomo_tray_non_utf8_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.yaml");
+        let raw_gbk = b"# \xd6\xd0\xce\xc4\nmixed-port: 7890\n";
+        std::fs::write(&cfg, raw_gbk).unwrap();
+
+        ensure_default_config(&cfg);
+        assert_eq!(std::fs::read(&cfg).unwrap(), raw_gbk);
+
+        let err = apply_subscription_url(&cfg, "https://example.com/sub").unwrap_err();
+        assert!(err.contains("failed to read"));
+        assert_eq!(std::fs::read(&cfg).unwrap(), raw_gbk);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

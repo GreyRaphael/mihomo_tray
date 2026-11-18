@@ -24,7 +24,7 @@ pub fn render_icon(key: IconKey) -> Result<Icon, String> {
 pub fn render_rgba(key: IconKey, size: u32) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let outer_color = state_color(key.state);
-    let inner_color = mode_color(key.mode, outer_color);
+    let inner_color = mode_color(key.mode);
     let border_color = [20u8, 24u8, 30u8];
 
     let center = (size as f32 - 1.0) / 2.0;
@@ -50,9 +50,11 @@ pub fn render_rgba(key: IconKey, size: u32) -> Vec<u8> {
                 outer_color
             };
 
-            if key.mode != ProxyMode::Unknown && dist <= dot_r + 0.75 {
+            if let Some(inner) = inner_color
+                && dist <= dot_r + 0.75
+            {
                 let dot_alpha = smoothstep_edge(dot_r, dist);
-                rgb = lerp_rgb(rgb, inner_color, dot_alpha);
+                rgb = lerp_rgb(rgb, inner, dot_alpha);
             }
 
             buf[idx] = rgb[0];
@@ -73,12 +75,12 @@ fn state_color(state: OperationalState) -> [u8; 3] {
     }
 }
 
-fn mode_color(mode: ProxyMode, fallback: [u8; 3]) -> [u8; 3] {
+fn mode_color(mode: ProxyMode) -> Option<[u8; 3]> {
     match mode {
-        ProxyMode::Rule => [244, 247, 250], // Crisp light center
-        ProxyMode::Global => [229, 57, 53], // Red
-        ProxyMode::Direct => [34, 39, 46],  // Dark charcoal
-        ProxyMode::Unknown => fallback,
+        ProxyMode::Rule => Some([244, 247, 250]), // Crisp light center
+        ProxyMode::Global => Some([229, 57, 53]), // Red
+        ProxyMode::Direct => Some([34, 39, 46]),  // Dark charcoal
+        ProxyMode::Unknown => None,
     }
 }
 

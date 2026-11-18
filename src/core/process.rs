@@ -27,7 +27,7 @@ pub struct RuntimeRecord {
 
 #[derive(Debug)]
 pub struct ManagedChild {
-    pub child: Option<Child>,
+    pub child: Child,
     pub pid: u32,
 }
 
@@ -157,10 +157,7 @@ pub fn spawn_normal(exe: &Path, args: &[String]) -> Result<ManagedChild, String>
     let child = platform::spawn_hidden(exe, args, cwd)
         .map_err(|e| format!("failed to start {}: {e}", exe.display()))?;
     let pid = child.id();
-    Ok(ManagedChild {
-        child: Some(child),
-        pid,
-    })
+    Ok(ManagedChild { child, pid })
 }
 
 pub fn terminate_pid_and_wait(pid: u32) -> Result<(), String> {

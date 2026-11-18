@@ -114,11 +114,15 @@ pub fn try_run_helper(
     let flag = args.get(1)?.as_str();
     match flag {
         ELEVATE_STOP_FLAG => {
-            let pid = args.get(2).and_then(|s| s.parse::<u32>().ok())?;
+            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
+                return Some(-1);
+            };
             Some(stop_pid(pid))
         }
         ELEVATE_START_FLAG => {
-            let pid = args.get(2).and_then(|s| s.parse::<u32>().ok())?;
+            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
+                return Some(-1);
+            };
             Some(start_from_pid(pid, &args[3..]))
         }
         _ => None,
@@ -166,6 +170,50 @@ pub fn is_tray_menu_open() -> bool {
 /// Prompts the user with a simple modal text input box for a subscription URL.
 pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
     imp::prompt_subscription_url(current)
+}
+
+/// Computes an updated Windows `ProxyOverride` value if needed.
+/// - When `extra_bypass` is empty and an entry already exists, returns `None` to preserve user settings.
+/// - When `extra_bypass` is non-empty (or no entry exists yet), merges deduplicated entries and ensures `<local>` is included.
+#[cfg(any(windows, test))]
+pub fn merge_proxy_override(existing: Option<&str>, extra_bypass: &[String]) -> Option<String> {
+    let extras: Vec<&str> = extra_bypass
+        .iter()
+        .flat_map(|item| item.split(';'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if extras.is_empty() {
+        return existing.is_none().then(|| "<local>".to_string());
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut push_unique = |entry: &str| {
+        if entry.eq_ignore_ascii_case("<local>") {
+            return;
+        }
+        if !entries.iter().any(|e| e.eq_ignore_ascii_case(entry)) {
+            entries.push(entry.to_string());
+        }
+    };
+
+    if let Some(raw) = existing {
+        for part in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            push_unique(part);
+        }
+    }
+    for part in extras {
+        push_unique(part);
+    }
+    entries.push("<local>".to_string());
+
+    let merged = entries.join(";");
+    if existing == Some(merged.as_str()) {
+        None
+    } else {
+        Some(merged)
+    }
 }
 
 /// Quotes arguments following Microsoft `CommandLineToArgvW` rules so paths with spaces,
@@ -227,6 +275,29 @@ mod tests {
         assert_eq!(
             joined,
             r#"--elevate-start 1234 -d "C:\My Portable Tools\mihomo tray\config" "\\server\share name\config.yaml" "C:\Trailing Space\\" """#
+        );
+    }
+
+    #[test]
+    fn merges_proxy_override_only_when_seeding_or_bypass_configured() {
+        assert_eq!(merge_proxy_override(None, &[]), Some("<local>".to_string()));
+        assert_eq!(
+            merge_proxy_override(Some("localhost;127.*;<local>"), &[]),
+            None
+        );
+        assert_eq!(
+            merge_proxy_override(
+                Some("localhost;127.*;<local>"),
+                &[" 10.* ".to_string(), "*.corp;127.*".to_string()]
+            ),
+            Some("localhost;127.*;10.*;*.corp;<local>".to_string())
+        );
+        assert_eq!(
+            merge_proxy_override(
+                Some("localhost;127.*;10.*;*.corp;<local>"),
+                &["10.*".to_string(), "*.corp".to_string()]
+            ),
+            None
         );
     }
 }

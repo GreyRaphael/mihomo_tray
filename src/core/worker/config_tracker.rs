@@ -36,6 +36,7 @@ pub(super) struct ConfigTracker {
     config_file: PathBuf,
     cached_autostart: bool,
     last_autostart_check: Option<Instant>,
+    pending_path_refresh: bool,
 }
 
 impl ConfigTracker {
@@ -62,6 +63,7 @@ impl ConfigTracker {
             config_file,
             cached_autostart: false,
             last_autostart_check: None,
+            pending_path_refresh: false,
         }
     }
 
@@ -99,10 +101,6 @@ impl ConfigTracker {
         self.cached_autostart
     }
 
-    pub fn has_settings_error(&self) -> bool {
-        self.settings_error.is_some()
-    }
-
     pub fn current_config_error(&self) -> Option<String> {
         self.settings_error
             .clone()
@@ -119,9 +117,12 @@ impl ConfigTracker {
             let reload = self.load_settings_from_disk();
             settings_changed = reload.changed;
             controller_changed = reload.controller_changed;
-            if settings_changed && !tracked_alive {
-                path_switched = self.refresh_paths();
+            if settings_changed {
+                self.pending_path_refresh = true;
             }
+        }
+        if self.pending_path_refresh && !tracked_alive {
+            path_switched = self.refresh_paths();
         }
 
         let config_file_changed = path_switched || self.config_file_changed();
@@ -168,6 +169,7 @@ impl ConfigTracker {
     }
 
     fn refresh_paths(&mut self) -> bool {
+        self.pending_path_refresh = false;
         match discover::find_kernel(&self.portable_root, &self.settings) {
             Ok(path) => {
                 self.known_kernel_path = path;
@@ -259,6 +261,35 @@ mod tests {
         assert!(!broken.settings_changed);
         assert!(broken.error_changed);
         assert!(tracker.current_config_error().is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flushes_deferred_path_refresh_once_core_stops() {
+        let root = crate::config::test_temp_dir("cfg_tracker_defer_paths");
+        let settings_path = tray::settings_path(&root);
+        std::fs::write(&settings_path, "").unwrap();
+        let mut tracker = ConfigTracker::new(
+            root.clone(),
+            settings_path.clone(),
+            TraySettings::default(),
+            None,
+        );
+
+        std::fs::write(&settings_path, "mihomo:\n  config: ./alt/config.yaml\n").unwrap();
+        tracker.invalidate_settings_mtime();
+        let live_poll = tracker.poll_changes(true);
+        assert!(live_poll.settings_changed);
+        assert!(!live_poll.config_file_changed);
+        assert_eq!(
+            tracker.config_file(),
+            root.join("config").join("config.yaml")
+        );
+
+        let stopped_poll = tracker.poll_changes(false);
+        assert!(stopped_poll.config_file_changed);
+        assert_eq!(tracker.config_file(), root.join("alt").join("config.yaml"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

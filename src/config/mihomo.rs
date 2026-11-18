@@ -163,28 +163,19 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
         .ok_or_else(|| format!("{} root must be a YAML mapping", path.display()))?;
 
     // 1. Insert or update `proxy-providers.subscription` while preserving user keys.
-    if let Some(providers_map) = root_map.get_mapping("proxy-providers") {
-        if let Some(sub_map) = providers_map.get_mapping(SUBSCRIPTION_PROVIDER_NAME) {
+    upsert_mapping(&root_map, "proxy-providers", |providers_map| {
+        upsert_mapping(providers_map, SUBSCRIPTION_PROVIDER_NAME, |sub_map| {
             sub_map.set("type", "http");
             sub_map.set("url", url);
             sub_map.set("path", SUBSCRIPTION_LOCAL_PATH);
             sub_map.set("interval", SUBSCRIPTION_INTERVAL_SECS as i64);
-            if let Some(hc_map) = sub_map.get_mapping("health-check") {
+            upsert_mapping(sub_map, "health-check", |hc_map| {
                 hc_map.set("enable", true);
                 hc_map.set("url", HEALTH_CHECK_URL);
                 hc_map.set("interval", HEALTH_CHECK_INTERVAL_SECS);
-            } else {
-                sub_map.set("health-check", build_health_check_doc());
-            }
-        } else {
-            providers_map.set(SUBSCRIPTION_PROVIDER_NAME, build_subscription_doc(url));
-        }
-    } else {
-        let providers_doc = MappingBuilder::new()
-            .pair(SUBSCRIPTION_PROVIDER_NAME, build_subscription_doc(url))
-            .build_document();
-        root_map.set("proxy-providers", &providers_doc);
-    }
+            });
+        });
+    });
 
     // 2. Wire `use: [subscription]` into proxy groups
     wire_subscription_into_groups(&root_map);
@@ -200,22 +191,16 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn build_health_check_doc() -> Document {
-    MappingBuilder::new()
-        .pair("enable", true)
-        .pair("url", HEALTH_CHECK_URL)
-        .pair("interval", HEALTH_CHECK_INTERVAL_SECS)
-        .build_document()
-}
-
-fn build_subscription_doc(url: &str) -> Document {
-    MappingBuilder::new()
-        .pair("type", "http")
-        .pair("url", url)
-        .pair("path", SUBSCRIPTION_LOCAL_PATH)
-        .pair("interval", SUBSCRIPTION_INTERVAL_SECS as i64)
-        .pair("health-check", build_health_check_doc())
-        .build_document()
+fn upsert_mapping(parent: &Mapping, key: &str, update: impl FnOnce(&Mapping)) {
+    if let Some(existing) = parent.get_mapping(key) {
+        update(&existing);
+        return;
+    }
+    let doc = Document::new_mapping();
+    if let Some(map) = doc.as_mapping() {
+        update(&map);
+    }
+    parent.set(key, &doc);
 }
 
 fn wire_subscription_into_groups(root_map: &Mapping) {

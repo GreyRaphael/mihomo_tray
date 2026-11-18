@@ -8,7 +8,7 @@ use crate::config::tray::{self, TraySettings};
 use crate::core::api::Client;
 use crate::core::process::{self, RunningProcess};
 use crate::platform;
-use crate::text::{ERR_NO_CONTROLLER, MIHOMO_CONFIG_NAME};
+use crate::text::{self, ERR_NO_CONTROLLER, MIHOMO_CONFIG_NAME};
 
 pub fn find_kernel(
     portable_root: &Path,
@@ -16,10 +16,7 @@ pub fn find_kernel(
 ) -> Result<Option<PathBuf>, String> {
     if let Some(declared) = tray::resolve_portable_path(portable_root, &settings.mihomo.path) {
         if !declared.is_file() {
-            return Err(format!(
-                "Declared mihomo.path does not exist: {}",
-                declared.display()
-            ));
+            return Err(text::format_declared_path_missing(&declared));
         }
         return Ok(Some(declared));
     }
@@ -151,15 +148,6 @@ fn resolve_external_ui(
 }
 
 /// Builds the exact command-line arguments passed when spawning mihomo.
-pub fn build_launch_args(
-    portable_root: &Path,
-    settings: &TraySettings,
-    kernel_path: Option<&Path>,
-) -> Result<Vec<String>, String> {
-    let (home_dir, config_file) = resolve_home_and_config(portable_root, settings, kernel_path);
-    build_launch_args_for_paths(portable_root, settings, &home_dir, &config_file)
-}
-
 pub(crate) fn build_launch_args_for_paths(
     portable_root: &Path,
     settings: &TraySettings,
@@ -173,16 +161,11 @@ pub(crate) fn build_launch_args_for_paths(
         ("secret", "secret in config.yaml"),
     ] {
         if has_flag(&settings.mihomo.args, flag) {
-            return Err(format!(
-                "Do not pass -{flag} in mihomo.args; configure {owner} instead."
-            ));
+            return Err(text::format_disallowed_mihomo_arg(flag, owner));
         }
     }
     if !settings.ui.external_ui.trim().is_empty() && has_flag(&settings.mihomo.args, "ext-ui") {
-        return Err(
-            "Do not pass -ext-ui in mihomo.args when ui.external_ui is configured in tray.yml."
-                .to_string(),
-        );
+        return Err(text::ERR_CONFLICTING_EXT_UI_ARG.to_string());
     }
 
     let config_info = mihomo::read_file(config_file).unwrap_or_default();
@@ -251,10 +234,7 @@ pub fn resolve_controller(
             return Err(err);
         }
         if other_controller_family {
-            return Err(format!(
-                "{} configures only TLS/unix/pipe external-controller, which is unsupported.",
-                config_path.display()
-            ));
+            return Err(text::format_unsupported_controller_family(config_path));
         }
         return Err(ERR_NO_CONTROLLER.to_string());
     };
@@ -381,7 +361,9 @@ mod tests {
         std::fs::create_dir_all(root.join("ui")).unwrap();
         std::fs::write(root.join("ui").join("index.html"), "<html></html>").unwrap();
 
-        let args = build_launch_args(&root, &TraySettings::default(), None).unwrap();
+        let defaults = TraySettings::default();
+        let (home, cfg) = resolve_home_and_config(&root, &defaults, None);
+        let args = build_launch_args_for_paths(&root, &defaults, &home, &cfg).unwrap();
         let ui_idx = args
             .iter()
             .position(|a| a == "-ext-ui")
@@ -391,7 +373,8 @@ mod tests {
         let mut conflict_settings = TraySettings::default();
         conflict_settings.ui.external_ui = "./ui".to_string();
         conflict_settings.mihomo.args = vec!["-ext-ui".to_string(), "./other-ui".to_string()];
-        assert!(build_launch_args(&root, &conflict_settings, None).is_err());
+        let (home, cfg) = resolve_home_and_config(&root, &conflict_settings, None);
+        assert!(build_launch_args_for_paths(&root, &conflict_settings, &home, &cfg).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }

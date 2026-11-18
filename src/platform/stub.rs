@@ -56,3 +56,26 @@ pub fn format_env_vars_command(port: u16) -> String {
 pub fn is_tray_menu_open() -> bool {
     false
 }
+
+/// Guards `rustydialogs`'s Linux backend `LazyLock`, which panics if no
+/// `kdialog`/`zenity` executable is available or when running headless.
+pub fn can_show_dialog() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return false;
+        }
+        if let Ok(backend) = std::env::var("RUSTY_DIALOGS_BACKEND") {
+            return matches!(backend.as_str(), "kdialog" | "zenity")
+                && which::which(&backend).is_ok();
+        }
+        which::which("kdialog").is_ok() || which::which("zenity").is_ok()
+    }
+}

@@ -38,7 +38,7 @@ pub struct MihomoTrayApp {
     last_menu_fingerprint: Option<MenuFingerprint>,
     pending_menu_rebuild: bool,
     last_click: Option<Instant>,
-    last_gui_error: Option<String>,
+    has_gui_open_error: bool,
     version_dialog_open: Arc<AtomicBool>,
     prompt_dialog_open: Arc<AtomicBool>,
     quitting: bool,
@@ -72,7 +72,7 @@ impl MihomoTrayApp {
             last_menu_fingerprint: None,
             pending_menu_rebuild: false,
             last_click: None,
-            last_gui_error: None,
+            has_gui_open_error: false,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             prompt_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
@@ -376,40 +376,19 @@ impl MihomoTrayApp {
     fn open_target(&mut self, target: impl AsRef<std::ffi::OsStr>) {
         let target = target.as_ref();
         match open::that_detached(target) {
-            Ok(()) => self.clear_gui_action_error(),
+            Ok(()) => {
+                if self.has_gui_open_error {
+                    self.has_gui_open_error = false;
+                    self.send_worker(WorkerCommand::GuiOpenResult(Ok(())));
+                }
+            }
             Err(err) => {
                 let display = target.to_string_lossy();
                 let msg = crate::text::format_open_target_failed(&display, &err);
-                self.last_gui_error = Some(msg.clone());
-                self.set_action_error(msg);
+                self.has_gui_open_error = true;
+                self.send_worker(WorkerCommand::GuiOpenResult(Err(msg)));
             }
         }
-    }
-
-    fn clear_gui_action_error(&mut self) {
-        let Some(gui_err) = self.last_gui_error.take() else {
-            return;
-        };
-        let cleared = {
-            let mut snap = self.shared.lock().unwrap();
-            if snap.action_error.as_deref() == Some(gui_err.as_str()) {
-                snap.action_error = None;
-                true
-            } else {
-                false
-            }
-        };
-        if cleared {
-            self.apply_snapshot(true);
-        }
-    }
-
-    fn set_action_error(&mut self, err: String) {
-        {
-            let mut snap = self.shared.lock().unwrap();
-            snap.action_error = Some(err);
-        }
-        self.apply_snapshot(true);
     }
 
     fn send_worker(&self, cmd: WorkerCommand) {
@@ -463,10 +442,10 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::QuitCompleted => {
                 event_loop.exit();
             }
-            AppEvent::QuitCancelled(err) => {
+            AppEvent::QuitCancelled => {
                 self.quitting = false;
                 self.restart_on_exit = false;
-                self.set_action_error(err);
+                self.apply_snapshot(true);
             }
         }
     }

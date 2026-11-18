@@ -68,6 +68,10 @@ pub const ERR_INVALID_SUBSCRIPTION_URL: &str =
     "Subscription URL must start with http:// or https://";
 pub const ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN: &str =
     "Shutdown requested while waiting for controller.";
+pub const ERR_TUN_STILL_ENABLED: &str = "TUN mode remained enabled after disabling.";
+pub const ERR_UNSUPPORTED_PROXY_MODE: &str = "unsupported proxy mode";
+pub const ERR_CONFLICTING_EXT_UI_ARG: &str =
+    "Do not pass -ext-ui in mihomo.args when ui.external_ui is configured in tray.yml.";
 
 pub const TITLE_VERSION: &str = "Version";
 pub const TITLE_CONFIRM_STOP: &str = "Confirm Stop Core";
@@ -124,6 +128,29 @@ pub fn format_elevated_helper_failed(code: i32, reason: Option<&str>) -> String 
 
 pub fn format_tun_enable_after_elevation_failed(err: &str) -> String {
     format!("Failed to enable TUN after elevation: {err}")
+}
+
+pub fn format_declared_path_missing(path: &std::path::Path) -> String {
+    format!("Declared mihomo.path does not exist: {}", path.display())
+}
+
+pub fn format_disallowed_mihomo_arg(flag: &str, owner: &str) -> String {
+    format!("Do not pass -{flag} in mihomo.args; configure {owner} instead.")
+}
+
+pub fn format_unsupported_controller_family(config_path: &std::path::Path) -> String {
+    format!(
+        "{} configures only TLS/unix/pipe external-controller, which is unsupported.",
+        config_path.display()
+    )
+}
+
+pub fn format_event_loop_init_failed(err: &dyn std::fmt::Display) -> String {
+    format!("Failed to initialize event loop: {err}")
+}
+
+pub fn format_single_instance_failed(err: &dyn std::fmt::Display) -> String {
+    format!("Single-instance check failed: {err}")
 }
 
 pub fn format_status_running(mode: &str, version: &str) -> String {

@@ -68,10 +68,7 @@ fn main() {
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .unwrap_or_else(|err| {
-            platform::notify_error(
-                text::APP_NAME,
-                &format!("Failed to initialize event loop: {err}"),
-            );
+            platform::notify_error(text::APP_NAME, &text::format_event_loop_init_failed(&err));
             std::process::exit(1);
         });
 
@@ -101,6 +98,7 @@ fn main() {
         tracing::error!("Event loop terminated with error: {err}");
     }
     let should_restart = app.should_restart();
+    drop(app);
     drop(instance);
     if should_restart {
         let args = vec![
@@ -166,10 +164,7 @@ fn acquire_single_instance(
                 return None;
             }
             Err(err) => {
-                platform::notify_error(
-                    text::APP_NAME,
-                    &format!("Single-instance check failed: {err}"),
-                );
+                platform::notify_error(text::APP_NAME, &text::format_single_instance_failed(&err));
                 std::process::exit(1);
             }
         }

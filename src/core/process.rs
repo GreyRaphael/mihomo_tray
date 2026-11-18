@@ -315,21 +315,18 @@ fn eq_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Elevated helper entrypoint (`--elevate-stop <pid>`).
+/// Failures are reported via negative exit codes (translated by [`helper_exit_reason`]
+/// in the main process) instead of initializing log rotation in the transient child.
 pub fn helper_stop_pid(pid: u32) -> i32 {
     if pid == 0 {
-        eprintln!("elevated stop helper rejected pid 0");
         return HELPER_EXIT_INVALID_ARGS;
     }
     if process_exe_for_pid(pid).is_none() {
-        eprintln!("elevated stop helper rejected missing or unauthorized pid {pid}");
         return HELPER_EXIT_UNAUTHORIZED;
     }
     match terminate_pid_and_wait(pid) {
         Ok(()) => 0,
-        Err(err) => {
-            eprintln!("elevated stop helper failed to terminate pid {pid}: {err}");
-            HELPER_EXIT_STOP_FAILED
-        }
+        Err(_) => HELPER_EXIT_STOP_FAILED,
     }
 }
 
@@ -337,37 +334,21 @@ pub fn helper_stop_pid(pid: u32) -> i32 {
 /// Reads the real executable image from `<pid>` so the caller never injects an arbitrary executable path.
 pub fn helper_start_from_pid(pid: u32, args: &[String]) -> i32 {
     if pid == 0 {
-        eprintln!("elevated start helper rejected pid 0");
         return HELPER_EXIT_INVALID_ARGS;
     }
     let Some(exe) = process_exe_for_pid(pid) else {
-        eprintln!("elevated start helper rejected missing or unauthorized pid {pid}");
         return HELPER_EXIT_UNAUTHORIZED;
     };
-    if let Err(err) = terminate_pid_and_wait(pid) {
-        eprintln!("elevated start helper failed to terminate pid {pid}: {err}");
+    if terminate_pid_and_wait(pid).is_err() {
         return HELPER_EXIT_STOP_FAILED;
     }
     let cwd = exe.parent();
     match platform::spawn_hidden(&exe, args, cwd) {
         Ok(child) => match i32::try_from(child.id()) {
             Ok(id) if id > 0 => id,
-            _ => {
-                eprintln!(
-                    "elevated start helper spawned {} with out-of-range pid {}",
-                    exe.display(),
-                    child.id()
-                );
-                HELPER_EXIT_PID_OVERFLOW
-            }
+            _ => HELPER_EXIT_PID_OVERFLOW,
         },
-        Err(err) => {
-            eprintln!(
-                "elevated start helper failed to spawn {}: {err}",
-                exe.display()
-            );
-            HELPER_EXIT_SPAWN_FAILED
-        }
+        Err(_) => HELPER_EXIT_SPAWN_FAILED,
     }
 }
 
@@ -388,23 +369,23 @@ fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
 fn is_authorized_helper_exe(name: &str, exe: &Path, portable_root: &Path) -> bool {
     let settings = tray::load(&tray::settings_path(portable_root)).unwrap_or_default();
     let declared = tray::resolve_portable_path(portable_root, &settings.mihomo.path);
-    if declared
+    let discovered = declared.or_else(|| {
+        discover::find_kernel(portable_root, &settings)
+            .ok()
+            .flatten()
+    });
+    if discovered
         .as_deref()
         .is_some_and(|path| paths_match(exe, path))
     {
         return true;
     }
     let (home_dir, _) =
-        discover::resolve_home_and_config(portable_root, &settings, declared.as_deref());
+        discover::resolve_home_and_config(portable_root, &settings, discovered.as_deref());
     if load_runtime_record(&home_dir).is_some_and(|rec| paths_match(exe, &rec.kernel_path)) {
         return true;
     }
-    platform::is_kernel_candidate_name(name)
-        && (is_under_dir(exe, portable_root)
-            || discover::find_kernel(portable_root, &settings)
-                .ok()
-                .flatten()
-                .is_some_and(|found| paths_match(exe, &found)))
+    platform::is_kernel_candidate_name(name) && is_under_dir(exe, portable_root)
 }
 
 fn is_under_dir(path: &Path, dir: &Path) -> bool {

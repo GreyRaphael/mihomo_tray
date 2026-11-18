@@ -221,6 +221,10 @@ pub fn is_tray_menu_open() -> bool {
     }
 }
 
+pub fn can_show_dialog() -> bool {
+    true
+}
+
 fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()

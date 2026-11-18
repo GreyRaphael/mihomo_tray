@@ -9,22 +9,25 @@ use crate::state::{AsyncTaskKind, Provider, WorkerCommand};
 use crate::text;
 
 #[derive(Default)]
-pub(super) struct SubscriptionTaskState {
+pub(super) struct TaskSlot {
     active_generation: Option<u64>,
-    pending_reload: bool,
     generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskCompletion {
-    Stale,
-    ChainedReload,
-    Current,
-}
-
-impl SubscriptionTaskState {
+impl TaskSlot {
     pub fn is_active(&self) -> bool {
         self.active_generation.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_started_for_test(&mut self) -> u64 {
+        let generation = self.generation;
+        self.active_generation = Some(generation);
+        generation
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation
     }
 
     fn mark_started(&mut self, generation: u64) {
@@ -39,14 +42,44 @@ impl SubscriptionTaskState {
     pub fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.active_generation = None;
+    }
+
+    fn complete(&mut self, task_gen: u64) -> bool {
+        if self.active_generation != Some(task_gen) {
+            return false;
+        }
+        self.active_generation = None;
+        true
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SubscriptionTaskState {
+    slot: TaskSlot,
+    pending_reload: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCompletion {
+    Stale,
+    ChainedReload,
+    Current,
+}
+
+impl SubscriptionTaskState {
+    pub fn is_active(&self) -> bool {
+        self.slot.is_active()
+    }
+
+    pub fn invalidate(&mut self) {
+        self.slot.invalidate();
         self.pending_reload = false;
     }
 
     fn complete(&mut self, task_gen: u64) -> TaskCompletion {
-        if self.active_generation != Some(task_gen) {
+        if !self.slot.complete(task_gen) {
             return TaskCompletion::Stale;
         }
-        self.active_generation = None;
         if self.pending_reload {
             self.pending_reload = false;
             return TaskCompletion::ChainedReload;
@@ -112,21 +145,22 @@ impl Worker {
         group: String,
     ) -> Result<CommandOutcome, String> {
         let client = self.require_client()?.clone();
-        if self.testing_latency {
+        if self.latency_tasks.is_active() {
             return Ok(CommandOutcome::KeepError);
         }
+        let generation = self.latency_tasks.current_generation();
         if self.spawn_background_task(
             "mihomo-latency",
-            AsyncTaskKind::LatencyTest,
+            AsyncTaskKind::LatencyTest { generation },
             None,
             move || {
                 (
-                    AsyncTaskKind::LatencyTest,
+                    AsyncTaskKind::LatencyTest { generation },
                     client.test_group_delay(&group).err(),
                 )
             },
         ) {
-            self.testing_latency = true;
+            self.latency_tasks.mark_started(generation);
             Ok(CommandOutcome::ClearError)
         } else {
             Ok(CommandOutcome::KeepError)
@@ -138,7 +172,7 @@ impl Worker {
         if self.sub_tasks.is_active() {
             return Ok(CommandOutcome::KeepError);
         }
-        let generation = self.sub_tasks.generation;
+        let generation = self.sub_tasks.slot.current_generation();
         if self.spawn_background_task(
             "mihomo-sub-refresh",
             AsyncTaskKind::RefreshSubscriptions { generation },
@@ -163,7 +197,7 @@ impl Worker {
                 (AsyncTaskKind::RefreshSubscriptions { generation }, err)
             },
         ) {
-            self.sub_tasks.mark_started(generation);
+            self.sub_tasks.slot.mark_started(generation);
             Ok(CommandOutcome::ClearError)
         } else {
             Ok(CommandOutcome::KeepError)
@@ -211,7 +245,7 @@ impl Worker {
                 )
             },
         ) {
-            self.sub_tasks.mark_started(generation);
+            self.sub_tasks.slot.mark_started(generation);
         } else {
             self.state_sync.resolve_deferred(generation, true);
         }
@@ -221,7 +255,7 @@ impl Worker {
         let saved = self.capture_live_or_persisted_state();
         mihomo::apply_subscription_url(self.cfg.config_file(), url)?;
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
-            let generation = self.sub_tasks.bump_generation();
+            let generation = self.sub_tasks.slot.bump_generation();
             self.state_sync.defer_restore(generation, saved);
             if self.sub_tasks.is_active() {
                 self.sub_tasks.pending_reload = true;
@@ -242,8 +276,13 @@ impl Worker {
         error: Option<String>,
     ) -> Result<CommandOutcome, String> {
         match kind {
-            AsyncTaskKind::LatencyTest => {
-                self.testing_latency = false;
+            AsyncTaskKind::LatencyTest { generation } => {
+                if !self.latency_tasks.complete(generation) {
+                    if let Some(err) = error {
+                        tracing::debug!("Ignoring stale latency task error: {err}");
+                    }
+                    return Ok(CommandOutcome::KeepError);
+                }
                 match error {
                     Some(err) => Err(err),
                     None => Ok(CommandOutcome::KeepError),
@@ -281,12 +320,275 @@ impl Worker {
     }
 
     fn chain_pending_sub_reload(&mut self) {
-        let generation = self.sub_tasks.generation;
+        let generation = self.sub_tasks.slot.current_generation();
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
             self.spawn_apply_subscription_reload(client, generation);
         } else {
             self.set_status_note(None);
             self.state_sync.resolve_deferred(generation, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::state_store::PersistedState;
+    use crate::config::tray::TraySettings;
+    use crate::core::api::{Client, CoreConfigs};
+    use crate::core::worker::tests::{read_http_request, test_worker};
+    use crate::state::ProxyMode;
+
+    #[test]
+    fn subscription_async_reload_preserves_pending_restore_until_async_done() {
+        let root = crate::config::test_temp_dir("worker_sub_restore");
+        let cfg_dir = root.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            cfg_dir.join("config.yaml"),
+            format!("mixed-port: 7890\nmode: rule\nexternal-controller: 127.0.0.1:{port}\n"),
+        )
+        .unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut mode = "rule".to_string();
+            let mut tun_on = false;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                let (status, body) = if req.starts_with("GET /version ") {
+                    ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
+                } else if req.starts_with("GET /configs ") {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"mode":"{mode}","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                        ),
+                    )
+                } else if req.starts_with("PUT /configs?force=true ") {
+                    mode = "rule".to_string();
+                    tun_on = false;
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PUT /providers/proxies/subscription ") {
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PATCH /configs ") {
+                    let (_, payload) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    if let Some(m) = json.get("mode").and_then(|v| v.as_str()) {
+                        mode = m.to_string();
+                    }
+                    if let Some(t) = json
+                        .get("tun")
+                        .and_then(|v| v.get("enable"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        tun_on = t;
+                    }
+                    ("204 No Content", String::new())
+                } else if req.starts_with("GET /proxies ") {
+                    ("200 OK", r#"{"proxies":{}}"#.to_string())
+                } else if req.starts_with("GET /providers/proxies ") {
+                    ("200 OK", r#"{"providers":{}}"#.to_string())
+                } else if req.starts_with("POST /__stop ") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    break;
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                if req.starts_with("PATCH /configs ") && mode == "global" && !tun_on {
+                    let _ = done_tx.send(());
+                }
+            }
+        });
+
+        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        {
+            let mut snap = shared.lock().unwrap();
+            snap.controller_ok = true;
+            snap.mode = "global".to_string();
+            snap.tun = false;
+        }
+        worker.state_sync.set_persisted_for_test(PersistedState {
+            system_proxy: false,
+            mode: Some("global".to_string()),
+            tun: Some(false),
+        });
+
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::SetSubscriptionUrl(
+                    "https://example.com/sub".to_string()
+                ))
+                .unwrap(),
+            CommandOutcome::ClearError
+        );
+        assert!(!worker.state_sync.has_ready_restore());
+        assert!(worker.state_sync.has_deferred_restore());
+
+        let mut mid_cfg = CoreConfigs {
+            mode: "rule".to_string(),
+            mixed_port: 7890,
+            tun_enable: false,
+        };
+        worker.apply_pending_restore_if_needed(&mut mid_cfg);
+        worker
+            .state_sync
+            .sync_live_if_idle(worker.cfg.home_dir(), false, "rule", false);
+        assert_eq!(
+            worker
+                .state_sync
+                .persisted()
+                .and_then(|s| s.mode.as_deref()),
+            Some("global")
+        );
+
+        let async_cmd = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(async_cmd).unwrap();
+        assert!(worker.state_sync.has_ready_restore());
+
+        let polled = worker.poll_controller_configs();
+        assert!(polled.controller_ok);
+        assert_eq!(polled.mode, "global");
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Explicit SetMode during deferred reload must survive rather than be reverted.
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::SetSubscriptionUrl(
+                    "https://example.com/sub2".to_string()
+                ))
+                .unwrap(),
+            CommandOutcome::ClearError
+        );
+        assert!(worker.state_sync.has_deferred_restore());
+        worker
+            .handle_command(WorkerCommand::SetMode(ProxyMode::Direct))
+            .unwrap();
+        let async_cmd2 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(async_cmd2).unwrap();
+        let polled2 = worker.poll_controller_configs();
+        assert!(polled2.controller_ok);
+        assert_eq!(polled2.mode, "direct");
+
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .unwrap()
+            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalidated_subscription_task_does_not_block_or_clear_new_task() {
+        let root = crate::config::test_temp_dir("worker_sub_invalidate");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                let resp = if req.starts_with("GET /providers/proxies ") {
+                    let body = r#"{"providers":{"subscription":{"vehicleType":"HTTP","updatedAt":"2025-01-01T08:00:00+08:00"}}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+
+        worker.sub_tasks.invalidate();
+        let stale_gen = 0;
+        worker
+            .handle_command(WorkerCommand::RefreshSubscriptions)
+            .unwrap();
+        assert!(worker.sub_tasks.is_active());
+        assert_eq!(
+            shared.lock().unwrap().status_note.as_deref(),
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION)
+        );
+
+        worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::RefreshSubscriptions {
+                    generation: stale_gen,
+                },
+                error: Some("stale timeout".to_string()),
+            })
+            .unwrap();
+        assert!(worker.sub_tasks.is_active());
+        assert_eq!(
+            shared.lock().unwrap().status_note.as_deref(),
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION)
+        );
+        assert_eq!(shared.lock().unwrap().action_error, None);
+
+        let real_done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(real_done).unwrap();
+        assert!(!worker.sub_tasks.is_active());
+        assert_eq!(shared.lock().unwrap().status_note, None);
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalidated_latency_task_ignores_stale_completion_and_allows_retry() {
+        let root = crate::config::test_temp_dir("worker_latency_invalidate");
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+
+        let gen0 = worker.latency_tasks.current_generation();
+        worker.latency_tasks.mark_started(gen0);
+        worker.latency_tasks.invalidate();
+        assert!(!worker.latency_tasks.is_active());
+
+        let gen1 = worker.latency_tasks.current_generation();
+        worker.latency_tasks.mark_started(gen1);
+
+        // Stale gen0 failure must be ignored without clearing active gen1.
+        let outcome = worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::LatencyTest { generation: gen0 },
+                error: Some("stale latency timeout".to_string()),
+            })
+            .unwrap();
+        assert_eq!(outcome, CommandOutcome::KeepError);
+        assert!(worker.latency_tasks.is_active());
+
+        let err = worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::LatencyTest { generation: gen1 },
+                error: Some("real latency error".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(err, "real latency error");
+        assert!(!worker.latency_tasks.is_active());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

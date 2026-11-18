@@ -174,7 +174,7 @@ pub type SharedSnapshot = Arc<Mutex<Snapshot>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncTaskKind {
-    LatencyTest,
+    LatencyTest { generation: u64 },
     RefreshSubscriptions { generation: u64 },
     ApplySubscription { generation: u64, reload_ok: bool },
 }
@@ -195,6 +195,7 @@ pub enum WorkerCommand {
     CopyEnvVars,
     RestartCore,
     ToggleAutostart,
+    GuiOpenResult(Result<(), String>),
     AsyncDone {
         kind: AsyncTaskKind,
         error: Option<String>,
@@ -210,7 +211,7 @@ pub enum AppEvent {
     Menu(MenuEvent),
     SnapshotUpdated { rebuild_menu: bool },
     QuitCompleted,
-    QuitCancelled(String),
+    QuitCancelled,
 }
 
 pub fn order_and_filter_groups(

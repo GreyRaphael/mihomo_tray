@@ -65,7 +65,7 @@ impl Worker {
         if !want_enable {
             set_res?;
             if after.tun_enable {
-                return Err("TUN mode remained enabled after disabling.".to_string());
+                return Err(text::ERR_TUN_STILL_ENABLED.to_string());
             }
             return Ok(());
         }
@@ -90,10 +90,11 @@ impl Worker {
             .exe
             .clone()
             .or_else(|| self.cfg.known_kernel_path().map(ToOwned::to_owned));
-        let launch_args = discover::build_launch_args(
+        let launch_args = discover::build_launch_args_for_paths(
             self.cfg.portable_root(),
             self.cfg.settings(),
-            kernel_path.as_deref(),
+            self.cfg.home_dir(),
+            self.cfg.config_file(),
         )?;
 
         self.set_status_note(Some(text::STATUS_ELEVATING_CORE));
@@ -130,6 +131,8 @@ impl Worker {
                     kernel_path: kernel.clone(),
                 },
             );
+        } else {
+            process::clear_runtime_record(self.cfg.home_dir());
         }
 
         let elevated = [RunningProcess {
@@ -213,8 +216,6 @@ impl Worker {
 
     pub(super) fn force_restart_core(&mut self) -> Result<(), String> {
         let saved = self.capture_live_or_persisted_state();
-        self.sub_tasks.invalidate();
-        self.state_sync.arm_ready_restore(saved);
         self.reload_paths_and_runtime();
         let running = self
             .process_inspector
@@ -223,25 +224,18 @@ impl Worker {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
             let stop_res = self.stop_active_kernel(true, Some(running));
             self.set_status_note(None);
-            if !self.should_start_after_stop(stop_res?)? {
-                return Ok(());
+            match stop_res? {
+                StopOutcome::Stopped => {}
+                StopOutcome::DeclinedByUser => return Ok(()),
+                StopOutcome::AmbiguousExternal => {
+                    return Err(text::ERR_MULTIPLE_EXTERNAL_CORES.to_string());
+                }
             }
         }
+        self.sub_tasks.invalidate();
+        self.latency_tasks.invalidate();
+        self.state_sync.arm_ready_restore(saved);
         self.start_core_internal()
-    }
-
-    pub(super) fn should_start_after_stop(&mut self, outcome: StopOutcome) -> Result<bool, String> {
-        match outcome {
-            StopOutcome::Stopped => Ok(true),
-            StopOutcome::DeclinedByUser => {
-                self.state_sync.clear_pending();
-                Ok(false)
-            }
-            StopOutcome::AmbiguousExternal => {
-                self.state_sync.clear_pending();
-                Err(text::ERR_MULTIPLE_EXTERNAL_CORES.to_string())
-            }
-        }
     }
 
     pub(super) fn stop_core_internal(&mut self, interactive: bool) -> Result<(), String> {
@@ -284,14 +278,16 @@ impl Worker {
         prefetched: Option<Vec<RunningProcess>>,
     ) -> Result<StopOutcome, String> {
         // First try managed non-elevated child directly.
-        if let Some(mut managed) = self.managed.take() {
+        if let Some(ref mut managed) = self.managed {
             if matches!(managed.child.try_wait(), Ok(None)) {
                 if managed.child.kill().is_ok() {
                     let _ = managed.child.wait();
+                    self.managed = None;
                     self.clear_running_tracking();
                     return Ok(StopOutcome::Stopped);
                 }
             } else {
+                self.managed = None;
                 self.clear_running_tracking();
                 return Ok(StopOutcome::Stopped);
             }
@@ -387,7 +383,7 @@ impl Worker {
     }
 }
 
-pub(super) fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<CoreConfigs, String> {
+fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<CoreConfigs, String> {
     client
         .set_tun(true)
         .map_err(|err| text::format_tun_enable_after_elevation_failed(&err))?;
@@ -396,4 +392,150 @@ pub(super) fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<Co
         return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
     }
     Ok(verify)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::tray::TraySettings;
+    use crate::core::worker::tests::{read_http_request, test_worker};
+
+    #[test]
+    fn verify_or_enable_tun_after_elevation_patches_and_verifies_tun() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut tun_on = false;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("PATCH /configs ") {
+                    let (_, body) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                    assert_eq!(json["tun"]["enable"].as_bool(), Some(true));
+                    tun_on = true;
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                } else {
+                    let body = format!(
+                        r#"{{"mode":"rule","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
+        verify_or_enable_tun_after_elevation(&client).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn verify_or_enable_tun_after_elevation_errors_when_still_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("PATCH /configs ") {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                } else {
+                    let body = r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
+        let err = verify_or_enable_tun_after_elevation(&client).unwrap_err();
+        assert_eq!(err, text::ERR_TUN_FAILED_AFTER_ELEVATION);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stop_active_kernel_reports_declined_and_ambiguous_external_processes() {
+        let root = crate::config::test_temp_dir("worker_stop_outcome");
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+
+        let single_external = vec![RunningProcess {
+            pid: 999_991,
+            exe: Some(PathBuf::from("/external/mihomo")),
+            cmd: Vec::new(),
+        }];
+        let declined = worker
+            .stop_active_kernel(false, Some(single_external))
+            .unwrap();
+        assert_eq!(declined, StopOutcome::DeclinedByUser);
+
+        let multi_external = vec![
+            RunningProcess {
+                pid: 999_991,
+                exe: Some(PathBuf::from("/external/mihomo-1")),
+                cmd: Vec::new(),
+            },
+            RunningProcess {
+                pid: 999_992,
+                exe: Some(PathBuf::from("/external/mihomo-2")),
+                cmd: Vec::new(),
+            },
+        ];
+        let ambiguous = worker
+            .stop_active_kernel(true, Some(multi_external))
+            .unwrap();
+        assert_eq!(ambiguous, StopOutcome::AmbiguousExternal);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_restart_declining_external_stop_preserves_deferred_restore_and_tasks() {
+        let root = crate::config::test_temp_dir("worker_restart_preserve");
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+        let saved = crate::config::state_store::PersistedState {
+            system_proxy: true,
+            mode: Some("global".to_string()),
+            tun: Some(false),
+        };
+        worker.state_sync.defer_restore(7, saved);
+        worker.sub_tasks.invalidate();
+        worker.latency_tasks.mark_started_for_test();
+
+        // When stop_active_kernel returns DeclinedByUser (headless confirm_yes_no = false),
+        // deferred restore and active latency task must not be cleared prematurely.
+        assert_eq!(
+            worker
+                .stop_active_kernel(
+                    true,
+                    Some(vec![RunningProcess {
+                        pid: 999_991,
+                        exe: Some(PathBuf::from("/external/mihomo")),
+                        cmd: Vec::new(),
+                    }])
+                )
+                .unwrap(),
+            StopOutcome::DeclinedByUser
+        );
+        assert!(worker.state_sync.has_deferred_restore());
+        assert!(worker.latency_tasks.is_active());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

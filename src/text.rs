@@ -74,8 +74,6 @@ pub const TITLE_QUIT_ANYWAY: &str = "Core Still Running";
 #[cfg(windows)]
 pub const PROMPT_SUBSCRIPTION_TITLE: &str = "Set Subscription URL";
 #[cfg(windows)]
-pub const PROMPT_SUBSCRIPTION_HEADING: &str = "Subscription URL";
-#[cfg(windows)]
 pub const PROMPT_SUBSCRIPTION_HINT: &str =
     "Enter your subscription link (auto-updates every 12 hours):";
 #[cfg(windows)]

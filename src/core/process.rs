@@ -332,11 +332,7 @@ mod tests {
 
     #[test]
     fn authorizes_custom_declared_and_recorded_helper_executables() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("mihomo_tray_helper_auth_{nanos}"));
+        let root = crate::config::test_temp_dir("helper_auth");
         std::fs::create_dir_all(root.join("custom")).unwrap();
         let custom_exe = root.join("custom").join("my-core.exe");
         std::fs::write(&custom_exe, b"core").unwrap();

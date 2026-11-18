@@ -39,7 +39,7 @@ pub const STATUS_STOPPING_CORE: &str = "Stopping mihomo core...";
 pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
 pub const STATUS_UPDATING_SUBSCRIPTION: &str = "Updating subscription...";
 
-pub const ERR_ALREADY_RUNNING: &str = "mihomo-tray is already running for this portable folder.\nCheck the system tray overflow area if the icon is hidden.";
+pub const ERR_ALREADY_RUNNING: &str = "mihomo-tray is already running.\nCheck the system tray overflow area if the icon is hidden.";
 pub const ERR_CORE_NOT_FOUND: &str = "No mihomo binary found beside mihomo-tray, in ./core, ./bin, or on PATH. Place mihomo.exe in ./core or set mihomo.path in tray.yml.";
 pub const ERR_NO_CONTROLLER: &str = "No controller address found. Configure external-controller in config.yaml or controller.address in tray.yml.";
 pub const ERR_CORE_STOPPED_UNEXPECTEDLY: &str = "mihomo exited unexpectedly.";

@@ -303,7 +303,6 @@ fn remove_single_direct_placeholder(group_map: &mut Mapping) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extracts_controller_secret_and_ui() {
@@ -334,11 +333,7 @@ external-ui: ./ui
 
     #[test]
     fn writes_subscription_with_12h_interval_and_wires_groups() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mihomo_tray_sub_test_{nanos}"));
+        let dir = crate::config::test_temp_dir("sub_test");
         let cfg = dir.join("config.yaml");
 
         apply_subscription_url(&cfg, "https://example.com/sub?token=abc").unwrap();
@@ -390,12 +385,7 @@ external-ui: ./ui
 
     #[test]
     fn preserves_non_utf8_config_on_default_init_and_subscription_update() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mihomo_tray_non_utf8_{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::config::test_temp_dir("non_utf8");
         let cfg = dir.join("config.yaml");
         let raw_gbk = b"# \xd6\xd0\xce\xc4\nmixed-port: 7890\n";
         std::fs::write(&cfg, raw_gbk).unwrap();

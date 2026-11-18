@@ -218,12 +218,7 @@ mod tests {
 
     #[test]
     fn ensure_sample_file_preserves_non_utf8_content() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mihomo_tray_cfg_non_utf8_{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::config::test_temp_dir("cfg_non_utf8");
         let path = dir.join("tray.yml");
         let raw_gbk = b"# \xd6\xd0\xce\xc4\nmihomo:\n  auto_start: false\n";
         std::fs::write(&path, raw_gbk).unwrap();

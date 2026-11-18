@@ -95,6 +95,7 @@ struct Worker {
     tx: Sender<WorkerCommand>,
     testing_latency: Arc<AtomicBool>,
     refreshing_subs: Arc<AtomicBool>,
+    updating_sub: Arc<AtomicBool>,
     process_inspector: ProcessInspector,
     managed: Option<ManagedChild>,
     known_kernel_path: Option<PathBuf>,
@@ -145,6 +146,7 @@ impl Worker {
             tx,
             testing_latency: Arc::new(AtomicBool::new(false)),
             refreshing_subs: Arc::new(AtomicBool::new(false)),
+            updating_sub: Arc::new(AtomicBool::new(false)),
             process_inspector: ProcessInspector::new(),
             managed: None,
             known_kernel_path: None,
@@ -725,34 +727,59 @@ impl Worker {
         Ok(())
     }
 
+    fn spawn_background_task<F>(
+        &self,
+        name: &str,
+        flag: &Arc<AtomicBool>,
+        status_note: Option<&'static str>,
+        task: F,
+    ) where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        if flag
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(note) = status_note {
+            self.set_status_note(Some(note));
+        }
+        let flag_clone = Arc::clone(flag);
+        let tx = self.tx.clone();
+        let clear_note = status_note.is_some();
+        if std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                struct ResetFlag(Arc<AtomicBool>);
+                impl Drop for ResetFlag {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let error = {
+                    let _reset = ResetFlag(flag_clone);
+                    task().err()
+                };
+                let _ = tx.send(WorkerCommand::AsyncDone { error, clear_note });
+            })
+            .is_err()
+        {
+            flag.store(false, Ordering::Release);
+            if clear_note {
+                self.set_status_note(None);
+            }
+        }
+    }
+
     fn start_test_group_latency(&self, group: String) -> Result<(), String> {
         let client = self
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        if self
-            .testing_latency
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-        let flag = Arc::clone(&self.testing_latency);
-        let tx = self.tx.clone();
-        if std::thread::Builder::new()
-            .name("mihomo-latency".to_string())
-            .spawn(move || {
-                let error = client.test_group_delay(&group).err();
-                flag.store(false, Ordering::Release);
-                let _ = tx.send(WorkerCommand::AsyncDone {
-                    error,
-                    clear_note: false,
-                });
-            })
-            .is_err()
-        {
-            self.testing_latency.store(false, Ordering::Release);
-        }
+        self.spawn_background_task("mihomo-latency", &self.testing_latency, None, move || {
+            client.test_group_delay(&group)
+        });
         Ok(())
     }
 
@@ -761,73 +788,59 @@ impl Worker {
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        if self
-            .refreshing_subs
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-        self.set_status_note(Some(text::STATUS_REFRESHING_SUBSCRIPTION));
-        let flag = Arc::clone(&self.refreshing_subs);
-        let tx = self.tx.clone();
-        if std::thread::Builder::new()
-            .name("mihomo-sub-refresh".to_string())
-            .spawn(move || {
-                let error = (|| -> Result<(), String> {
-                    let providers = client.get_providers()?.providers;
-                    let refreshable: Vec<String> = providers
-                        .into_iter()
-                        .filter(Provider::refreshable)
-                        .map(|p| p.name)
-                        .collect();
-                    if refreshable.is_empty() {
-                        return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
-                    }
-                    for name in refreshable {
-                        client.refresh_provider(&name)?;
-                    }
-                    Ok(())
-                })()
-                .err();
-                flag.store(false, Ordering::Release);
-                let _ = tx.send(WorkerCommand::AsyncDone {
-                    error,
-                    clear_note: true,
-                });
-            })
-            .is_err()
-        {
-            self.refreshing_subs.store(false, Ordering::Release);
-            self.set_status_note(None);
-        }
+        self.spawn_background_task(
+            "mihomo-sub-refresh",
+            &self.refreshing_subs,
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION),
+            move || {
+                let providers = client.get_providers()?.providers;
+                let refreshable: Vec<String> = providers
+                    .into_iter()
+                    .filter(Provider::refreshable)
+                    .map(|p| p.name)
+                    .collect();
+                if refreshable.is_empty() {
+                    return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
+                }
+                for name in refreshable {
+                    client.refresh_provider(&name)?;
+                }
+                Ok(())
+            },
+        );
         Ok(())
     }
 
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
-        self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
-        let res = (|| {
-            let saved = self.capture_live_or_persisted_state();
-            mihomo::apply_subscription_url(&self.config_file, url)?;
-            if let Some(client) = &self.client
-                && client.probe().is_ok()
-            {
-                let sub_cache = self
-                    .home_dir
-                    .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
-                let had_cached_sub = sub_cache.is_file();
-                client.reload_configs()?;
-                self.pending_restore = Some(saved);
-                // When no cache existed before, `reload_configs` already fetched the new provider;
-                // only force a provider refresh if replacing an existing cache or if reload didn't create it.
-                if had_cached_sub || !sub_cache.is_file() {
-                    client.refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)?;
-                }
-                return Ok(());
-            }
+        let saved = self.capture_live_or_persisted_state();
+        mihomo::apply_subscription_url(&self.config_file, url)?;
+        if let Some(client) = self.client.clone()
+            && client.probe().is_ok()
+        {
             self.pending_restore = Some(saved);
-            self.start_core_internal()
-        })();
+            let sub_cache = self
+                .home_dir
+                .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
+            self.spawn_background_task(
+                "mihomo-sub-apply",
+                &self.updating_sub,
+                Some(text::STATUS_UPDATING_SUBSCRIPTION),
+                move || {
+                    let had_cached_sub = sub_cache.is_file();
+                    client.reload_configs()?;
+                    // When no cache existed before, `reload_configs` already fetched the new provider;
+                    // only force a provider refresh if replacing an existing cache or if reload didn't create it.
+                    if had_cached_sub || !sub_cache.is_file() {
+                        client.refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)?;
+                    }
+                    Ok(())
+                },
+            );
+            return Ok(());
+        }
+        self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
+        self.pending_restore = Some(saved);
+        let res = self.start_core_internal();
         self.set_status_note(None);
         res
     }

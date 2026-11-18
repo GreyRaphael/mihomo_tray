@@ -31,21 +31,10 @@ pub fn save(home_dir: &Path, state: &PersistedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mihomo_tray_state_{tag}_{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn roundtrips_persisted_state_and_handles_missing_file() {
-        let dir = temp_dir("roundtrip");
+        let dir = crate::config::test_temp_dir("state_roundtrip");
         assert_eq!(load(&dir), None);
 
         let st = PersistedState {

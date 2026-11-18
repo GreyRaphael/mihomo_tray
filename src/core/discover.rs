@@ -343,17 +343,7 @@ pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mihomo_tray_test_{tag}_{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::config::test_temp_dir as temp_dir;
 
     #[test]
     fn discovers_unrenamed_single_kernel_in_core_dir() {

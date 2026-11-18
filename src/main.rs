@@ -150,6 +150,8 @@ fn acquire_single_instance(
     }
 }
 
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
 fn init_logging(portable_root: &Path) -> PathBuf {
     let logs_dir = portable_root.join("logs");
     if let Err(err) = std::fs::create_dir_all(&logs_dir) {
@@ -159,6 +161,12 @@ fn init_logging(portable_root: &Path) -> PathBuf {
         );
     }
     let log_file = logs_dir.join("mihomo-tray.log");
+    if let Ok(meta) = std::fs::metadata(&log_file)
+        && meta.len() > MAX_LOG_BYTES
+    {
+        let backup = logs_dir.join("mihomo-tray.log.old");
+        let _ = std::fs::rename(&log_file, backup);
+    }
 
     match OpenOptions::new().create(true).append(true).open(&log_file) {
         Ok(file) => {

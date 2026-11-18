@@ -57,3 +57,18 @@ pub(crate) fn ensure_template_file(path: &Path, template: &str) {
         tracing::warn!("Failed to initialize {}: {err}", path.display());
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_temp_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mihomo_tray_{tag}_{nanos}_{seq}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}

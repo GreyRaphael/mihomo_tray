@@ -56,7 +56,7 @@ mihomo-tray/
 | `serde_yaml_ng` | `0.10.0` | Full YAML parsing for `tray.yml` and `config.yaml` |
 | `sysinfo` | `0.40.3` | Cross-platform process inspection (`default-features = false, features = ["system"]`) |
 | `open` | `5.4.5` | Open WebUI URL, config files, and portable folders in system default apps |
-| `single-instance` | `0.3.3` | Per-portable-directory instance mutex (keyed by hash of `portable_root`) |
+| `single-instance` | `0.3.3` | Global single-instance mutex (`mihomo-tray`) |
 | `auto-launch` | `0.6.0` | Cross-platform startup registration (`Start with Windows`) |
 | `tracing` | `0.1.44` | Structured diagnostic logging |
 | `tracing-subscriber` | `0.3.23` | Formatting file logger writing to `./logs/` |
@@ -79,7 +79,7 @@ src/
 ├── main.rs               # Helper dispatch -> single-instance -> EventLoop<AppEvent>
 ├── app.rs                # winit ApplicationHandler, tray icon/menu orchestration, 300ms debounce
 ├── text.rs               # English UI strings & formatted messages
-├── state.rs              # Snapshot, Group, Provider, KernelSlot, WorkerCommand, AppEvent
+├── state.rs              # Snapshot, Group, Provider, WorkerCommand, AppEvent
 ├── config/
 │   ├── mod.rs
 │   ├── tray.rs           # TraySettings + portable relative path resolution
@@ -94,7 +94,7 @@ src/
 ├── tray/
 │   ├── mod.rs
 │   ├── icon.rs           # Procedural RGBA icon renderer (32x32, outer ring + center mode dot)
-│   └── menu.rs           # Two-phase muda 0.21 menu builder with Action dispatch & paging
+│   └── menu.rs           # muda 0.21 menu builder with fingerprint diffing, Action dispatch & paging
 └── platform/
     ├── mod.rs            # Platform abstraction boundary + #[cfg] target dispatch
     ├── windows.rs        # Win10+ implementation (WinINet proxy, UAC helper, MessageBoxW)
@@ -139,11 +139,11 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
   - When toggling TUN ON fails to stick (`tun == false` on readback) or an elevated restart is needed, the worker resolves the running kernel PID, spawns a hidden elevated copy of `mihomo-tray.exe --elevate-start <pid> <args...>` via `ShellExecuteExW`.
   - The elevated helper reads the verified executable image path from the running `<pid>` via `sysinfo` (never accepting an arbitrary executable path from CLI arguments), stops `<pid>`, and spawns the elevated kernel with explicit absolute `-d` / `-f` / `-ext-ctl` / `-secret` / `-ext-ui` arguments.
 
-### 5.3 Two-Phase Menu Rebuild & Controls
-1. **Menu debounce & non-blocking UI**: Tray/menu callbacks pass events over `EventLoopProxy` and debounce rapid clicks (`300ms`). All HTTP calls run on the worker thread.
-2. **Two-phase menu updates**:
-   - Phase 1: Immediate menu update with status line, `Open WebUI`, `Set Subscription URL`, Modes (`Rule`/`Global`/`Direct`), `System Proxy`, `TUN Mode`, `Open`, `More` (`Copy Environment Variables`, `Refresh Subscription`, `Restart Mihomo Core`, `Restart Application`, `Start with Windows`, `Version`), and `Quit`.
-   - Phase 2: Worker fetches `/proxies` & `/providers/proxies` (bounded timeout) and pushes updated proxy group submenus (latency suffixes like `(45ms)` / `(timeout)`, sorted fastest-first, optional `groups.page_size` pagination, `Test Group Latency`, and `Auto (Unpin)`).
+### 5.3 Menu Rebuild & Controls
+1. **Menu debounce & non-blocking UI**: Tray/menu callbacks pass events over `EventLoopProxy` and debounce rapid clicks (`300ms`). All HTTP calls run on the worker thread (with slow latency tests and subscription reloads offloaded to guarded background threads).
+2. **Fingerprint-guarded menu rebuilds**:
+   - Worker polls `/configs`, `/proxies`, and `/providers/proxies` into a unified `Snapshot` (status line, `Open WebUI`, `Set Subscription URL`, Modes `Rule`/`Global`/`Direct`, `System Proxy`, `TUN Mode`, `Proxy Groups` with latency sorting, optional `groups.page_size` pagination, `Test Group Latency`, `Auto (Unpin)`, `Open`, `More`, and `Quit`).
+   - GUI checks `MenuFingerprint` (tracking visible group items and visible node latencies) and defers rebuilds while a native popup menu is open.
 3. **High-DPI procedural icons**: 32x32 RGBA circle + inner dot (`icon.rs`), updated whenever state (`Running`/`SysProxy`/`Tun`/`Stopped`/`Unreachable`) or mode (`rule`/`global`/`direct`) changes.
 
 ---

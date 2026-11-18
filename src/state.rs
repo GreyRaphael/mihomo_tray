@@ -188,4 +188,79 @@ pub enum AppEvent {
     Menu(MenuEvent),
     SnapshotUpdated { rebuild_menu: bool },
     QuitCompleted,
+    QuitCancelled(String),
+}
+
+pub fn order_and_filter_groups(
+    groups: Vec<Group>,
+    include: &[String],
+    exclude: &[String],
+    order: &[String],
+) -> Vec<Group> {
+    let mut filtered: Vec<Group> = groups
+        .into_iter()
+        .filter(|g| {
+            if !include.is_empty() && !include.iter().any(|x| x.eq_ignore_ascii_case(&g.name)) {
+                return false;
+            }
+            if exclude.iter().any(|x| x.eq_ignore_ascii_case(&g.name)) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        if a.name == "GLOBAL" && b.name != "GLOBAL" {
+            return std::cmp::Ordering::Less;
+        }
+        if b.name == "GLOBAL" && a.name != "GLOBAL" {
+            return std::cmp::Ordering::Greater;
+        }
+        let pos_a = order.iter().position(|x| x.eq_ignore_ascii_case(&a.name));
+        let pos_b = order.iter().position(|x| x.eq_ignore_ascii_case(&b.name));
+        match (pos_a, pos_b) {
+            (Some(ia), Some(ib)) => ia.cmp(&ib),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
+        }
+    });
+    filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g(name: &str) -> Group {
+        Group {
+            name: name.to_string(),
+            kind: "Selector".to_string(),
+            switchable: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keeps_global_first_and_applies_order_and_filters() {
+        let order = vec!["Streaming".to_string(), "Proxy".to_string()];
+        let exclude = vec!["HiddenOne".to_string()];
+
+        let input = vec![
+            g("Alpha"),
+            g("Proxy"),
+            g("HiddenOne"),
+            g("GLOBAL"),
+            g("Streaming"),
+        ];
+        let out: Vec<String> = order_and_filter_groups(input, &[], &exclude, &order)
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert_eq!(out, vec!["GLOBAL", "Streaming", "Proxy", "Alpha"]);
+    }
 }

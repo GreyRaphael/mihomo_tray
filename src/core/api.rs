@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use ureq::{Agent, RequestBuilder};
 
+use crate::config::tray::{CONTROLLER_TIMEOUT_MAX_MS, CONTROLLER_TIMEOUT_MIN_MS};
 use crate::state::{Group, Provider};
 
 const PROBE_TIMEOUT_MS: u64 = 800;
@@ -98,7 +99,7 @@ impl Client {
             host,
             port,
             secret: secret.to_string(),
-            timeout_ms: timeout_ms.clamp(200, 30_000),
+            timeout_ms: timeout_ms.clamp(CONTROLLER_TIMEOUT_MIN_MS, CONTROLLER_TIMEOUT_MAX_MS),
             agent,
         })
     }
@@ -456,7 +457,12 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
     let min: i64 = time_part.get(3..5)?.parse().ok()?;
     let sec: i64 = time_part.get(6..8)?.parse().ok()?;
 
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=max_days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
         return None;
     }
 
@@ -477,10 +483,25 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
         } else {
             return None;
         };
+        if !(0..=23).contains(&th) || !(0..=59).contains(&tm) {
+            return None;
+        }
         unix -= sign * (th * 3600 + tm * 60);
     }
 
     Some(unix)
+}
+
+fn max_days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
@@ -527,6 +548,9 @@ mod tests {
             parse_rfc3339_unix("2025-01-01T08:00:00+08:00"),
             Some(1_735_689_600)
         );
+        assert_eq!(parse_rfc3339_unix("2025-02-29T00:00:00Z"), None);
+        assert!(parse_rfc3339_unix("2024-02-29T00:00:00Z").is_some());
+        assert_eq!(parse_rfc3339_unix("2025-01-01T08:00:00+99:00"), None);
     }
 
     #[test]

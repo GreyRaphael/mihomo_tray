@@ -8,7 +8,7 @@ use crate::config::tray::{self, TraySettings};
 use crate::core::api::Client;
 use crate::core::process::{self, RunningProcess};
 use crate::platform;
-use crate::text::{ERR_CORE_NOT_FOUND, ERR_NO_CONTROLLER, MIHOMO_CONFIG_NAME};
+use crate::text::{ERR_NO_CONTROLLER, MIHOMO_CONFIG_NAME};
 
 pub fn find_kernel(
     portable_root: &Path,
@@ -136,10 +136,13 @@ pub fn resolve_external_ui(
     settings: &TraySettings,
     config_info: &MihomoConfigInfo,
 ) -> Option<PathBuf> {
+    if has_flag(&settings.mihomo.args, "ext-ui") {
+        return None;
+    }
     if let Some(explicit) = tray::resolve_portable_path(portable_root, &settings.ui.external_ui) {
         return Some(explicit);
     }
-    if config_info.external_ui.is_some() || has_flag(&settings.mihomo.args, "ext-ui") {
+    if config_info.external_ui.is_some() {
         return None;
     }
     let portable_ui = portable_root.join("ui");
@@ -166,6 +169,12 @@ pub fn build_launch_args(
                 "Do not pass -{flag} in mihomo.args; configure {owner} in tray.yml instead."
             ));
         }
+    }
+    if !settings.ui.external_ui.trim().is_empty() && has_flag(&settings.mihomo.args, "ext-ui") {
+        return Err(
+            "Do not pass -ext-ui in mihomo.args when ui.external_ui is configured in tray.yml."
+                .to_string(),
+        );
     }
 
     let (home_dir, config_file) = resolve_home_and_config(portable_root, settings, kernel_path);
@@ -250,10 +259,6 @@ pub fn resolve_controller(
 
     Client::new(&address, &secret, settings.controller.timeout_ms)
         .map_err(|err| err.message(&address))
-}
-
-pub fn kernel_missing_error() -> String {
-    ERR_CORE_NOT_FOUND.to_string()
 }
 
 fn env_non_empty(name: &str) -> Option<String> {
@@ -385,6 +390,12 @@ mod tests {
             .position(|a| a == "-ext-ui")
             .expect("-ext-ui present");
         assert_eq!(PathBuf::from(&args[ui_idx + 1]), root.join("ui"));
+
+        let mut conflict_settings = TraySettings::default();
+        conflict_settings.ui.external_ui = "./ui".to_string();
+        conflict_settings.mihomo.args = vec!["-ext-ui".to_string(), "./other-ui".to_string()];
+        assert!(build_launch_args(&root, &conflict_settings, None).is_err());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

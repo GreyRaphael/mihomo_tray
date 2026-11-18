@@ -147,16 +147,30 @@ fn acquire_single_instance(
 
 fn init_logging(portable_root: &Path) -> PathBuf {
     let logs_dir = portable_root.join("logs");
-    let _ = std::fs::create_dir_all(&logs_dir);
+    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
+        eprintln!(
+            "Failed to create log directory {}: {err}",
+            logs_dir.display()
+        );
+    }
     let log_file = logs_dir.join("mihomo-tray.log");
 
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_file) {
-        let writer = Mutex::new(file);
-        let _ = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_target(false)
-            .with_writer(writer)
-            .try_init();
+    match OpenOptions::new().create(true).append(true).open(&log_file) {
+        Ok(file) => {
+            let writer = Mutex::new(file);
+            let _ = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(writer)
+                .try_init();
+        }
+        Err(err) => {
+            eprintln!("Failed to open log file {}: {err}", log_file.display());
+            let _ = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_target(false)
+                .try_init();
+        }
     }
     log_file
 }

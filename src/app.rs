@@ -1,6 +1,9 @@
 //! Main thread GUI orchestration (`winit 0.30` ApplicationHandler + `tray-icon 0.26`).
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -36,6 +39,8 @@ pub struct MihomoTrayApp {
     last_menu_fingerprint: Option<MenuFingerprint>,
     pending_menu_rebuild: bool,
     last_click: Instant,
+    prompt_thread: Option<JoinHandle<()>>,
+    version_dialog_open: Arc<AtomicBool>,
     quitting: bool,
     restart_on_exit: bool,
 }
@@ -67,6 +72,8 @@ impl MihomoTrayApp {
             last_menu_fingerprint: None,
             pending_menu_rebuild: false,
             last_click: Instant::now() - CLICK_DEBOUNCE,
+            prompt_thread: None,
+            version_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
             restart_on_exit: false,
         }
@@ -91,9 +98,10 @@ impl MihomoTrayApp {
 
         if self.tray_icon.is_none() {
             let snap = self.shared.lock().unwrap().clone();
-            let built = menu::build(&snap, snap.page_size, self.menu_generation);
+            let now_unix = menu::current_unix_secs();
+            let built = menu::build(&snap, self.menu_generation, now_unix);
             self.actions = built.actions;
-            self.last_menu_fingerprint = Some(MenuFingerprint::from_snapshot(&snap));
+            self.last_menu_fingerprint = Some(MenuFingerprint::from_snapshot(&snap, now_unix));
 
             let icon_key = IconKey {
                 state: snap.operational_state(),
@@ -235,22 +243,22 @@ impl MihomoTrayApp {
     }
 
     fn copy_env_vars(&self) {
-        let port = {
+        let (snap_port, cfg_path) = {
             let snap = self.shared.lock().unwrap();
-            if snap.mixed_port > 0 {
-                snap.mixed_port
-            } else if let Some(cfg_path) = &snap.resolved_config {
-                mihomo::read_file(cfg_path)
-                    .map(|info| info.mixed_port)
-                    .unwrap_or(0)
-            } else {
-                0
-            }
+            (snap.mixed_port, snap.resolved_config.clone())
+        };
+        let port = if snap_port > 0 {
+            snap_port
+        } else if let Some(cfg_path) = cfg_path {
+            mihomo::read_file(&cfg_path)
+                .map(|info| info.mixed_port)
+                .unwrap_or(0)
+        } else {
+            0
         };
         if port == 0 {
             let mut snap = self.shared.lock().unwrap();
-            snap.action_error =
-                Some("No mixed-port/port found in running core or config.yaml.".to_string());
+            snap.action_error = Some(crate::text::ERR_NO_MIXED_PORT_FOR_ENV.to_string());
             drop(snap);
             let _ = self
                 .proxy
@@ -275,34 +283,49 @@ impl MihomoTrayApp {
     }
 
     fn show_version_dialog(&self) {
+        if self
+            .version_dialog_open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let open_flag = Arc::clone(&self.version_dialog_open);
         let (core_ver, cfg_path) = {
             let snap = self.shared.lock().unwrap();
             (snap.version.clone(), snap.resolved_config.clone())
         };
         let portable = self.portable_root.clone();
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("version-dialog".to_string())
             .spawn(move || {
-                let core_line = if core_ver.is_empty() {
-                    "not running".to_string()
-                } else {
-                    core_ver
-                };
-                let cfg_line = cfg_path
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "none".to_string());
-                let msg = format!(
-                    "{app} v{ver}\nMihomo Core: {core_line}\nPortable Folder: {portable}\nConfig File: {cfg_line}",
-                    app = crate::text::APP_NAME,
-                    ver = crate::text::APP_VERSION,
-                    portable = portable.display(),
-                );
-                platform::notify_info("Version", &msg);
+                struct ResetFlag(Arc<AtomicBool>);
+                impl Drop for ResetFlag {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = ResetFlag(open_flag);
+                let msg =
+                    crate::text::format_version_dialog(&core_ver, &portable, cfg_path.as_deref());
+                platform::notify_info(crate::text::TITLE_VERSION, &msg);
             })
-            .ok();
+            .is_err()
+        {
+            self.version_dialog_open.store(false, Ordering::Release);
+        }
     }
 
-    fn prompt_and_set_subscription(&self) {
+    fn prompt_and_set_subscription(&mut self) {
+        if let Some(handle) = self.prompt_thread.take() {
+            if !handle.is_finished() {
+                self.prompt_thread = Some(handle);
+                platform::focus_subscription_prompt();
+                return;
+            }
+            let _ = handle.join();
+        }
+
         let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;
         };
@@ -314,7 +337,7 @@ impl MihomoTrayApp {
             .clone()
             .unwrap_or_else(|| self.portable_root.join("config").join("config.yaml"));
 
-        std::thread::Builder::new()
+        if let Ok(handle) = std::thread::Builder::new()
             .name("sub-prompt".to_string())
             .spawn(move || {
                 let current = mihomo::read_subscription_url(&cfg_path);
@@ -322,7 +345,9 @@ impl MihomoTrayApp {
                     let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
                 }
             })
-            .ok();
+        {
+            self.prompt_thread = Some(handle);
+        }
     }
 
     fn apply_snapshot(&mut self, rebuild_menu: bool) {
@@ -352,7 +377,8 @@ impl MihomoTrayApp {
         }
 
         if rebuild_menu {
-            let fp = MenuFingerprint::from_snapshot(&snap);
+            let now_unix = menu::current_unix_secs();
+            let fp = MenuFingerprint::from_snapshot(&snap, now_unix);
             if self.last_menu_fingerprint.as_ref() != Some(&fp) {
                 // Never call `set_menu` while TrackPopupMenu is displaying the live HMENU,
                 // otherwise Windows destroys the active popup menu mid-hover.
@@ -360,7 +386,7 @@ impl MihomoTrayApp {
                     self.pending_menu_rebuild = true;
                 } else {
                     let next_gen = self.menu_generation.wrapping_add(1).max(1);
-                    let built = menu::build(&snap, snap.page_size, next_gen);
+                    let built = menu::build(&snap, next_gen, now_unix);
                     self.actions = built.actions;
                     self.menu_generation = next_gen;
                     tray.set_menu(Some(Box::new(built.menu)));
@@ -388,7 +414,7 @@ impl MihomoTrayApp {
     fn open_target(&self, target: &str) {
         if let Err(err) = open::that_detached(target) {
             let mut snap = self.shared.lock().unwrap();
-            snap.action_error = Some(format!("Failed to open '{target}': {err}"));
+            snap.action_error = Some(crate::text::format_open_target_failed(target, &err));
             drop(snap);
             let _ = self
                 .proxy
@@ -403,6 +429,10 @@ impl MihomoTrayApp {
     }
 
     fn shutdown_on_exit(&mut self) {
+        platform::close_subscription_prompt();
+        if let Some(handle) = self.prompt_thread.take() {
+            let _ = handle.join();
+        }
         if let Some(mut worker) = self.worker.take() {
             if !self.quitting {
                 self.quitting = true;
@@ -444,6 +474,15 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::QuitCompleted => {
                 self.shutdown_on_exit();
                 event_loop.exit();
+            }
+            AppEvent::QuitCancelled(err) => {
+                self.quitting = false;
+                self.restart_on_exit = false;
+                {
+                    let mut snap = self.shared.lock().unwrap();
+                    snap.action_error = Some(err);
+                }
+                self.apply_snapshot(true);
             }
         }
     }

@@ -35,36 +35,30 @@ pub enum MenuAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuFingerprint {
     status_line: String,
-    status_note: Option<String>,
     error: Option<String>,
     web_ui_url: Option<String>,
     mode: ProxyMode,
     controller_ok: bool,
-    mixed_port: u16,
+    has_mixed_port: bool,
     sysproxy: bool,
     tun: bool,
     autostart: bool,
     groups: Vec<Group>,
     node_latency: BTreeMap<String, Option<u32>>,
     update_subscription_label: String,
-    resolved_config: Option<std::path::PathBuf>,
+    has_resolved_config: bool,
     page_size: usize,
 }
 
 impl MenuFingerprint {
-    pub fn from_snapshot(snap: &Snapshot) -> Self {
-        Self::from_snapshot_at(snap, current_unix_secs())
-    }
-
-    pub fn from_snapshot_at(snap: &Snapshot, now_unix: i64) -> Self {
+    pub fn from_snapshot(snap: &Snapshot, now_unix: i64) -> Self {
         Self {
             status_line: snap.status_line(),
-            status_note: snap.status_note.clone(),
             error: snap.error().map(ToString::to_string),
             web_ui_url: snap.web_ui_url.clone(),
             mode: snap.proxy_mode(),
             controller_ok: snap.controller_ok,
-            mixed_port: snap.mixed_port,
+            has_mixed_port: snap.mixed_port > 0,
             sysproxy: snap.sysproxy,
             tun: snap.tun,
             autostart: snap.autostart,
@@ -74,13 +68,13 @@ impl MenuFingerprint {
                 snap.subscription_updated_at(),
                 now_unix,
             ),
-            resolved_config: snap.resolved_config.clone(),
+            has_resolved_config: snap.resolved_config.is_some(),
             page_size: snap.page_size,
         }
     }
 }
 
-fn current_unix_secs() -> i64 {
+pub fn current_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -120,8 +114,24 @@ impl ActionRecorder {
     }
 }
 
-fn append_root_item(
-    menu: &Menu,
+trait MenuContainer {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem);
+}
+
+impl MenuContainer for Menu {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) {
+        let _ = self.append(item);
+    }
+}
+
+impl MenuContainer for Submenu {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) {
+        let _ = self.append(item);
+    }
+}
+
+fn append_menu_item<C: MenuContainer>(
+    container: &C,
     recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
@@ -131,11 +141,11 @@ fn append_root_item(
         Some(act) => MenuItem::with_id(recorder.next_id(act), label, enabled, None),
         None => MenuItem::new(label, enabled, None),
     };
-    let _ = menu.append(&item);
+    container.append_item(&item);
 }
 
-fn append_root_check(
-    menu: &Menu,
+fn append_check_item<C: MenuContainer>(
+    container: &C,
     recorder: &mut ActionRecorder,
     label: &str,
     enabled: bool,
@@ -143,40 +153,30 @@ fn append_root_check(
     action: MenuAction,
 ) {
     let item = CheckMenuItem::with_id(recorder.next_id(action), label, enabled, checked, None);
-    let _ = menu.append(&item);
+    container.append_item(&item);
 }
 
-pub fn build(snapshot: &Snapshot, page_size: usize, generation: u64) -> BuiltMenu {
-    build_at(snapshot, page_size, generation, current_unix_secs())
-}
-
-pub fn build_at(
-    snapshot: &Snapshot,
-    page_size: usize,
-    generation: u64,
-    now_unix: i64,
-) -> BuiltMenu {
+pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
     let mut recorder = ActionRecorder::new(generation);
     let menu = Menu::new();
+    let page_size = snapshot.page_size;
 
-    // 1. Mihomo status + optional status note / error line
-    append_root_item(&menu, &mut recorder, &snapshot.status_line(), false, None);
-    if let Some(note) = &snapshot.status_note {
-        append_root_item(&menu, &mut recorder, note, false, None);
-    } else if let Some(err) = snapshot.error() {
+    // 1. Mihomo status + optional error line (transient `status_note` is shown in tray tooltip).
+    append_menu_item(&menu, &mut recorder, &snapshot.status_line(), false, None);
+    if let Some(err) = snapshot.error() {
         let short = truncate_label(err, 90);
-        append_root_item(&menu, &mut recorder, &format!("! {short}"), false, None);
+        append_menu_item(&menu, &mut recorder, &format!("! {short}"), false, None);
     }
 
     // 2. WebUI & subscription onboarding
-    append_root_item(
+    append_menu_item(
         &menu,
         &mut recorder,
         text::MENU_OPEN_WEB_UI,
         snapshot.web_ui_url.is_some(),
         Some(MenuAction::OpenWebUi),
     );
-    append_root_item(
+    append_menu_item(
         &menu,
         &mut recorder,
         text::MENU_SET_SUBSCRIPTION,
@@ -193,7 +193,7 @@ pub fn build_at(
         (text::MENU_MODE_GLOBAL, ProxyMode::Global),
         (text::MENU_MODE_DIRECT, ProxyMode::Direct),
     ] {
-        append_root_check(
+        append_check_item(
             &menu,
             &mut recorder,
             label,
@@ -207,7 +207,7 @@ pub fn build_at(
     // 4. System Proxy & TUN toggles
     let can_toggle_sysproxy =
         snapshot.sysproxy || (snapshot.controller_ok && snapshot.mixed_port > 0);
-    append_root_check(
+    append_check_item(
         &menu,
         &mut recorder,
         text::MENU_SYSTEM_PROXY,
@@ -215,7 +215,7 @@ pub fn build_at(
         snapshot.sysproxy,
         MenuAction::ToggleSystemProxy,
     );
-    append_root_check(
+    append_check_item(
         &menu,
         &mut recorder,
         text::MENU_TUN_MODE,
@@ -245,7 +245,7 @@ pub fn build_at(
     append_more_items(&more_sub, snapshot, now_unix, &mut recorder);
     let _ = menu.append(&more_sub);
 
-    append_root_item(
+    append_menu_item(
         &menu,
         &mut recorder,
         text::MENU_QUIT,
@@ -270,21 +270,21 @@ fn build_group_submenu(
     let sub = Submenu::new(text::format_group_label(&group.name, is_pinned), true);
 
     if group.switchable && !group.members.is_empty() {
-        append_sub_item(
+        append_menu_item(
             &sub,
             recorder,
             text::MENU_TEST_LATENCY,
             true,
-            MenuAction::TestGroupLatency(group.name.clone()),
+            Some(MenuAction::TestGroupLatency(group.name.clone())),
         );
 
         if is_pinned {
-            append_sub_item(
+            append_menu_item(
                 &sub,
                 recorder,
                 text::MENU_AUTO_UNPIN,
                 true,
-                MenuAction::UnfixGroup(group.name.clone()),
+                Some(MenuAction::UnfixGroup(group.name.clone())),
             );
         }
         let _ = sub.append(&PredefinedMenuItem::separator());
@@ -352,64 +352,41 @@ fn append_member_item(
     let _ = target.append(&item);
 }
 
-fn append_sub_item(
-    sub: &Submenu,
-    recorder: &mut ActionRecorder,
-    label: &str,
-    enabled: bool,
-    action: MenuAction,
-) {
-    let item = MenuItem::with_id(recorder.next_id(action), label, enabled, None);
-    let _ = sub.append(&item);
-}
-
-fn append_sub_check(
-    sub: &Submenu,
-    recorder: &mut ActionRecorder,
-    label: &str,
-    enabled: bool,
-    checked: bool,
-    action: MenuAction,
-) {
-    let item = CheckMenuItem::with_id(recorder.next_id(action), label, enabled, checked, None);
-    let _ = sub.append(&item);
-}
-
 fn append_open_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRecorder) {
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_OPEN_TRAY_CONFIG,
         true,
-        MenuAction::OpenTrayConfig,
+        Some(MenuAction::OpenTrayConfig),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_OPEN_MIHOMO_CONFIG,
         snapshot.resolved_config.is_some(),
-        MenuAction::OpenMihomoConfig,
+        Some(MenuAction::OpenMihomoConfig),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_OPEN_PORTABLE_DIR,
         true,
-        MenuAction::OpenPortableDir,
+        Some(MenuAction::OpenPortableDir),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_OPEN_UI_DIR,
         true,
-        MenuAction::OpenUiDir,
+        Some(MenuAction::OpenUiDir),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_OPEN_LOG_FILE,
         true,
-        MenuAction::OpenLogFile,
+        Some(MenuAction::OpenLogFile),
     );
 }
 
@@ -419,37 +396,37 @@ fn append_more_items(
     now_unix: i64,
     recorder: &mut ActionRecorder,
 ) {
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_COPY_ENV_VARS,
         true,
-        MenuAction::CopyEnvVars,
+        Some(MenuAction::CopyEnvVars),
     );
     let update_label =
         text::format_update_subscription_label(snapshot.subscription_updated_at(), now_unix);
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         &update_label,
         snapshot.controller_ok,
-        MenuAction::RefreshSubscription,
+        Some(MenuAction::RefreshSubscription),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_RESTART_CORE,
         true,
-        MenuAction::RestartCore,
+        Some(MenuAction::RestartCore),
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         text::MENU_RESTART_APP,
         true,
-        MenuAction::RestartApp,
+        Some(MenuAction::RestartApp),
     );
-    append_sub_check(
+    append_check_item(
         sub,
         recorder,
         text::MENU_AUTOSTART,
@@ -457,12 +434,12 @@ fn append_more_items(
         snapshot.autostart,
         MenuAction::ToggleAutostart,
     );
-    append_sub_item(
+    append_menu_item(
         sub,
         recorder,
         &text::format_version_label(text::APP_VERSION),
         true,
-        MenuAction::ShowVersion,
+        Some(MenuAction::ShowVersion),
     );
 }
 
@@ -514,7 +491,7 @@ mod tests {
             ..Default::default()
         };
 
-        let built = build(&snap, 0, 1);
+        let built = build(&snap, 1, 1_700_000_000);
         assert!(matches!(built.actions[0], MenuAction::OpenWebUi));
         assert!(matches!(built.actions[1], MenuAction::SetSubscriptionUrl));
         assert!(
@@ -578,6 +555,7 @@ mod tests {
         let members: Vec<String> = (1..=5).map(|i| format!("Node-{i}")).collect();
         let snap = Snapshot {
             controller_ok: true,
+            page_size: 2,
             groups: vec![Group {
                 name: "Large".to_string(),
                 kind: "Selector".to_string(),
@@ -589,7 +567,7 @@ mod tests {
             ..Default::default()
         };
 
-        let built = build(&snap, 2, 1);
+        let built = build(&snap, 1, 1_700_000_000);
         let selected_count = built
             .actions
             .iter()
@@ -605,15 +583,16 @@ mod tests {
             mode: "rule".to_string(),
             ..Default::default()
         };
+        let now = 1_700_000_000;
         let mut s2 = s1.clone();
         assert_eq!(
-            MenuFingerprint::from_snapshot(&s1),
-            MenuFingerprint::from_snapshot(&s2)
+            MenuFingerprint::from_snapshot(&s1, now),
+            MenuFingerprint::from_snapshot(&s2, now)
         );
         s2.mode = "global".to_string();
         assert_ne!(
-            MenuFingerprint::from_snapshot(&s1),
-            MenuFingerprint::from_snapshot(&s2)
+            MenuFingerprint::from_snapshot(&s1, now),
+            MenuFingerprint::from_snapshot(&s2, now)
         );
     }
 
@@ -634,18 +613,18 @@ mod tests {
         let s_5s = make_snap(true, "HTTP", Some(now - 5));
         let s_45s = make_snap(true, "HTTP", Some(now - 45));
         assert_eq!(
-            MenuFingerprint::from_snapshot_at(&s_5s, now),
-            MenuFingerprint::from_snapshot_at(&s_45s, now)
+            MenuFingerprint::from_snapshot(&s_5s, now),
+            MenuFingerprint::from_snapshot(&s_45s, now)
         );
 
         // Crossing into the minute bucket updates fingerprint and More submenu item text.
         let s_2m = make_snap(true, "HTTP", Some(now - 120));
         assert_ne!(
-            MenuFingerprint::from_snapshot_at(&s_45s, now),
-            MenuFingerprint::from_snapshot_at(&s_2m, now)
+            MenuFingerprint::from_snapshot(&s_45s, now),
+            MenuFingerprint::from_snapshot(&s_2m, now)
         );
 
-        let built = build_at(&s_2m, 0, 1, now);
+        let built = build(&s_2m, 1, now);
         let more_sub = built
             .menu
             .items()
@@ -683,7 +662,7 @@ mod tests {
         assert_eq!(parse_action_id("bad_1_2"), None);
 
         let snap = Snapshot::default();
-        let built = build_at(&snap, 0, 42, 1_700_000_000);
+        let built = build(&snap, 42, 1_700_000_000);
         let last_id = built
             .menu
             .items()
@@ -716,8 +695,8 @@ mod tests {
         s2.node_latency.insert("Node-B".to_string(), Some(120));
 
         assert_eq!(
-            MenuFingerprint::from_snapshot_at(&s1, 1_700_000_000),
-            MenuFingerprint::from_snapshot_at(&s2, 1_700_000_000)
+            MenuFingerprint::from_snapshot(&s1, 1_700_000_000),
+            MenuFingerprint::from_snapshot(&s2, 1_700_000_000)
         );
     }
 }

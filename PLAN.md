@@ -58,7 +58,6 @@ mihomo-tray/
 | `open` | `5.4.5` | Open WebUI URL, config files, and portable folders in system default apps |
 | `single-instance` | `0.3.3` | Per-portable-directory instance mutex (keyed by hash of `portable_root`) |
 | `auto-launch` | `0.6.0` | Cross-platform startup registration (`Start with Windows`) |
-| `anyhow` | `1.0.104` | Error context propagation |
 | `tracing` | `0.1.44` | Structured diagnostic logging |
 | `tracing-subscriber` | `0.3.23` | Formatting file logger writing to `./logs/` |
 
@@ -66,9 +65,8 @@ mihomo-tray/
 | Crate | Version | Purpose |
 |---|---|---|
 | `winresource` | `0.1.34` | `build.rs` single-pass embedding of `assets/app.ico` + DPI/UTF-8 manifest (avoids `CVT1100` conflicts) |
-| `winreg` | `0.56.0` | Per-user `Internet Settings` registry updates & `Run` autostart path checks |
-| `windows-sys` | `0.61.2` | `InternetSetOptionW`, `MessageBoxW`, `ShellExecuteExW` (`CommandLineToArgvW`-safe quoting) |
-| `deelevate` | `0.2.0` | Detect whether the tray itself was launched elevated |
+| `winreg` | `0.56.0` | Per-user `Internet Settings` registry updates |
+| `windows-sys` | `0.61.2` | `InternetSetOptionW`, `MessageBoxW`, `ShellExecuteExW` (`CommandLineToArgvW`-safe quoting), DPI-aware prompt dialog |
 
 > **Implementation note**: `ShellExecuteExW` via `windows-sys` is used directly for UAC elevation instead of `runas 1.2.0`, because `runas 1.2.0` over-escapes backslashes inside quoted Windows paths containing spaces and leaks the child process handle.
 
@@ -85,7 +83,8 @@ src/
 ├── config/
 │   ├── mod.rs
 │   ├── tray.rs           # TraySettings + portable relative path resolution
-│   └── mihomo.rs         # Mihomo YAML inspection (external-controller, secret, external-ui)
+│   ├── mihomo.rs         # Mihomo YAML inspection (external-controller, secret, external-ui)
+│   └── state_store.rs    # PersistedState (.tray-state.json) across app restarts
 ├── core/
 │   ├── mod.rs
 │   ├── api.rs            # Mihomo REST client (ureq 3.5)
@@ -99,14 +98,15 @@ src/
 └── platform/
     ├── mod.rs            # Platform abstraction boundary + #[cfg] target dispatch
     ├── windows.rs        # Win10+ implementation (WinINet proxy, UAC helper, MessageBoxW)
+    ├── windows_prompt.rs # DPI-aware Win32 subscription URL modal input dialog
     └── stub.rs           # Non-Windows fallback/scaffold for host testing & future Linux/macOS
 ```
 
 ### Why Future Linux / macOS Support Requires Minimal Refactoring
-Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never import `windows_sys`, `winreg`, `runas`, or `deelevate`**. Only four OS concerns sit behind `src/platform/mod.rs`:
+Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never import `windows_sys` or `winreg`**. Only four OS concerns sit behind `src/platform/mod.rs`:
 1. `portable_root()` & `kernel_candidates()`: Windows uses `exe.parent()` and `*.exe`; macOS can later back out of `.app/Contents/MacOS`; Linux can drop `.exe` and support symlinks.
 2. `SystemProxy`: Windows uses `winreg` + `InternetSetOptionW` (preserving user-curated bypass entries and avoiding unnecessary refreshes); Linux/macOS can later plug in `gsettings`/`kconfig` and `networksetup`.
-3. `PrivilegeHelper`: Windows spawns self with `--elevate-start` / `--elevate-stop` / `--elevate-replace` via `runas`; Linux can later use `pkexec setcap` / `pkexec`; macOS can use `osascript` or privileged launch.
+3. `PrivilegeHelper`: Windows spawns self with `--elevate-start` / `--elevate-stop` via `ShellExecuteExW` (`"runas"`); Linux can later use `pkexec setcap` / `pkexec`; macOS can use `osascript` or privileged launch.
 4. `notify_error()` / `after_event_loop_ready()`: Windows uses `MessageBoxW`; macOS can apply `NSApplicationActivationPolicy::Accessory`; Linux can degrade gracefully when no SNI tray host exists.
 
 ---
@@ -136,7 +136,7 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
   - Users can overwrite or swap binaries in `./core/` and UI bundles in `./ui/`, then relaunch `mihomo-tray` (which preserves `System Proxy`, routing mode, and `TUN Mode` in `.tray-state.json`) or click `More -> Restart Mihomo Core`.
 - **TUN Elevation (Zero-Service)**:
   - Normal launches spawn `mihomo` without elevation.
-  - When toggling TUN ON fails to stick (`tun == false` on readback) or an elevated restart is needed, the worker resolves the running kernel PID, spawns a hidden elevated copy of `mihomo-tray.exe --elevate-start <pid>` (or `--elevate-replace <pid> <args...>`) via `runas`.
+  - When toggling TUN ON fails to stick (`tun == false` on readback) or an elevated restart is needed, the worker resolves the running kernel PID, spawns a hidden elevated copy of `mihomo-tray.exe --elevate-start <pid> <args...>` via `ShellExecuteExW`.
   - The elevated helper reads the verified executable image path from the running `<pid>` via `sysinfo` (never accepting an arbitrary executable path from CLI arguments), stops `<pid>`, and spawns the elevated kernel with explicit absolute `-d` / `-f` / `-ext-ctl` / `-secret` / `-ext-ui` arguments.
 
 ### 5.3 Two-Phase Menu Rebuild & Controls
@@ -158,4 +158,4 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
    - REST client (`ureq`) request/response verification against an ephemeral loopback mock HTTP server
    - Procedural RGBA icon generation invariants
 2. **Windows Target Verification (`cargo check --target x86_64-pc-windows-gnu --all-targets` & `cargo clippy --target x86_64-pc-windows-gnu --all-targets`)**:
-   - Verify full Windows Win10+ compilation (`windows.rs`, `build.rs`, `tray-icon`, `muda`, `winit`, `runas`, `deelevate`, `winreg`, `windows-sys`) with zero warnings/errors.
+   - Verify full Windows Win10+ compilation (`windows.rs`, `windows_prompt.rs`, `build.rs`, `tray-icon`, `muda`, `winit`, `winreg`, `windows-sys`) with zero warnings/errors.

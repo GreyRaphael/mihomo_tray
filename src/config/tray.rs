@@ -7,6 +7,8 @@ use serde::Deserialize;
 use crate::platform;
 use crate::text::TRAY_FILE_NAME;
 
+pub(crate) const CONTROLLER_TIMEOUT_MIN_MS: u32 = 200;
+pub(crate) const CONTROLLER_TIMEOUT_MAX_MS: u32 = 30_000;
 const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_SAMPLE: &str = include_str!("../../assets/tray.sample.yml");
 
@@ -120,7 +122,10 @@ pub fn parse(content: &str) -> Result<TraySettings, serde_yaml_ng::Error> {
     } else {
         serde_yaml_ng::from_str(clean)?
     };
-    settings.controller.timeout_ms = settings.controller.timeout_ms.clamp(200, 30_000);
+    settings.controller.timeout_ms = settings
+        .controller
+        .timeout_ms
+        .clamp(CONTROLLER_TIMEOUT_MIN_MS, CONTROLLER_TIMEOUT_MAX_MS);
     settings.ui.poll_interval_ms = settings.ui.poll_interval_ms.clamp(500, 60_000);
     settings.groups.page_size = settings.groups.page_size.min(MAX_PAGE_SIZE);
     Ok(settings)
@@ -148,16 +153,15 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !matches!(
-                    out.components().next_back(),
-                    None | Some(Component::Prefix(_) | Component::RootDir | Component::ParentDir)
-                ) {
-                    out.pop();
-                } else if out.as_os_str().is_empty() {
+            Component::ParentDir => match out.components().next_back() {
+                None | Some(Component::ParentDir | Component::Prefix(_)) => {
                     out.push(component.as_os_str());
                 }
-            }
+                Some(Component::RootDir) => {}
+                Some(_) => {
+                    out.pop();
+                }
+            },
             other => out.push(other.as_os_str()),
         }
     }
@@ -198,6 +202,18 @@ mod tests {
             Some(PathBuf::from("/abs/path/config.yaml"))
         );
         assert_eq!(resolve_portable_path(&root, "   "), None);
+        assert_eq!(
+            normalize_path(Path::new("../../core/mihomo")),
+            PathBuf::from("../../core/mihomo")
+        );
+        assert_eq!(
+            normalize_path(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/../../a/b")),
+            PathBuf::from("/a/b")
+        );
     }
 
     #[test]

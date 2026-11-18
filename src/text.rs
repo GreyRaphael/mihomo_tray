@@ -37,6 +37,7 @@ pub const STATUS_RESTARTING_CORE: &str = "Restarting mihomo core...";
 pub const STATUS_ELEVATING_CORE: &str = "Waiting for elevation prompt...";
 pub const STATUS_STOPPING_CORE: &str = "Stopping mihomo core...";
 pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
+pub const STATUS_UPDATING_SUBSCRIPTION: &str = "Updating subscription...";
 
 pub const ERR_ALREADY_RUNNING: &str = "mihomo-tray is already running for this portable folder.\nCheck the system tray overflow area if the icon is hidden.";
 pub const ERR_CORE_NOT_FOUND: &str = "No mihomo binary found beside mihomo-tray, in ./core, ./bin, or on PATH. Place mihomo.exe in ./core or set mihomo.path in tray.yml.";
@@ -51,6 +52,80 @@ pub const ERR_TUN_ELEVATION_DECLINED: &str =
 pub const ERR_TUN_FAILED_AFTER_ELEVATION: &str = "TUN mode remained disabled even after restarting mihomo elevated. Check config.yaml and Wintun availability.";
 pub const ERR_STOP_ELEVATION_REQUIRED: &str =
     "The running mihomo instance requires administrator privileges to stop.";
+pub const ERR_NO_MIXED_PORT_FOR_ENV: &str =
+    "No mixed-port/port found in running core or config.yaml.";
+pub const ERR_NO_MIXED_PORT_FOR_PROXY: &str =
+    "mihomo mixed-port/port is 0 or not configured; cannot enable system proxy.";
+pub const ERR_NO_MIXED_PORT_FOR_RESTORE: &str =
+    "mihomo mixed-port/port is 0 or not configured; cannot restore system proxy.";
+pub const ERR_LOCATE_ELEVATE_PROCESS: &str =
+    "Could not locate the running mihomo process to elevate.";
+pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
+    "No subscription provider configured. Use Set Subscription URL first.";
+pub const ERR_INVALID_SUBSCRIPTION_URL: &str =
+    "Subscription URL must start with http:// or https://";
+pub const ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN: &str =
+    "Shutdown requested while waiting for controller.";
+
+pub const TITLE_VERSION: &str = "Version";
+pub const TITLE_CONFIRM_STOP: &str = "Confirm Stop Core";
+pub const TITLE_QUIT_ANYWAY: &str = "Core Still Running";
+
+#[cfg(windows)]
+pub const PROMPT_SUBSCRIPTION_TITLE: &str = "Set Subscription URL";
+#[cfg(windows)]
+pub const PROMPT_SUBSCRIPTION_HEADING: &str = "Subscription URL";
+#[cfg(windows)]
+pub const PROMPT_SUBSCRIPTION_HINT: &str =
+    "Enter your subscription link (auto-updates every 12 hours):";
+#[cfg(windows)]
+pub const PROMPT_BTN_SAVE: &str = "Save";
+#[cfg(windows)]
+pub const PROMPT_BTN_CANCEL: &str = "Cancel";
+
+pub fn format_confirm_quit_anyway(err: &str) -> String {
+    format!(
+        "Could not stop the running mihomo core:\n\n{err}\n\nExit mihomo-tray anyway? (System Proxy will be disabled)"
+    )
+}
+
+pub fn format_confirm_stop_core(pid: u32, exe: Option<&std::path::Path>) -> String {
+    let exe_label = exe
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<elevated or unreadable path>".to_string());
+    format!("Stop running mihomo process?\n\nPID: {pid}\nExecutable: {exe_label}")
+}
+
+pub fn format_version_dialog(
+    core_version: &str,
+    portable_root: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+) -> String {
+    let core_line = if core_version.is_empty() {
+        "not running"
+    } else {
+        core_version
+    };
+    let cfg_line = config_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "{APP_NAME} v{APP_VERSION}\nMihomo Core: {core_line}\nPortable Folder: {portable}\nConfig File: {cfg_line}",
+        portable = portable_root.display(),
+    )
+}
+
+pub fn format_open_target_failed(target: &str, err: &dyn std::fmt::Display) -> String {
+    format!("Failed to open '{target}': {err}")
+}
+
+pub fn format_elevated_helper_failed(code: i32) -> String {
+    format!("Elevated helper failed while restarting mihomo (code {code}).")
+}
+
+pub fn format_tun_enable_after_elevation_failed(err: &str) -> String {
+    format!("Failed to enable TUN after elevation: {err}")
+}
 
 pub fn format_status_running(mode: &str, version: &str) -> String {
     let mode_label = if mode.is_empty() { "unknown" } else { mode };

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 mod stub;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_prompt;
 
 #[cfg(not(windows))]
 use stub as imp;
@@ -172,6 +174,42 @@ pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
     imp::prompt_subscription_url(current)
 }
 
+/// Focuses an already-open subscription prompt window if one exists.
+pub fn focus_subscription_prompt() {
+    imp::focus_subscription_prompt();
+}
+
+/// Requests an open subscription prompt window to close cleanly (used during app shutdown).
+pub fn close_subscription_prompt() {
+    imp::close_subscription_prompt();
+}
+
+/// Extracts the target executable path from a Scoop `.shim` file (`path = "..."`).
+#[cfg(any(windows, test))]
+pub fn parse_shim_path(content: &str) -> Option<PathBuf> {
+    content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                return None;
+            }
+            let (k, v) = trimmed.split_once('=')?;
+            if !k.trim().eq_ignore_ascii_case("path") {
+                return None;
+            }
+            let val = v.trim_start();
+            let raw_path = if let Some(quoted) = val.strip_prefix('"') {
+                quoted.split('"').next()?
+            } else {
+                val.split('#').next()?.trim()
+            };
+            (!raw_path.is_empty()).then(|| PathBuf::from(raw_path))
+        })
+}
+
 /// Computes an updated Windows `ProxyOverride` value if needed.
 /// - When `extra_bypass` is empty and an entry already exists, returns `None` to preserve user settings.
 /// - When `extra_bypass` is non-empty (or no entry exists yet), merges deduplicated entries and ensures `<local>` is included.
@@ -298,6 +336,19 @@ mod tests {
                 &["10.*".to_string(), "*.corp".to_string()]
             ),
             None
+        );
+    }
+
+    #[test]
+    fn parses_scoop_shim_paths_preserving_hash_inside_quotes() {
+        let content = "\u{feff}# scoop shim\npath = \"C:\\Users\\me#1\\scoop\\mihomo.exe\" # note\nargs = -d .\n";
+        assert_eq!(
+            parse_shim_path(content),
+            Some(PathBuf::from(r"C:\Users\me#1\scoop\mihomo.exe"))
+        );
+        assert_eq!(
+            parse_shim_path("path = C:\\scoop\\mihomo.exe # comment\n"),
+            Some(PathBuf::from(r"C:\scoop\mihomo.exe"))
         );
     }
 }

@@ -1,6 +1,8 @@
 //! Background worker thread for mihomo lifecycle, polling, and controller commands.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -12,9 +14,9 @@ use crate::config::state_store::{self, PersistedState};
 use crate::config::tray::{self, TraySettings};
 use crate::core::api::{Client, CoreConfigs};
 use crate::core::discover;
-use crate::core::process::{self, ManagedChild, RunningProcess, RuntimeRecord};
+use crate::core::process::{self, ManagedChild, ProcessInspector, RunningProcess, RuntimeRecord};
 use crate::platform;
-use crate::state::{AppEvent, Group, Provider, SharedSnapshot, WorkerCommand};
+use crate::state::{self, AppEvent, Provider, SharedSnapshot, WorkerCommand};
 use crate::text;
 
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
@@ -23,11 +25,15 @@ const AUTOSTART_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct WorkerHandle {
     pub tx: Sender<WorkerCommand>,
+    stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandle {
     pub fn send(&self, cmd: WorkerCommand) {
+        if matches!(cmd, WorkerCommand::Quit { .. }) {
+            self.stop_requested.store(true, Ordering::Release);
+        }
         let _ = self.tx.send(cmd);
     }
 
@@ -47,24 +53,29 @@ pub fn spawn(
     startup_error: Option<String>,
 ) -> WorkerHandle {
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    // Initialize Worker (and initial Snapshot fields) synchronously before returning
+    // so the GUI thread's first menu build observes resolved paths and startup errors.
+    let mut worker = Worker::new(
+        portable_root,
+        settings_path,
+        initial_settings,
+        shared,
+        proxy,
+        startup_error,
+        Arc::clone(&stop_requested),
+    );
 
     let join = std::thread::Builder::new()
         .name("mihomo-worker".to_string())
         .spawn(move || {
-            let mut worker = Worker::new(
-                portable_root,
-                settings_path,
-                initial_settings,
-                shared,
-                proxy,
-                startup_error,
-            );
             worker.run(rx);
         })
         .expect("failed to spawn worker thread");
 
     WorkerHandle {
         tx,
+        stop_requested,
         join: Some(join),
     }
 }
@@ -77,6 +88,8 @@ struct Worker {
     settings_parse_error: bool,
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
+    stop_requested: Arc<AtomicBool>,
+    process_inspector: ProcessInspector,
     managed: Option<ManagedChild>,
     known_kernel_path: Option<PathBuf>,
     recorded_pid: Option<u32>,
@@ -99,6 +112,7 @@ impl Worker {
         shared: SharedSnapshot,
         proxy: EventLoopProxy<AppEvent>,
         startup_error: Option<String>,
+        stop_requested: Arc<AtomicBool>,
     ) -> Self {
         let (home_dir, config_file) =
             discover::resolve_home_and_config(&portable_root, &settings, None);
@@ -120,6 +134,8 @@ impl Worker {
             settings_parse_error: has_startup_error,
             shared,
             proxy,
+            stop_requested,
+            process_inspector: ProcessInspector::new(),
             managed: None,
             known_kernel_path: None,
             recorded_pid: None,
@@ -142,16 +158,20 @@ impl Worker {
             let interval = Duration::from_millis(self.settings.ui.poll_interval_ms as u64);
             match rx.recv_timeout(interval) {
                 Ok(WorkerCommand::Quit { interactive }) => {
-                    self.handle_quit(interactive);
-                    break;
+                    if self.handle_quit(interactive) {
+                        break;
+                    }
+                    self.refresh();
                 }
                 Ok(cmd) => {
                     let mut burst_error = self.handle_command(cmd).err();
                     // Coalesce burst commands before doing a single refresh poll.
                     while let Ok(extra) = rx.try_recv() {
                         if let WorkerCommand::Quit { interactive } = extra {
-                            self.handle_quit(interactive);
-                            return;
+                            if self.handle_quit(interactive) {
+                                return;
+                            }
+                            break;
                         }
                         if let Err(err) = self.handle_command(extra) {
                             burst_error = Some(err);
@@ -175,13 +195,17 @@ impl Worker {
         self.reload_paths_and_runtime();
         self.load_initial_persisted_state();
         self.refresh_autostart_cache();
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = self
+            .process_inspector
+            .list_running_mihomo(self.known_kernel_path.as_deref());
         self.re_resolve_controller(&running);
 
         let controller_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
 
-        if !controller_alive
-            && running.is_empty()
+        if controller_alive {
+            // Core is already running; preserve its live mode/TUN instead of overriding from disk.
+            self.pending_restore = None;
+        } else if running.is_empty()
             && self.settings.mihomo.auto_start
             && let Err(err) = self.start_core_internal()
         {
@@ -281,7 +305,10 @@ impl Worker {
         self.reload_settings_and_paths(true);
 
         if let Some(rec) = process::load_runtime_record(&self.home_dir) {
-            if process::is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path)) {
+            if self
+                .process_inspector
+                .is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path))
+            {
                 self.recorded_pid = Some(rec.pid);
                 if self.known_kernel_path.is_none() {
                     self.known_kernel_path = Some(rec.kernel_path);
@@ -367,10 +394,7 @@ impl Worker {
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
         let cfg = client.get_configs()?;
         if cfg.mixed_port == 0 {
-            return Err(
-                "mihomo mixed-port/port is 0 or not configured; cannot enable system proxy."
-                    .to_string(),
-            );
+            return Err(text::ERR_NO_MIXED_PORT_FOR_PROXY.to_string());
         }
         platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)?;
         self.persisted_state.system_proxy = true;
@@ -410,13 +434,15 @@ impl Worker {
         }
 
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = self
+            .process_inspector
+            .list_running_mihomo(self.known_kernel_path.as_deref());
         let target = process::pick_target_process(
             &running,
             self.active_pid(),
             self.known_kernel_path.as_deref(),
         )
-        .ok_or_else(|| "Could not locate the running mihomo process to elevate.".to_string())?;
+        .ok_or_else(|| text::ERR_LOCATE_ELEVATE_PROCESS.to_string())?;
 
         let launch_args = discover::build_launch_args(
             &self.portable_root,
@@ -436,11 +462,7 @@ impl Worker {
 
         let new_pid = match code {
             Ok(c) if c > 0 => c as u32,
-            Ok(c) => {
-                return Err(format!(
-                    "Elevated helper failed while restarting mihomo (code {c})."
-                ));
-            }
+            Ok(c) => return Err(text::format_elevated_helper_failed(c)),
             Err(_) => return Err(text::ERR_TUN_ELEVATION_DECLINED.to_string()),
         };
 
@@ -471,7 +493,9 @@ impl Worker {
 
     fn start_core_internal(&mut self) -> Result<(), String> {
         self.reload_paths_and_runtime();
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = self
+            .process_inspector
+            .list_running_mihomo(self.known_kernel_path.as_deref());
         if process::pick_target_process(
             &running,
             self.active_pid(),
@@ -484,7 +508,7 @@ impl Worker {
         }
 
         let kernel_path = discover::find_kernel(&self.portable_root, &self.settings)?
-            .ok_or_else(discover::kernel_missing_error)?;
+            .ok_or_else(|| text::ERR_CORE_NOT_FOUND.to_string())?;
         self.known_kernel_path = Some(kernel_path.clone());
 
         let (home_dir, config_file) = discover::resolve_home_and_config(
@@ -506,31 +530,67 @@ impl Worker {
         self.managed = Some(child);
         self.recorded_pid = Some(pid);
         self.cached_version.clear();
-        process::save_runtime_record(&self.home_dir, &RuntimeRecord { pid, kernel_path });
+        process::save_runtime_record(
+            &self.home_dir,
+            &RuntimeRecord {
+                pid,
+                kernel_path: kernel_path.clone(),
+            },
+        );
 
-        let running_after = process::list_running_mihomo(self.known_kernel_path.as_deref());
-        self.re_resolve_controller(&running_after);
+        let spawned = [RunningProcess {
+            pid,
+            exe: Some(kernel_path),
+            cmd: args,
+        }];
+        self.re_resolve_controller(&spawned);
         let res = self.wait_for_controller(KERNEL_STARTUP_BUDGET, text::ERR_CORE_NOT_RESPONDING);
         self.set_status_note(None);
         res
+    }
+
+    fn disable_managed_system_proxy(&self) {
+        if self.persisted_state.system_proxy
+            && platform::proxy_is_enabled()
+            && let Err(err) = platform::proxy_disable()
+        {
+            tracing::warn!("Failed to disable system proxy on shutdown: {err}");
+        }
     }
 
     fn stop_core_internal(&mut self, interactive: bool) -> Result<(), String> {
         self.set_status_note(Some(text::STATUS_STOPPING_CORE));
         let res = self.stop_active_kernel(interactive);
         self.set_status_note(None);
-        res?;
-        if self.persisted_state.system_proxy && platform::proxy_is_enabled() {
-            let _ = platform::proxy_disable();
+        match res {
+            Ok(()) => {
+                self.disable_managed_system_proxy();
+                Ok(())
+            }
+            Err(err) if !interactive => {
+                tracing::warn!("Failed to stop core during non-interactive shutdown: {err}");
+                self.disable_managed_system_proxy();
+                Ok(())
+            }
+            Err(err) => {
+                let msg = text::format_confirm_quit_anyway(&err);
+                if platform::confirm_yes_no(text::TITLE_QUIT_ANYWAY, &msg) {
+                    self.disable_managed_system_proxy();
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
         }
-        Ok(())
     }
 
     fn force_restart_core(&mut self) -> Result<(), String> {
         let saved = self.capture_live_or_persisted_state();
         self.pending_restore = Some(saved);
         self.reload_paths_and_runtime();
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = self
+            .process_inspector
+            .list_running_mihomo(self.known_kernel_path.as_deref());
         if !running.is_empty() {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
             let stop_res = self.stop_active_kernel(true);
@@ -559,7 +619,9 @@ impl Worker {
             }
         }
 
-        let running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = self
+            .process_inspector
+            .list_running_mihomo(self.known_kernel_path.as_deref());
         let target = process::pick_target_process(
             &running,
             self.active_pid(),
@@ -569,16 +631,8 @@ impl Worker {
         .or_else(|| {
             if interactive && running.len() == 1 {
                 let candidate = &running[0];
-                let exe_label = candidate
-                    .exe
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<elevated or unreadable path>".to_string());
-                let msg = format!(
-                    "Stop running mihomo process?\n\nPID: {}\nExecutable: {}",
-                    candidate.pid, exe_label
-                );
-                if platform::confirm_yes_no("Confirm Stop Core", &msg) {
+                let msg = text::format_confirm_stop_core(candidate.pid, candidate.exe.as_deref());
+                if platform::confirm_yes_no(text::TITLE_CONFIRM_STOP, &msg) {
                     return Some(candidate.clone());
                 }
             }
@@ -613,6 +667,9 @@ impl Worker {
     fn wait_for_controller(&mut self, budget: Duration, timeout_msg: &str) -> Result<(), String> {
         let start = Instant::now();
         while start.elapsed() < budget {
+            if self.stop_requested.load(Ordering::Acquire) {
+                return Err(text::ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN.to_string());
+            }
             if let Some(ref mut managed) = self.managed
                 && let Ok(Some(_)) = managed.child.try_wait()
             {
@@ -648,10 +705,7 @@ impl Worker {
                 .map(|p| p.name)
                 .collect();
             if refreshable.is_empty() {
-                return Err(
-                    "No subscription provider configured. Use Set Subscription URL first."
-                        .to_string(),
-                );
+                return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
             }
             for name in refreshable {
                 client.refresh_provider(&name)?;
@@ -663,10 +717,9 @@ impl Worker {
     }
 
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
-        self.set_status_note(Some("Updating subscription..."));
+        self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
         let res = (|| {
             let saved = self.capture_live_or_persisted_state();
-            self.pending_restore = Some(saved);
             mihomo::apply_subscription_url(&self.config_file, url)?;
             if let Some(client) = &self.client
                 && client.probe().is_ok()
@@ -674,11 +727,13 @@ impl Worker {
                 let sub_cache = self.home_dir.join("providers").join("subscription.yaml");
                 let had_cached_sub = sub_cache.is_file();
                 client.reload_configs()?;
+                self.pending_restore = Some(saved);
                 if had_cached_sub || !sub_cache.is_file() {
                     client.refresh_provider("subscription")?;
                 }
                 return Ok(());
             }
+            self.pending_restore = Some(saved);
             self.start_core_internal()
         })();
         self.set_status_note(None);
@@ -740,20 +795,32 @@ impl Worker {
             cfg.mode = mode.clone();
         }
 
-        if restore.system_proxy
-            && cfg.mixed_port > 0
-            && let Err(err) = platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)
-        {
-            self.set_action_error(Some(err));
+        if restore.system_proxy {
+            if cfg.mixed_port == 0 {
+                self.set_action_error(Some(text::ERR_NO_MIXED_PORT_FOR_RESTORE.to_string()));
+            } else if let Err(err) =
+                platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)
+            {
+                self.set_action_error(Some(err));
+            }
         }
     }
 
-    fn handle_quit(&mut self, interactive: bool) {
+    fn handle_quit(&mut self, interactive: bool) -> bool {
         let final_state = self.capture_live_or_persisted_state();
         self.persisted_state = final_state;
         self.save_persisted_state();
-        let _ = self.stop_core_internal(interactive);
-        let _ = self.proxy.send_event(AppEvent::QuitCompleted);
+        match self.stop_core_internal(interactive) {
+            Ok(()) => {
+                let _ = self.proxy.send_event(AppEvent::QuitCompleted);
+                true
+            }
+            Err(err) => {
+                self.stop_requested.store(false, Ordering::Release);
+                let _ = self.proxy.send_event(AppEvent::QuitCancelled(err));
+                false
+            }
+        }
     }
 
     fn active_pid(&mut self) -> Option<u32> {
@@ -764,7 +831,10 @@ impl Worker {
             self.managed = None;
         }
         if let Some(pid) = self.recorded_pid {
-            if process::is_recorded_kernel_alive(pid, self.known_kernel_path.as_deref()) {
+            if self
+                .process_inspector
+                .is_recorded_kernel_alive(pid, self.known_kernel_path.as_deref())
+            {
                 return Some(pid);
             }
             self.recorded_pid = None;
@@ -773,10 +843,11 @@ impl Worker {
         None
     }
 
-    fn refresh(&mut self) {
+    fn resolve_live_controller(&mut self) -> bool {
         let tracked_alive = self.active_pid().is_some();
         let mut running = if !tracked_alive || self.client.is_none() {
-            process::list_running_mihomo(self.known_kernel_path.as_deref())
+            self.process_inspector
+                .list_running_mihomo(self.known_kernel_path.as_deref())
         } else {
             Vec::new()
         };
@@ -789,57 +860,115 @@ impl Worker {
             let controller_cfg_changed = self.reload_settings_if_changed();
             if self.client.is_none() || controller_cfg_changed {
                 if running.is_empty() {
-                    running = process::list_running_mihomo(self.known_kernel_path.as_deref());
+                    running = self
+                        .process_inspector
+                        .list_running_mihomo(self.known_kernel_path.as_deref());
                 }
                 self.re_resolve_controller(&running);
             }
         }
+        kernel_running
+    }
 
-        let client_opt = self.client.clone();
-        let mut controller_ok = false;
-        let mut mode = String::new();
-        let mut mixed_port = 0u16;
-        let mut tun = false;
-        let mut controller_error = None;
-        let mut web_ui_url = None;
-
-        if let Some(client) = &client_opt {
-            web_ui_url = Some(client.format_web_ui_url(&self.settings.ui.web_url));
-            match client.get_configs() {
-                Ok(mut cfg) => {
-                    self.apply_pending_restore_if_needed(&mut cfg);
-                    controller_ok = true;
-                    mode = cfg.mode;
-                    mixed_port = cfg.mixed_port;
-                    tun = cfg.tun_enable;
-                    if self.cached_version.is_empty()
-                        && let Ok(ver) = client.get_version()
-                    {
-                        self.cached_version = ver;
-                    }
+    fn poll_controller_configs(
+        &mut self,
+        client_opt: Option<&Client>,
+    ) -> (bool, String, u16, bool, Option<String>, Option<String>) {
+        let Some(client) = client_opt else {
+            return (
+                false,
+                String::new(),
+                0,
+                false,
+                Some(text::ERR_NO_CONTROLLER.to_string()),
+                None,
+            );
+        };
+        let web_ui_url = Some(client.format_web_ui_url(&self.settings.ui.web_url));
+        match client.get_configs() {
+            Ok(mut cfg) => {
+                self.apply_pending_restore_if_needed(&mut cfg);
+                if self.cached_version.is_empty()
+                    && let Ok(ver) = client.get_version()
+                {
+                    self.cached_version = ver;
                 }
-                Err(err) => {
-                    controller_error = Some(err);
+                (
+                    true,
+                    cfg.mode,
+                    cfg.mixed_port,
+                    cfg.tun_enable,
+                    None,
+                    web_ui_url,
+                )
+            }
+            Err(err) => (false, String::new(), 0, false, Some(err), web_ui_url),
+        }
+    }
+
+    fn sync_live_persisted_state(&mut self, sysproxy: bool, mode: &str, tun: bool) {
+        if self.pending_restore.is_some() {
+            return;
+        }
+        let live = PersistedState {
+            system_proxy: sysproxy,
+            mode: (!mode.is_empty()).then(|| mode.to_string()),
+            tun: Some(tun),
+        };
+        if !self.has_persisted_state || live != self.persisted_state {
+            self.persisted_state = live;
+            self.save_persisted_state();
+        }
+    }
+
+    fn publish_phase2_proxies(&self, client: &Client) {
+        let proxies_res = client.get_proxies();
+        let providers_res = client.get_providers();
+
+        let mut snap = self.shared.lock().unwrap();
+        if let Ok(proxies) = proxies_res {
+            snap.groups = state::order_and_filter_groups(
+                proxies.groups,
+                &self.settings.groups.include,
+                &self.settings.groups.exclude,
+                &self.settings.groups.order,
+            );
+            let mut latencies = proxies.latency;
+            if let Ok(prov) = providers_res {
+                snap.providers = prov.providers;
+                for (name, delay) in prov.latency {
+                    latencies
+                        .entry(name)
+                        .and_modify(|existing| {
+                            if existing.is_none() {
+                                *existing = delay;
+                            }
+                        })
+                        .or_insert(delay);
                 }
             }
-        } else {
-            controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
+            snap.node_latency = latencies;
+        } else if let Ok(prov) = providers_res {
+            snap.providers = prov.providers;
         }
+        drop(snap);
+        let _ = self
+            .proxy
+            .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+    }
+
+    fn refresh(&mut self) {
+        let kernel_running = self.resolve_live_controller();
+        let client_opt = self.client.clone();
+        let (controller_ok, mode, mixed_port, tun, controller_error, web_ui_url) =
+            self.poll_controller_configs(client_opt.as_ref());
 
         let sysproxy = platform::proxy_is_enabled();
         self.refresh_autostart_if_stale();
         let autostart = self.cached_autostart;
 
-        if controller_ok && self.pending_restore.is_none() {
-            let live = PersistedState {
-                system_proxy: sysproxy,
-                mode: (!mode.is_empty()).then(|| mode.clone()),
-                tun: Some(tun),
-            };
-            if !self.has_persisted_state || live != self.persisted_state {
-                self.persisted_state = live;
-                self.save_persisted_state();
-            }
+        if controller_ok {
+            self.sync_live_persisted_state(sysproxy, &mode, tun);
         }
 
         // Phase 1 snapshot: immediate state + controls update.
@@ -864,46 +993,16 @@ impl Worker {
             if !controller_ok {
                 snap.groups.clear();
                 snap.providers.clear();
+                snap.node_latency.clear();
             }
         }
         let _ = self
             .proxy
             .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
 
-        if !controller_ok {
-            return;
-        }
-
         // Phase 2 snapshot: fetch proxy groups & providers.
-        if let Some(client) = &client_opt {
-            let proxies_res = client.get_proxies();
-            let providers_res = client.get_providers();
-
-            let mut snap = self.shared.lock().unwrap();
-            if let Ok(proxies) = proxies_res {
-                snap.groups = order_and_filter_groups(proxies.groups, &self.settings);
-                let mut latencies = proxies.latency;
-                if let Ok(prov) = providers_res {
-                    snap.providers = prov.providers;
-                    for (name, delay) in prov.latency {
-                        latencies
-                            .entry(name)
-                            .and_modify(|existing| {
-                                if existing.is_none() {
-                                    *existing = delay;
-                                }
-                            })
-                            .or_insert(delay);
-                    }
-                }
-                snap.node_latency = latencies;
-            } else if let Ok(prov) = providers_res {
-                snap.providers = prov.providers;
-            }
-            drop(snap);
-            let _ = self
-                .proxy
-                .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+        if controller_ok && let Some(client) = &client_opt {
+            self.publish_phase2_proxies(client);
         }
     }
 
@@ -935,7 +1034,7 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
 fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<bool, String> {
     client
         .set_tun(true)
-        .map_err(|err| format!("Failed to enable TUN after elevation: {err}"))?;
+        .map_err(|err| text::format_tun_enable_after_elevation_failed(&err))?;
     let verify = client.get_configs()?;
     if !verify.tun_enable {
         return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
@@ -943,78 +1042,9 @@ fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<bool, String>
     Ok(true)
 }
 
-fn order_and_filter_groups(groups: Vec<Group>, settings: &TraySettings) -> Vec<Group> {
-    let include = &settings.groups.include;
-    let exclude = &settings.groups.exclude;
-    let order = &settings.groups.order;
-
-    let mut filtered: Vec<Group> = groups
-        .into_iter()
-        .filter(|g| {
-            if !include.is_empty() && !include.iter().any(|x| x.eq_ignore_ascii_case(&g.name)) {
-                return false;
-            }
-            if exclude.iter().any(|x| x.eq_ignore_ascii_case(&g.name)) {
-                return false;
-            }
-            true
-        })
-        .collect();
-
-    filtered.sort_by(|a, b| {
-        if a.name == "GLOBAL" && b.name != "GLOBAL" {
-            return std::cmp::Ordering::Less;
-        }
-        if b.name == "GLOBAL" && a.name != "GLOBAL" {
-            return std::cmp::Ordering::Greater;
-        }
-        let pos_a = order.iter().position(|x| x.eq_ignore_ascii_case(&a.name));
-        let pos_b = order.iter().position(|x| x.eq_ignore_ascii_case(&b.name));
-        match (pos_a, pos_b) {
-            (Some(ia), Some(ib)) => ia.cmp(&ib),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a
-                .name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase()),
-        }
-    });
-    filtered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn g(name: &str) -> Group {
-        Group {
-            name: name.to_string(),
-            kind: "Selector".to_string(),
-            switchable: true,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn keeps_global_first_and_applies_order_and_filters() {
-        let mut settings = TraySettings::default();
-        settings.groups.order = vec!["Streaming".to_string(), "Proxy".to_string()];
-        settings.groups.exclude = vec!["HiddenOne".to_string()];
-
-        let input = vec![
-            g("Alpha"),
-            g("Proxy"),
-            g("HiddenOne"),
-            g("GLOBAL"),
-            g("Streaming"),
-        ];
-        let out: Vec<String> = order_and_filter_groups(input, &settings)
-            .into_iter()
-            .map(|x| x.name)
-            .collect();
-        assert_eq!(out, vec!["GLOBAL", "Streaming", "Proxy", "Alpha"]);
-    }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         use std::io::Read;

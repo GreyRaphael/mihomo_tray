@@ -26,8 +26,13 @@ pub(crate) fn ensure_template_file(path: &Path, template: &str) {
     if !should_write {
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!("Failed to create directory {}: {err}", parent.display());
+        return;
     }
-    let _ = std::fs::write(path, template);
+    if let Err(err) = std::fs::write(path, template) {
+        tracing::warn!("Failed to initialize {}: {err}", path.display());
+    }
 }

@@ -100,7 +100,7 @@ pub fn read_subscription_url(path: &Path) -> Option<String> {
 pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> {
     let url = raw_url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("Subscription URL must start with http:// or https://".to_string());
+        return Err(crate::text::ERR_INVALID_SUBSCRIPTION_URL.to_string());
     }
 
     let source_text = match std::fs::read_to_string(path) {

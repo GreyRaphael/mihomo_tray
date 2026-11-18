@@ -5,7 +5,7 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::platform;
 use crate::text::RUNTIME_LOCK_NAME;
@@ -37,11 +37,22 @@ pub fn runtime_record_path(home_dir: &Path) -> PathBuf {
 
 pub fn save_runtime_record(home_dir: &Path, record: &RuntimeRecord) {
     let path = runtime_record_path(home_dir);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            "Failed to create runtime directory {}: {err}",
+            parent.display()
+        );
+        return;
     }
-    if let Ok(json) = serde_json::to_string_pretty(record) {
-        let _ = std::fs::write(path, json);
+    match serde_json::to_string_pretty(record) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, json) {
+                tracing::warn!("Failed to write {}: {err}", path.display());
+            }
+        }
+        Err(err) => tracing::warn!("Failed to serialize runtime record: {err}"),
     }
 }
 
@@ -52,71 +63,103 @@ pub fn load_runtime_record(home_dir: &Path) -> Option<RuntimeRecord> {
 }
 
 pub fn clear_runtime_record(home_dir: &Path) {
-    let _ = std::fs::remove_file(runtime_record_path(home_dir));
+    let path = runtime_record_path(home_dir);
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("Failed to remove {}: {err}", path.display());
+    }
 }
 
-pub fn list_running_mihomo(expected_kernel: Option<&Path>) -> Vec<RunningProcess> {
-    let Ok(mut sys) = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(
+/// Reusable `sysinfo::System` wrapper so periodic process checks avoid reallocating buffers.
+#[derive(Default)]
+pub struct ProcessInspector {
+    sys: Option<System>,
+}
+
+impl ProcessInspector {
+    pub fn new() -> Self {
+        Self {
+            sys: System::new().ok(),
+        }
+    }
+
+    fn system_mut(&mut self) -> Option<&mut System> {
+        if self.sys.is_none() {
+            self.sys = System::new().ok();
+        }
+        self.sys.as_mut()
+    }
+
+    pub fn list_running_mihomo(&mut self, expected_kernel: Option<&Path>) -> Vec<RunningProcess> {
+        let Some(sys) = self.system_mut() else {
+            return Vec::new();
+        };
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
             ProcessRefreshKind::nothing()
                 .with_exe(UpdateKind::Always)
                 .with_cmd(UpdateKind::Always),
-        ),
-    ) else {
-        return Vec::new();
-    };
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+        );
 
-    let mut out = Vec::new();
-    for (pid, proc_info) in sys.processes() {
-        let name = proc_info.name().to_string_lossy();
-        let exe = proc_info.exe().map(Path::to_path_buf);
+        let mut out = Vec::new();
+        for (pid, proc_info) in sys.processes() {
+            let name = proc_info.name().to_string_lossy();
+            let exe = proc_info.exe().map(Path::to_path_buf);
 
-        let name_matches = platform::is_kernel_candidate_name(&name);
-        let path_matches = expected_kernel
-            .zip(exe.as_deref())
-            .is_some_and(|(want, got)| paths_match(want, got));
+            let name_matches = platform::is_kernel_candidate_name(&name);
+            let path_matches = expected_kernel
+                .zip(exe.as_deref())
+                .is_some_and(|(want, got)| paths_match(want, got));
 
-        if name_matches || path_matches {
-            let cmd = proc_info
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect();
-            out.push(RunningProcess {
-                pid: pid.as_u32(),
-                exe,
-                cmd,
-            });
+            if name_matches || path_matches {
+                let cmd = proc_info
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect();
+                out.push(RunningProcess {
+                    pid: pid.as_u32(),
+                    exe,
+                    cmd,
+                });
+            }
         }
+        out
     }
-    out
+
+    /// Checks whether `pid` is still alive and belongs to a mihomo kernel process
+    /// (guarding against OS PID reuse after crashes or reboots).
+    pub fn is_recorded_kernel_alive(&mut self, pid: u32, expected_kernel: Option<&Path>) -> bool {
+        let Some(sys) = self.system_mut() else {
+            return false;
+        };
+        let sys_pid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sys_pid]),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+        let Some(proc_info) = sys.process(sys_pid) else {
+            return false;
+        };
+        let name = proc_info.name().to_string_lossy();
+        matches_recorded_kernel(&name, proc_info.exe(), expected_kernel)
+    }
 }
 
 pub fn is_pid_alive(pid: u32) -> bool {
     let Ok(mut sys) = System::new() else {
         return false;
     };
-    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
-    sys.process(Pid::from_u32(pid)).is_some()
-}
-
-/// Checks whether `pid` is still alive and belongs to a mihomo kernel process
-/// (guarding against OS PID reuse after crashes or reboots).
-pub fn is_recorded_kernel_alive(pid: u32, expected_kernel: Option<&Path>) -> bool {
-    let Ok(mut sys) = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)),
-    ) else {
-        return false;
-    };
     let sys_pid = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
-    let Some(proc_info) = sys.process(sys_pid) else {
-        return false;
-    };
-    let name = proc_info.name().to_string_lossy();
-    matches_recorded_kernel(&name, proc_info.exe(), expected_kernel)
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(sys_pid).is_some()
 }
 
 fn matches_recorded_kernel(name: &str, exe: Option<&Path>, expected_kernel: Option<&Path>) -> bool {
@@ -176,7 +219,12 @@ pub fn terminate_pid_and_wait(pid: u32) -> Result<(), String> {
     let deadline = Instant::now() + STOP_WAIT_BUDGET;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(80));
-        if !is_pid_alive(pid) {
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sys_pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        if sys.process(sys_pid).is_none() {
             return Ok(());
         }
     }
@@ -233,13 +281,13 @@ pub fn helper_start_from_pid(pid: u32, args: &[String]) -> i32 {
 }
 
 fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)),
-    )
-    .ok()?;
+    let mut sys = System::new().ok()?;
     let sys_pid = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
     let proc_info = sys.process(sys_pid)?;
     let name = proc_info.name().to_string_lossy();
     let exe = proc_info.exe()?.to_path_buf();
@@ -252,7 +300,8 @@ mod tests {
 
     #[test]
     fn rejects_reused_non_kernel_pid_and_accepts_matching_kernel() {
-        assert!(!is_recorded_kernel_alive(std::process::id(), None));
+        let mut inspector = ProcessInspector::new();
+        assert!(!inspector.is_recorded_kernel_alive(std::process::id(), None));
         assert!(!matches_recorded_kernel(
             "notepad.exe",
             Some(Path::new(r"C:\Windows\System32\notepad.exe")),

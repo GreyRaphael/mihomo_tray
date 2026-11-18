@@ -17,10 +17,10 @@ pub(super) struct SettingsReload {
 
 pub(super) struct ConfigTracker {
     pub portable_root: PathBuf,
-    pub settings_path: PathBuf,
+    settings_path: PathBuf,
     pub settings: TraySettings,
-    pub last_settings_mtime: Option<SystemTime>,
-    pub last_config_mtime: Option<SystemTime>,
+    last_settings_mtime: Option<SystemTime>,
+    last_config_mtime: Option<SystemTime>,
     pub settings_error: Option<String>,
     pub kernel_path_error: Option<String>,
     pub known_kernel_path: Option<PathBuf>,
@@ -73,7 +73,7 @@ impl ConfigTracker {
         self.load_settings_from_disk()
     }
 
-    pub fn load_settings_from_disk(&mut self) -> SettingsReload {
+    fn load_settings_from_disk(&mut self) -> SettingsReload {
         self.last_settings_mtime = file_mtime(&self.settings_path);
         let prev_settings = self.settings.clone();
         let prev_controller = self.settings.controller.clone();
@@ -143,6 +143,11 @@ impl ConfigTracker {
             self.refresh_autostart_cache();
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn invalidate_settings_mtime(&mut self) {
+        self.last_settings_mtime = None;
+    }
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -169,7 +174,7 @@ mod tests {
 
         // Write valid empty YAML matching defaults -> must still report changed & clear error.
         std::fs::write(&settings_path, "").unwrap();
-        tracker.last_settings_mtime = None;
+        tracker.invalidate_settings_mtime();
         let reload = tracker.reload_settings_if_changed();
         assert!(reload.changed);
         assert!(reload.controller_changed);

@@ -78,6 +78,7 @@ pub struct ProvidersData {
     pub latency: BTreeMap<String, Option<u32>>,
 }
 
+#[derive(Clone, Copy)]
 enum RequestOp<'a> {
     Get,
     Delete,

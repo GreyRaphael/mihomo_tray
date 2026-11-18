@@ -32,9 +32,8 @@ pub fn kernel_exe_name() -> &'static str {
     "mihomo.exe"
 }
 
-pub fn is_kernel_candidate_name(file_name: &str) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    lower.starts_with("mihomo") && lower.ends_with(".exe")
+pub fn is_kernel_candidate_name(lower_name: &str) -> bool {
+    lower_name.starts_with("mihomo") && lower_name.ends_with(".exe")
 }
 
 pub fn expand_env(value: &str) -> String {
@@ -60,7 +59,7 @@ pub fn resolve_shim_target(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let content = std::fs::read_to_string(shim_file).ok()?;
-    let target = crate::platform::parse_shim_path(&content)?;
+    let target = super::win_helpers::parse_shim_path(&content)?;
     target.is_file().then_some(target)
 }
 
@@ -103,7 +102,7 @@ pub fn proxy_enable(port: u16, extra_bypass: &[String]) -> Result<(), String> {
         }
     };
     if let Some(merged) =
-        crate::platform::merge_proxy_override(existing_override.as_deref(), extra_bypass)
+        super::win_helpers::merge_proxy_override(existing_override.as_deref(), extra_bypass)
     {
         key.set_value("ProxyOverride", &merged)
             .map_err(|e| format!("failed to set ProxyOverride: {e}"))?;
@@ -161,7 +160,7 @@ pub fn spawn_hidden(exe: &Path, args: &[String], cwd: Option<&Path>) -> std::io:
 
 pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     let exe = std::env::current_exe().map_err(|e| format!("failed to locate self: {e}"))?;
-    let params = crate::platform::quote_win32_args(args);
+    let params = super::win_helpers::quote_win32_args(args);
     let verb_w = wide("runas");
     let file_w = wide(&exe.to_string_lossy());
     let params_w = wide(&params);

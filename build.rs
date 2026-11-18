@@ -1,6 +1,6 @@
-const WINDOWS_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+const WINDOWS_MANIFEST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity type="win32" name="GreyRaphael.MihomoTray" version="0.3.5.0" processorArchitecture="*" />
+  <assemblyIdentity type="win32" name="GreyRaphael.MihomoTray" version="__VERSION__" processorArchitecture="*" />
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
@@ -28,6 +28,14 @@ const WINDOWS_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalon
 </assembly>
 "#;
 
+fn manifest_xml() -> String {
+    let base = env!("CARGO_PKG_VERSION")
+        .split('-')
+        .next()
+        .unwrap_or("0.0.0");
+    WINDOWS_MANIFEST_TEMPLATE.replace("__VERSION__", &format!("{base}.0"))
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/app.ico");
@@ -47,7 +55,7 @@ fn main() {
 
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/app.ico");
-    res.set_manifest(WINDOWS_MANIFEST);
+    res.set_manifest(&manifest_xml());
     if let Err(err) = res.compile() {
         if cfg!(windows) {
             panic!("failed to compile Windows resources: {err}");

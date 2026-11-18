@@ -45,7 +45,7 @@ pub fn read_file(path: &Path) -> Result<MihomoConfigInfo, String> {
     try_parse_str(&text).map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
-pub fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
+fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
     let clean = text.strip_prefix('\u{feff}').unwrap_or(text);
     let parsed: PartialMihomoYaml = if clean.trim().is_empty() {
         PartialMihomoYaml::default()

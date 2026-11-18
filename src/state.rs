@@ -18,7 +18,7 @@ pub enum ProxyMode {
 }
 
 impl ProxyMode {
-    pub fn from_api(raw: &str) -> Self {
+    fn from_api(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "rule" => Self::Rule,
             "global" => Self::Global,
@@ -175,8 +175,8 @@ pub type SharedSnapshot = Arc<Mutex<Snapshot>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncTaskKind {
     LatencyTest,
-    RefreshSubscriptions,
-    ApplySubscription { reload_ok: bool },
+    RefreshSubscriptions { generation: u64 },
+    ApplySubscription { generation: u64, reload_ok: bool },
 }
 
 #[derive(Debug, Clone)]

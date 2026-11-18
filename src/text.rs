@@ -25,7 +25,7 @@ pub const MENU_OPEN_UI_DIR: &str = "Open WebUI Folder (ui/)";
 pub const MENU_OPEN_LOG_FILE: &str = "Open Log File";
 pub const MENU_MORE: &str = "More";
 pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
-pub const MENU_REFRESH_SUBSCRIPTION: &str = "Update Subscription";
+const MENU_REFRESH_SUBSCRIPTION: &str = "Update Subscription";
 pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
 pub const MENU_RESTART_APP: &str = "Restart Application";
 pub const MENU_AUTOSTART: &str = "Start with Windows";
@@ -35,7 +35,6 @@ pub const STATUS_STARTING_CORE: &str = "Starting mihomo core...";
 pub const STATUS_WAITING_CONTROLLER: &str = "Waiting for mihomo controller...";
 pub const STATUS_RESTARTING_CORE: &str = "Restarting mihomo core...";
 pub const STATUS_ELEVATING_CORE: &str = "Waiting for elevation prompt...";
-pub const STATUS_STOPPING_CORE: &str = "Stopping mihomo core...";
 pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
 pub const STATUS_UPDATING_SUBSCRIPTION: &str = "Updating subscription...";
 
@@ -161,23 +160,43 @@ pub fn format_version_label(version: &str) -> String {
     format!("Version: v{version}")
 }
 
+/// Coarse relative age bucket for `Update Subscription` so tray menus only
+/// rebuild when the displayed label actually changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubAgeBucket {
+    None,
+    JustNow,
+    Minutes(i64),
+    Hours(i64),
+    Days(i64),
+}
+
+pub fn subscription_age_bucket(updated_at: Option<i64>, now_unix: i64) -> SubAgeBucket {
+    let Some(ts) = updated_at else {
+        return SubAgeBucket::None;
+    };
+    let elapsed = now_unix.saturating_sub(ts);
+    if elapsed < 60 {
+        SubAgeBucket::JustNow
+    } else if elapsed < 3_600 {
+        SubAgeBucket::Minutes(elapsed / 60)
+    } else if elapsed < 86_400 {
+        SubAgeBucket::Hours(elapsed / 3_600)
+    } else {
+        SubAgeBucket::Days(elapsed / 86_400)
+    }
+}
+
 /// Formats `Update Subscription` with a coarse relative age bucket so tray
 /// menus only rebuild when the displayed minute/hour/day label changes.
 pub fn format_update_subscription_label(updated_at: Option<i64>, now_unix: i64) -> String {
-    let Some(ts) = updated_at else {
-        return MENU_REFRESH_SUBSCRIPTION.to_string();
-    };
-    let elapsed = now_unix.saturating_sub(ts);
-    let age = if elapsed < 60 {
-        "just now".to_string()
-    } else if elapsed < 3_600 {
-        format!("{}m ago", elapsed / 60)
-    } else if elapsed < 86_400 {
-        format!("{}h ago", elapsed / 3_600)
-    } else {
-        format!("{}d ago", elapsed / 86_400)
-    };
-    format!("{MENU_REFRESH_SUBSCRIPTION} ({age})")
+    match subscription_age_bucket(updated_at, now_unix) {
+        SubAgeBucket::None => MENU_REFRESH_SUBSCRIPTION.to_string(),
+        SubAgeBucket::JustNow => format!("{MENU_REFRESH_SUBSCRIPTION} (just now)"),
+        SubAgeBucket::Minutes(m) => format!("{MENU_REFRESH_SUBSCRIPTION} ({m}m ago)"),
+        SubAgeBucket::Hours(h) => format!("{MENU_REFRESH_SUBSCRIPTION} ({h}h ago)"),
+        SubAgeBucket::Days(d) => format!("{MENU_REFRESH_SUBSCRIPTION} ({d}d ago)"),
+    }
 }
 
 #[cfg(test)]

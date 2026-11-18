@@ -134,7 +134,7 @@ impl MihomoTrayApp {
         }
     }
 
-    fn handle_tray_event(&mut self, event: TrayIconEvent) {
+    fn handle_tray_event(&mut self, event: &TrayIconEvent) {
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
@@ -325,6 +325,7 @@ impl MihomoTrayApp {
                         Some((now_unix, fp, snap.clone()))
                     }
                 } else {
+                    self.pending_menu_rebuild = false;
                     None
                 }
             } else {
@@ -426,7 +427,7 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::TrayIcon(ev) => self.handle_tray_event(ev),
+            AppEvent::TrayIcon(ev) => self.handle_tray_event(&ev),
             AppEvent::Menu(ev) => self.handle_menu_event(ev.id.as_ref()),
             AppEvent::SnapshotUpdated { rebuild_menu } => self.apply_snapshot(rebuild_menu),
             AppEvent::QuitCompleted => {

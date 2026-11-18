@@ -156,6 +156,16 @@ pub fn build_launch_args(
     settings: &TraySettings,
     kernel_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    let (home_dir, config_file) = resolve_home_and_config(portable_root, settings, kernel_path);
+    build_launch_args_for_paths(portable_root, settings, &home_dir, &config_file)
+}
+
+pub(crate) fn build_launch_args_for_paths(
+    portable_root: &Path,
+    settings: &TraySettings,
+    home_dir: &Path,
+    config_file: &Path,
+) -> Result<Vec<String>, String> {
     for (flag, owner) in [
         ("d", "mihomo.home in tray.yml"),
         ("f", "mihomo.config in tray.yml"),
@@ -175,8 +185,7 @@ pub fn build_launch_args(
         );
     }
 
-    let (home_dir, config_file) = resolve_home_and_config(portable_root, settings, kernel_path);
-    let config_info = mihomo::read_file(&config_file).unwrap_or_default();
+    let config_info = mihomo::read_file(config_file).unwrap_or_default();
 
     let mut args: Vec<String> = settings
         .mihomo

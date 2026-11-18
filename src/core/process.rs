@@ -335,9 +335,6 @@ fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
 }
 
 fn is_authorized_helper_exe(name: &str, exe: &Path, portable_root: &Path) -> bool {
-    if platform::is_kernel_candidate_name(name) {
-        return true;
-    }
     let settings = tray::load(&tray::settings_path(portable_root)).unwrap_or_default();
     let declared = tray::resolve_portable_path(portable_root, &settings.mihomo.path);
     if declared
@@ -348,7 +345,22 @@ fn is_authorized_helper_exe(name: &str, exe: &Path, portable_root: &Path) -> boo
     }
     let (home_dir, _) =
         discover::resolve_home_and_config(portable_root, &settings, declared.as_deref());
-    load_runtime_record(&home_dir).is_some_and(|rec| paths_match(exe, &rec.kernel_path))
+    if load_runtime_record(&home_dir).is_some_and(|rec| paths_match(exe, &rec.kernel_path)) {
+        return true;
+    }
+    platform::is_kernel_candidate_name(name)
+        && (is_under_dir(exe, portable_root)
+            || discover::find_kernel(portable_root, &settings)
+                .ok()
+                .flatten()
+                .is_some_and(|found| paths_match(exe, &found)))
+}
+
+fn is_under_dir(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(cp), Ok(cd)) => cp.starts_with(&cd),
+        _ => path.starts_with(dir),
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +427,19 @@ mod tests {
             },
         );
         assert!(is_authorized_helper_exe("my-core.exe", &custom_exe, &root));
+        let portable_kernel = root.join("core").join(platform::kernel_exe_name());
+        std::fs::create_dir_all(portable_kernel.parent().unwrap()).unwrap();
+        std::fs::write(&portable_kernel, b"core").unwrap();
+        assert!(is_authorized_helper_exe(
+            platform::kernel_exe_name(),
+            &portable_kernel,
+            &root
+        ));
+        assert!(!is_authorized_helper_exe(
+            platform::kernel_exe_name(),
+            Path::new("/tmp/untrusted/mihomo-evil"),
+            &root
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

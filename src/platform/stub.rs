@@ -7,9 +7,8 @@ pub fn kernel_exe_name() -> &'static str {
     "mihomo"
 }
 
-pub fn is_kernel_candidate_name(file_name: &str) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    lower == "mihomo" || lower.starts_with("mihomo-") || lower.starts_with("mihomo_")
+pub fn is_kernel_candidate_name(lower_name: &str) -> bool {
+    lower_name == "mihomo" || lower_name.starts_with("mihomo-") || lower_name.starts_with("mihomo_")
 }
 
 pub fn expand_env(value: &str) -> String {

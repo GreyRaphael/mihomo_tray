@@ -1,22 +1,37 @@
-//! Persisted toggle state and deferred restore tracking for [`super::Worker`].
+//! Persisted toggle state and unified restore tracking for [`super::Worker`].
 
 use std::path::Path;
 
 use crate::config::state_store::{self, PersistedState};
-use crate::platform;
 use crate::state::Snapshot;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingRestore {
+    Ready(PersistedState),
+    Deferred {
+        generation: u64,
+        state: PersistedState,
+    },
+}
+
+impl PendingRestore {
+    fn state(&self) -> &PersistedState {
+        match self {
+            Self::Ready(state) | Self::Deferred { state, .. } => state,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct StateSync {
-    pub persisted: Option<PersistedState>,
-    pub pending_restore: Option<PersistedState>,
-    pub pending_reload_restore: Option<PersistedState>,
+    persisted: Option<PersistedState>,
+    pending: Option<PendingRestore>,
 }
 
 impl StateSync {
     pub fn load_initial(&mut self, home_dir: &Path) {
         self.persisted = state_store::load(home_dir);
-        self.pending_restore = self.persisted.clone();
+        self.pending = self.persisted.clone().map(PendingRestore::Ready);
     }
 
     pub fn update(&mut self, home_dir: &Path, update: impl FnOnce(&mut PersistedState)) {
@@ -25,17 +40,13 @@ impl StateSync {
         state_store::save(home_dir, state);
     }
 
-    pub fn capture_live_or_persisted(&self, snap: &Snapshot) -> PersistedState {
-        if let Some(pending) = self
-            .pending_restore
-            .as_ref()
-            .or(self.pending_reload_restore.as_ref())
-        {
-            return pending.clone();
+    pub fn capture(&self, snap: &Snapshot, sysproxy: bool) -> PersistedState {
+        if let Some(pending) = &self.pending {
+            return pending.state().clone();
         }
         if snap.controller_ok {
             PersistedState {
-                system_proxy: platform::proxy_is_enabled(),
+                system_proxy: sysproxy,
                 mode: (!snap.mode.is_empty()).then(|| snap.mode.clone()),
                 tun: Some(snap.tun),
             }
@@ -45,7 +56,7 @@ impl StateSync {
     }
 
     pub fn sync_live_if_idle(&mut self, home_dir: &Path, sysproxy: bool, mode: &str, tun: bool) {
-        if self.pending_restore.is_some() || self.pending_reload_restore.is_some() {
+        if self.pending.is_some() {
             return;
         }
         let live = PersistedState {
@@ -58,31 +69,68 @@ impl StateSync {
         }
     }
 
-    pub fn set_pending_restore(&mut self, saved: PersistedState) {
-        self.pending_restore = Some(saved);
+    pub fn set_ready_restore(&mut self, saved: PersistedState) {
+        self.pending = Some(PendingRestore::Ready(saved));
     }
 
-    pub fn arm_reload_restore(&mut self, saved: PersistedState) {
-        self.pending_reload_restore = Some(saved);
+    pub fn defer_restore(&mut self, generation: u64, saved: PersistedState) {
+        self.pending = Some(PendingRestore::Deferred {
+            generation,
+            state: saved,
+        });
     }
 
-    pub fn promote_reload_restore(&mut self, should_restore: bool) {
-        let restore = self.pending_reload_restore.take();
-        if should_restore && restore.is_some() {
-            self.pending_restore = restore;
+    pub fn resolve_deferred(&mut self, generation: u64, should_restore: bool) {
+        if matches!(
+            self.pending,
+            Some(PendingRestore::Deferred { generation: g, .. }) if g == generation
+        ) {
+            self.pending = match self.pending.take() {
+                Some(PendingRestore::Deferred { state, .. }) if should_restore => {
+                    Some(PendingRestore::Ready(state))
+                }
+                _ => None,
+            };
         }
     }
 
-    pub fn take_pending_restore(&mut self) -> Option<PersistedState> {
-        self.pending_restore.take()
+    pub fn take_ready_restore(&mut self) -> Option<PersistedState> {
+        if matches!(self.pending, Some(PendingRestore::Ready(_))) {
+            match self.pending.take() {
+                Some(PendingRestore::Ready(state)) => Some(state),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
-    pub fn clear_pending_restore(&mut self) {
-        self.pending_restore = None;
+    pub fn clear_pending(&mut self) {
+        self.pending = None;
     }
 
     pub fn has_persisted_system_proxy(&self) -> bool {
         self.persisted.as_ref().is_some_and(|s| s.system_proxy)
+    }
+
+    #[cfg(test)]
+    pub(super) fn persisted(&self) -> Option<&PersistedState> {
+        self.persisted.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_persisted_for_test(&mut self, state: PersistedState) {
+        self.persisted = Some(state);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_ready_restore(&self) -> bool {
+        matches!(self.pending, Some(PendingRestore::Ready(_)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_deferred_restore(&self) -> bool {
+        matches!(self.pending, Some(PendingRestore::Deferred { .. }))
     }
 }
 
@@ -91,14 +139,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_prefers_pending_reload_restore_over_reset_snapshot() {
+    fn capture_prefers_deferred_restore_over_reset_snapshot() {
         let saved = PersistedState {
             system_proxy: true,
             mode: Some("global".to_string()),
             tun: Some(true),
         };
         let mut sync = StateSync::default();
-        sync.arm_reload_restore(saved.clone());
+        sync.defer_restore(1, saved.clone());
 
         let reset_snap = Snapshot {
             controller_ok: true,
@@ -106,10 +154,15 @@ mod tests {
             tun: false,
             ..Default::default()
         };
-        assert_eq!(sync.capture_live_or_persisted(&reset_snap), saved);
+        assert_eq!(sync.capture(&reset_snap, false), saved);
+        assert!(sync.take_ready_restore().is_none());
 
-        sync.promote_reload_restore(false);
-        assert!(sync.pending_restore.is_none());
-        assert!(sync.pending_reload_restore.is_none());
+        // Stale generation must not affect the current deferred state.
+        sync.resolve_deferred(0, false);
+        assert!(sync.has_deferred_restore());
+
+        sync.resolve_deferred(1, false);
+        assert!(!sync.has_ready_restore());
+        assert!(!sync.has_deferred_restore());
     }
 }

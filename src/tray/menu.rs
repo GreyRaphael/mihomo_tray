@@ -56,8 +56,7 @@ impl MenuFingerprint {
                 }
             }
         }
-        text::format_update_subscription_label(snap.subscription_updated_at(), now_unix)
-            .hash(&mut hasher);
+        text::subscription_age_bucket(snap.subscription_updated_at(), now_unix).hash(&mut hasher);
         snap.page_size.hash(&mut hasher);
         Self(hasher.finish())
     }

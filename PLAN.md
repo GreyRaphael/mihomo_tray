@@ -100,7 +100,9 @@ src/
 │   └── worker/           # Background polling & command execution thread
 │       ├── mod.rs
 │       ├── config_tracker.rs
-│       └── state_sync.rs
+│       ├── lifecycle.rs
+│       ├── state_sync.rs
+│       └── tasks.rs
 ├── tray/
 │   ├── mod.rs
 │   ├── icon.rs           # Procedural RGBA icon renderer (32x32, outer ring + center mode dot)
@@ -108,6 +110,7 @@ src/
 └── platform/
     ├── mod.rs            # Platform abstraction boundary + rustydialogs/arboard/auto-launch + #[cfg] dispatch
     ├── windows.rs        # Win10+ implementation (WinINet proxy, UAC helper, Scoop shim, GUI menu probe)
+    ├── win_helpers.rs    # Pure Windows helper logic (testable on non-Windows hosts)
     └── stub.rs           # Non-Windows fallback/scaffold for host testing & future Linux/macOS
 ```
 

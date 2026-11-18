@@ -6,10 +6,10 @@ use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../assets/config.sample.yaml");
-const SUBSCRIPTION_PROVIDER_NAME: &str = "subscription";
+pub(crate) const SUBSCRIPTION_PROVIDER_NAME: &str = "subscription";
 const SUBSCRIPTION_INTERVAL_SECS: u64 = 43_200; // 12 hours
-const SUBSCRIPTION_LOCAL_PATH: &str = "./providers/subscription.yaml";
-const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
+pub(crate) const SUBSCRIPTION_LOCAL_PATH: &str = "./providers/subscription.yaml";
+pub(crate) const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MihomoConfigInfo {

@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use ureq::{Agent, RequestBuilder};
 
+use crate::config::mihomo::HEALTH_CHECK_URL;
 use crate::config::tray::{CONTROLLER_TIMEOUT_MAX_MS, CONTROLLER_TIMEOUT_MIN_MS};
 use crate::state::{Group, Provider};
 
@@ -18,10 +19,10 @@ const RELOAD_HTTP_TIMEOUT_MS: u64 = 45_000;
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    pub host: String,
-    pub port: u16,
-    pub secret: String,
-    pub timeout_ms: u32,
+    host: String,
+    pub(crate) port: u16,
+    pub(crate) secret: String,
+    timeout_ms: u32,
     agent: Agent,
 }
 
@@ -81,13 +82,15 @@ impl Client {
         if trimmed.is_empty() {
             return Err(ClientError::InvalidAddress);
         }
-        if trimmed.to_ascii_lowercase().starts_with("https://") {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("https://") {
             return Err(ClientError::TlsUnsupported);
         }
-        let without_scheme = trimmed
-            .strip_prefix("http://")
-            .or_else(|| trimmed.strip_prefix("HTTP://"))
-            .unwrap_or(trimmed);
+        let without_scheme = if lower.starts_with("http://") {
+            &trimmed[7..]
+        } else {
+            trimmed
+        };
         let authority = without_scheme.split('/').next().unwrap_or("").trim();
         let (host, port) = parse_host_port(authority).ok_or(ClientError::InvalidAddress)?;
         let agent: Agent = Agent::config_builder()
@@ -104,12 +107,16 @@ impl Client {
         })
     }
 
-    pub fn base_url(&self) -> String {
+    fn host_for_url(&self) -> String {
         if self.host.contains(':') && !self.host.starts_with('[') {
-            format!("http://[{}]:{}", self.host, self.port)
+            format!("[{}]", self.host)
         } else {
-            format!("http://{}:{}", self.host, self.port)
+            self.host.clone()
         }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}:{}", self.host_for_url(), self.port)
     }
 
     pub fn format_web_ui_url(&self, template: &str) -> String {
@@ -120,11 +127,7 @@ impl Client {
             tpl
         };
         let encoded_secret = percent_encode(&self.secret);
-        let host_for_url = if self.host.contains(':') && !self.host.starts_with('[') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
+        let host_for_url = self.host_for_url();
         effective
             .replace("{host}", &host_for_url)
             .replace("{port}", &self.port.to_string())
@@ -276,7 +279,7 @@ impl Client {
         let path = format!(
             "/group/{}/delay?timeout={DELAY_QUERY_TIMEOUT_MS}&url={}",
             percent_encode(group),
-            percent_encode("https://www.gstatic.com/generate_204")
+            percent_encode(HEALTH_CHECK_URL)
         );
         self.get_json(&path, DELAY_HTTP_TIMEOUT_MS).map(|_| ())
     }

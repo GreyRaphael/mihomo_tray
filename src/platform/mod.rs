@@ -21,7 +21,10 @@ pub const AFTER_RESTART_FLAG: &str = "--after-restart";
 /// Returns the directory containing the portable layout.
 /// On Windows, this is the directory containing `mihomo-tray.exe`.
 pub fn portable_root() -> PathBuf {
-    imp::portable_root()
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Default kernel executable filename for this OS (`mihomo.exe` on Windows, `mihomo` on Unix).

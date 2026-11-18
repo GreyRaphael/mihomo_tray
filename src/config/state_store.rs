@@ -25,26 +25,7 @@ pub fn load(home_dir: &Path) -> Option<PersistedState> {
 }
 
 pub fn save(home_dir: &Path, state: &PersistedState) {
-    let path = state_path(home_dir);
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(
-            "Failed to create state directory {}: {err}",
-            parent.display()
-        );
-        return;
-    }
-    match serde_json::to_string_pretty(state) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
-                tracing::warn!("Failed to write {}: {err}", path.display());
-            }
-        }
-        Err(err) => {
-            tracing::warn!("Failed to serialize persisted state: {err}");
-        }
-    }
+    crate::config::write_json_pretty(&state_path(home_dir), state);
 }
 
 #[cfg(test)]

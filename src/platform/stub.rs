@@ -3,13 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-pub fn portable_root() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 pub fn kernel_exe_name() -> &'static str {
     "mihomo"
 }

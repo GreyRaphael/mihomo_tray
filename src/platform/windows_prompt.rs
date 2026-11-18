@@ -227,8 +227,6 @@ unsafe fn create_prompt_window(
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(prompt_wnd_proc),
         hInstance: hinstance,
-        hIcon: unsafe { load_app_icon(hinstance, 32, 32) },
-        hIconSm: unsafe { load_app_icon(hinstance, 16, 16) },
         hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
         lpszClassName: class_name.as_ptr(),
         hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },

@@ -38,24 +38,7 @@ pub fn runtime_record_path(home_dir: &Path) -> PathBuf {
 }
 
 pub fn save_runtime_record(home_dir: &Path, record: &RuntimeRecord) {
-    let path = runtime_record_path(home_dir);
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(
-            "Failed to create runtime directory {}: {err}",
-            parent.display()
-        );
-        return;
-    }
-    match serde_json::to_string_pretty(record) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
-                tracing::warn!("Failed to write {}: {err}", path.display());
-            }
-        }
-        Err(err) => tracing::warn!("Failed to serialize runtime record: {err}"),
-    }
+    crate::config::write_json_pretty(&runtime_record_path(home_dir), record);
 }
 
 pub fn load_runtime_record(home_dir: &Path) -> Option<RuntimeRecord> {

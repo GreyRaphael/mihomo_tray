@@ -352,12 +352,17 @@ fn append_member_item(
 ) {
     let label = text::format_node_label(member, delay);
     let selected = member == group.now;
-    let id = recorder.next_id(MenuAction::SelectProxy {
-        group: group.name.clone(),
-        member: member.to_string(),
-    });
-    let item = CheckMenuItem::with_id(id, label, group.switchable, selected, None);
-    let _ = target.append(&item);
+    append_check_item(
+        target,
+        recorder,
+        &label,
+        group.switchable,
+        selected,
+        MenuAction::SelectProxy {
+            group: group.name.clone(),
+            member: member.to_string(),
+        },
+    );
 }
 
 fn append_open_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRecorder) {

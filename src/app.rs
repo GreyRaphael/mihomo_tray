@@ -178,19 +178,13 @@ impl MihomoTrayApp {
                     .unwrap()
                     .resolved_config
                     .clone()
-                    .unwrap_or_else(|| self.portable_root.join("config"));
-                let open_path = if target.exists() {
-                    target
-                } else {
-                    target
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| self.portable_root.clone())
-                };
-                if !open_path.exists() {
-                    let _ = std::fs::create_dir_all(&open_path);
-                }
-                self.open_target(&open_path.display().to_string());
+                    .unwrap_or_else(|| {
+                        self.portable_root
+                            .join("config")
+                            .join(crate::text::MIHOMO_CONFIG_NAME)
+                    });
+                mihomo::ensure_default_config(&target);
+                self.open_target(&target.display().to_string());
             }
             MenuAction::OpenPortableDir => {
                 self.open_target(&self.portable_root.display().to_string());

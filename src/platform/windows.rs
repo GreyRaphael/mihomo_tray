@@ -38,13 +38,6 @@ pub use super::windows_prompt::{
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const SCOOP_SHIM_MAX_BYTES: u64 = 64 * 1024;
 
-pub fn portable_root() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 pub fn kernel_exe_name() -> &'static str {
     "mihomo.exe"
 }
@@ -222,44 +215,22 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     }
 }
 
-pub fn notify_error(title: &str, message: &str) {
+fn message_box(title: &str, message: &str, flags: u32) -> i32 {
     let title_w = wide(title);
     let msg_w = wide(message);
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            msg_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
-    }
+    unsafe { MessageBoxW(std::ptr::null_mut(), msg_w.as_ptr(), title_w.as_ptr(), flags) }
+}
+
+pub fn notify_error(title: &str, message: &str) {
+    message_box(title, message, MB_OK | MB_ICONERROR);
 }
 
 pub fn notify_info(title: &str, message: &str) {
-    let title_w = wide(title);
-    let msg_w = wide(message);
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            msg_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
+    message_box(title, message, MB_OK | MB_ICONINFORMATION);
 }
 
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
-    let title_w = wide(title);
-    let msg_w = wide(message);
-    let res = unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            msg_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-        )
-    };
-    res == IDYES
+    message_box(title, message, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
 }
 
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {

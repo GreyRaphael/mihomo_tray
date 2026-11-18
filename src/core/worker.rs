@@ -738,12 +738,16 @@ impl Worker {
             if let Some(client) = &self.client
                 && client.probe().is_ok()
             {
-                let sub_cache = self.home_dir.join("providers").join("subscription.yaml");
+                let sub_cache = self
+                    .home_dir
+                    .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
                 let had_cached_sub = sub_cache.is_file();
                 client.reload_configs()?;
                 self.pending_restore = Some(saved);
+                // When no cache existed before, `reload_configs` already fetched the new provider;
+                // only force a provider refresh if replacing an existing cache or if reload didn't create it.
                 if had_cached_sub || !sub_cache.is_file() {
-                    client.refresh_provider("subscription")?;
+                    client.refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)?;
                 }
                 return Ok(());
             }

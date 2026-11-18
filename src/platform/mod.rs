@@ -135,49 +135,41 @@ pub fn try_run_helper(
     }
 }
 
-fn can_show_rfd_dialog() -> bool {
+fn can_show_dialog() -> bool {
     #[cfg(any(windows, target_os = "macos"))]
     {
         true
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
-            && which::which("zenity").is_ok()
-    }
-}
-
-fn can_show_text_input() -> bool {
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        true
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
-            && (std::env::var_os("RUSTY_DIALOGS_BACKEND").is_some()
-                || which::which("kdialog").is_ok()
-                || which::which("zenity").is_ok())
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return false;
+        }
+        if let Ok(backend) = std::env::var("RUSTY_DIALOGS_BACKEND") {
+            return matches!(backend.as_str(), "kdialog" | "zenity")
+                && which::which(&backend).is_ok();
+        }
+        which::which("kdialog").is_ok() || which::which("zenity").is_ok()
     }
 }
 
 fn show_message_dialog(
-    level: rfd::MessageLevel,
+    icon: rustydialogs::MessageIcon,
     title: &str,
     message: &str,
-    buttons: rfd::MessageButtons,
-) -> Option<rfd::MessageDialogResult> {
-    if !can_show_rfd_dialog() {
+    buttons: rustydialogs::MessageButtons,
+) -> Option<rustydialogs::MessageResult> {
+    if !can_show_dialog() {
         return None;
     }
-    Some(
-        rfd::MessageDialog::new()
-            .set_level(level)
-            .set_title(title)
-            .set_description(message)
-            .set_buttons(buttons)
-            .show(),
-    )
+    rustydialogs::MessageBox {
+        title,
+        message,
+        icon,
+        buttons,
+        owner: None,
+    }
+    .show()
 }
 
 /// Displays a blocking modal notice/error box to the user on desktop platforms.
@@ -186,10 +178,10 @@ pub fn notify_error(title: &str, message: &str) {
     tracing::error!("{title}: {message}");
 
     let _ = show_message_dialog(
-        rfd::MessageLevel::Error,
+        rustydialogs::MessageIcon::Error,
         title,
         message,
-        rfd::MessageButtons::Ok,
+        rustydialogs::MessageButtons::Ok,
     );
 }
 
@@ -199,21 +191,25 @@ pub fn notify_info(title: &str, message: &str) {
     tracing::info!("{title}: {message}");
 
     let _ = show_message_dialog(
-        rfd::MessageLevel::Info,
+        rustydialogs::MessageIcon::Info,
         title,
         message,
-        rfd::MessageButtons::Ok,
+        rustydialogs::MessageButtons::Ok,
     );
 }
 
 /// Displays a blocking modal confirmation (Yes/No) returning `true` only on Yes.
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
+    if !can_show_dialog() {
+        tracing::warn!("Confirmation dialog skipped (no native backend): {title}: {message}");
+        return false;
+    }
     show_message_dialog(
-        rfd::MessageLevel::Warning,
+        rustydialogs::MessageIcon::Warning,
         title,
         message,
-        rfd::MessageButtons::YesNo,
-    ) == Some(rfd::MessageDialogResult::Yes)
+        rustydialogs::MessageButtons::YesNo,
+    ) == Some(rustydialogs::MessageResult::Yes)
 }
 
 /// Writes UTF-8 text to the OS clipboard.
@@ -259,7 +255,7 @@ pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
     }
     let _guard = PromptGuard;
 
-    if !can_show_text_input() {
+    if !can_show_dialog() {
         tracing::warn!("No native text input backend available on this system");
         return None;
     }

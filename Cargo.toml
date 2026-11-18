@@ -12,7 +12,6 @@ auto-launch = "0.6"
 file-rotate = "0.8"
 open = "5.4"
 percent-encoding = "2.3"
-rfd = "0.18"
 rustydialogs = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -30,7 +29,6 @@ winit = "0.30"
 yaml-edit = { version = "0.3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-rfd = { version = "0.18", features = ["common-controls-v6"] }
 tray-icon = { version = "0.26", default-features = false, features = ["muda-common-controls-v6"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

@@ -38,7 +38,6 @@ pub struct MihomoTrayApp {
     last_menu_fingerprint: Option<MenuFingerprint>,
     pending_menu_rebuild: bool,
     last_click: Option<Instant>,
-    has_gui_open_error: bool,
     version_dialog_open: Arc<AtomicBool>,
     prompt_dialog_open: Arc<AtomicBool>,
     quitting: bool,
@@ -72,7 +71,6 @@ impl MihomoTrayApp {
             last_menu_fingerprint: None,
             pending_menu_rebuild: false,
             last_click: None,
-            has_gui_open_error: false,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             prompt_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
@@ -365,28 +363,24 @@ impl MihomoTrayApp {
         self.apply_snapshot(true);
     }
 
-    fn open_web_ui(&mut self) {
+    fn open_web_ui(&self) {
         let url = self.shared.lock().unwrap().web_ui_url.clone();
         if let Some(url) = url {
             self.open_target(&url);
         }
     }
 
-    fn open_target(&mut self, target: impl AsRef<std::ffi::OsStr>) {
+    fn open_target(&self, target: impl AsRef<std::ffi::OsStr>) {
         let target = target.as_ref();
-        match open::that_detached(target) {
-            Ok(()) => {
-                if self.has_gui_open_error {
-                    self.has_gui_open_error = false;
-                    self.send_worker(WorkerCommand::GuiOpenResult(Ok(())));
-                }
-            }
-            Err(err) => {
-                let display = target.to_string_lossy();
-                let msg = crate::text::format_open_target_failed(&display, &err);
-                self.has_gui_open_error = true;
-                self.send_worker(WorkerCommand::GuiOpenResult(Err(msg)));
-            }
+        if let Err(err) = open::that_detached(target) {
+            let display = target.to_string_lossy();
+            let msg = crate::text::format_open_target_failed(&display, &err);
+            tracing::warn!("{msg}");
+            let _ = std::thread::Builder::new()
+                .name("open-err-dialog".to_string())
+                .spawn(move || {
+                    platform::notify_error(crate::text::APP_NAME, &msg);
+                });
         }
     }
 

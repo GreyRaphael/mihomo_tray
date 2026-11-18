@@ -28,37 +28,23 @@ use crate::platform;
 use crate::state::{self, AppEvent, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand};
 use crate::text;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActionErrorKind {
-    TransientWait,
-    GuiOpen,
-    General,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActionError {
-    pub kind: ActionErrorKind,
+    pub transient_wait: bool,
     pub message: String,
 }
 
 impl ActionError {
     pub fn general(message: impl Into<String>) -> Self {
         Self {
-            kind: ActionErrorKind::General,
+            transient_wait: false,
             message: message.into(),
         }
     }
 
     pub fn transient_wait(message: impl Into<String>) -> Self {
         Self {
-            kind: ActionErrorKind::TransientWait,
-            message: message.into(),
-        }
-    }
-
-    pub fn gui_open(message: impl Into<String>) -> Self {
-        Self {
-            kind: ActionErrorKind::GuiOpen,
+            transient_wait: true,
             message: message.into(),
         }
     }
@@ -79,7 +65,6 @@ impl std::fmt::Display for ActionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandOutcome {
     ClearError,
-    ClearKind(ActionErrorKind),
     KeepError,
 }
 
@@ -260,14 +245,6 @@ impl Worker {
                                 burst_error = None;
                                 outcome = CommandOutcome::ClearError;
                             }
-                            Ok(CommandOutcome::ClearKind(kind)) => {
-                                if burst_error.as_ref().is_some_and(|e| e.kind == kind) {
-                                    burst_error = None;
-                                }
-                                if self.action_error.as_ref().is_some_and(|e| e.kind == kind) {
-                                    outcome = CommandOutcome::ClearError;
-                                }
-                            }
                             Ok(CommandOutcome::KeepError) => {}
                             Err(err) => burst_error = Some(err),
                         }
@@ -362,10 +339,6 @@ impl Worker {
                 let res = platform::autostart_set(!enabled);
                 self.cfg.refresh_autostart_cache();
                 Ok(res.map(|()| CommandOutcome::ClearError)?)
-            }
-            WorkerCommand::GuiOpenResult(Err(err)) => Err(ActionError::gui_open(err)),
-            WorkerCommand::GuiOpenResult(Ok(())) => {
-                Ok(CommandOutcome::ClearKind(ActionErrorKind::GuiOpen))
             }
             WorkerCommand::AsyncDone { kind, error } => self.handle_async_done(kind, error),
             WorkerCommand::Quit { .. } => unreachable!("Quit is handled directly in Worker::run"),
@@ -616,7 +589,7 @@ impl Worker {
             if self
                 .action_error
                 .as_ref()
-                .is_some_and(|e| e.kind == ActionErrorKind::TransientWait)
+                .is_some_and(|e| e.transient_wait)
             {
                 self.action_error = None;
             }
@@ -1183,79 +1156,6 @@ mod tests {
             .unwrap()
             .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
         server.join().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn gui_open_result_sets_and_clears_only_matching_action_error() {
-        let root = crate::config::test_temp_dir("worker_gui_open_err");
-        let mut settings = TraySettings::default();
-        settings.mihomo.auto_start = false;
-        let (mut worker, rx, shared) = test_worker(&root, settings, None);
-
-        let err = worker
-            .handle_command(WorkerCommand::GuiOpenResult(Err("open failed".to_string())))
-            .unwrap_err();
-        worker.set_action_error(Some(err));
-        assert_eq!(
-            shared.lock().unwrap().action_error.as_deref(),
-            Some("open failed")
-        );
-
-        // If an unrelated error replaced it, GuiOpenResult(Ok) must not clear the unrelated error.
-        worker.set_action_error(Some(ActionError::general("other error")));
-        assert_eq!(
-            worker
-                .handle_command(WorkerCommand::GuiOpenResult(Ok(())))
-                .unwrap(),
-            CommandOutcome::ClearKind(ActionErrorKind::GuiOpen)
-        );
-        assert_eq!(
-            shared.lock().unwrap().action_error.as_deref(),
-            Some("other error")
-        );
-
-        // Same-burst GuiOpenResult(Err) followed by GuiOpenResult(Ok) must cancel itself out
-        // without clobbering the preexisting unrelated "other error".
-        worker
-            .tx
-            .send(WorkerCommand::GuiOpenResult(Err(
-                "open failed 2".to_string()
-            )))
-            .unwrap();
-        worker
-            .tx
-            .send(WorkerCommand::GuiOpenResult(Ok(())))
-            .unwrap();
-        worker
-            .tx
-            .send(WorkerCommand::Quit { interactive: false })
-            .unwrap();
-        worker.run(&rx);
-        assert_eq!(
-            shared.lock().unwrap().action_error.as_deref(),
-            Some("other error")
-        );
-
-        // When no unrelated error is active, same-burst Err -> Ok ends cleanly with None.
-        worker.set_action_error(None);
-        worker
-            .tx
-            .send(WorkerCommand::GuiOpenResult(Err(
-                "open failed 3".to_string()
-            )))
-            .unwrap();
-        worker
-            .tx
-            .send(WorkerCommand::GuiOpenResult(Ok(())))
-            .unwrap();
-        worker
-            .tx
-            .send(WorkerCommand::Quit { interactive: false })
-            .unwrap();
-        worker.run(&rx);
-        assert_eq!(shared.lock().unwrap().action_error, None);
-
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -192,7 +192,6 @@ pub enum WorkerCommand {
     CopyEnvVars,
     RestartCore,
     ToggleAutostart,
-    GuiOpenResult(Result<(), String>),
     AsyncDone {
         kind: AsyncTaskKind,
         error: Option<String>,

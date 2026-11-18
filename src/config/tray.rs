@@ -12,7 +12,7 @@ pub(crate) const CONTROLLER_TIMEOUT_MAX_MS: u32 = 30_000;
 const MAX_PAGE_SIZE: usize = 1000;
 const DEFAULT_SAMPLE: &str = include_str!("../../assets/tray.sample.yml");
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TraySettings {
     pub mihomo: MihomoSettings,
@@ -22,7 +22,7 @@ pub struct TraySettings {
     pub ui: UiSettings,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MihomoSettings {
     pub path: String,
@@ -44,7 +44,7 @@ impl Default for MihomoSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControllerSettings {
     pub address: String,
@@ -62,13 +62,13 @@ impl Default for ControllerSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ProxySettings {
     pub bypass: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct GroupsSettings {
     pub order: Vec<String>,
@@ -77,7 +77,7 @@ pub struct GroupsSettings {
     pub page_size: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
     pub external_ui: String,

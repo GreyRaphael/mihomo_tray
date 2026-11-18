@@ -150,7 +150,7 @@ impl KernelRuntime {
 
 impl Worker {
     pub(super) fn re_resolve_controller(&mut self, running: &[RunningProcess]) {
-        match discover::resolve_controller(self.cfg.settings(), running, self.cfg.config_file()) {
+        match discover::resolve_controller(&self.cfg.settings, running, &self.cfg.config_file) {
             Ok(client) => {
                 self.client = Some(client);
                 self.last_controller_error = None;
@@ -186,26 +186,31 @@ impl Worker {
         }
 
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
-        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        let running = self
+            .kernel
+            .list_running(self.cfg.known_kernel_path.as_deref());
         let tracked_pid = self
             .kernel
-            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
-        let target =
-            process::pick_target_process(&running, tracked_pid, self.cfg.known_kernel_path())
-                .ok_or_else(|| ActionError::general(text::ERR_LOCATE_ELEVATE_PROCESS))?
-                .clone();
+            .active_pid(self.cfg.known_kernel_path.as_deref(), &self.cfg.home_dir);
+        let target = process::pick_target_process(
+            &running,
+            tracked_pid,
+            self.cfg.known_kernel_path.as_deref(),
+        )
+        .ok_or_else(|| ActionError::general(text::ERR_LOCATE_ELEVATE_PROCESS))?
+        .clone();
 
         let kernel_path = target
             .exe
             .clone()
-            .or_else(|| self.cfg.known_kernel_path().map(ToOwned::to_owned));
+            .or_else(|| self.cfg.known_kernel_path.clone());
         let launch_args = resolve_elevation_launch_args(
             tracked_pid == Some(target.pid),
             &target.cmd,
-            self.cfg.portable_root(),
-            self.cfg.settings(),
-            self.cfg.home_dir(),
-            self.cfg.config_file(),
+            &self.cfg.portable_root,
+            &self.cfg.settings,
+            &self.cfg.home_dir,
+            &self.cfg.config_file,
         )?;
         let before_pids: HashSet<u32> = running.iter().map(|p| p.pid).collect();
 
@@ -235,14 +240,16 @@ impl Worker {
         }
 
         self.cached_version.clear();
-        let after_running = self
-            .kernel
-            .list_running(kernel_path.as_deref().or(self.cfg.known_kernel_path()));
+        let after_running = self.kernel.list_running(
+            kernel_path
+                .as_deref()
+                .or(self.cfg.known_kernel_path.as_deref()),
+        );
         let Some(spawned) =
             process::pick_spawned_process(&after_running, &before_pids, kernel_path.as_deref())
                 .cloned()
         else {
-            self.kernel.clear_dead(self.cfg.home_dir());
+            self.kernel.clear_dead(&self.cfg.home_dir);
             return Err(ActionError::transient_wait(
                 text::ERR_CORE_STOPPED_UNEXPECTEDLY,
             ));
@@ -250,7 +257,7 @@ impl Worker {
 
         let resolved_exe = spawned.exe.clone().or(kernel_path);
         self.kernel
-            .record_elevated(spawned.pid, self.cfg.home_dir(), resolved_exe.as_deref());
+            .record_elevated(spawned.pid, &self.cfg.home_dir, resolved_exe.as_deref());
 
         let cmd = if spawned.cmd.is_empty() {
             synthetic_argv(resolved_exe.as_deref(), &launch_args)
@@ -281,31 +288,40 @@ impl Worker {
 
     pub(super) fn start_core_internal(&mut self) -> Result<(), ActionError> {
         self.reload_paths_and_runtime();
-        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        let running = self
+            .kernel
+            .list_running(self.cfg.known_kernel_path.as_deref());
         let active_pid = self
             .kernel
-            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
-        if process::pick_target_process(&running, active_pid, self.cfg.known_kernel_path())
-            .is_some()
+            .active_pid(self.cfg.known_kernel_path.as_deref(), &self.cfg.home_dir);
+        if process::pick_target_process(
+            &running,
+            active_pid,
+            self.cfg.known_kernel_path.as_deref(),
+        )
+        .is_some()
         {
             self.re_resolve_controller(&running);
             return Ok(());
         }
 
-        let kernel_path = match (self.cfg.known_kernel_path(), self.cfg.kernel_path_error()) {
-            (Some(path), _) => path.to_path_buf(),
+        let kernel_path = match (
+            self.cfg.known_kernel_path.as_ref(),
+            self.cfg.kernel_path_error.as_deref(),
+        ) {
+            (Some(path), _) => path.clone(),
             (None, Some(err)) => return Err(ActionError::general(err)),
             (None, None) => return Err(ActionError::general(text::ERR_CORE_NOT_FOUND)),
         };
 
-        let _ = std::fs::create_dir_all(self.cfg.home_dir());
-        mihomo::ensure_default_config(self.cfg.config_file());
+        let _ = std::fs::create_dir_all(&self.cfg.home_dir);
+        mihomo::ensure_default_config(&self.cfg.config_file);
 
         let args = discover::build_launch_args_for_paths(
-            self.cfg.portable_root(),
-            self.cfg.settings(),
-            self.cfg.home_dir(),
-            self.cfg.config_file(),
+            &self.cfg.portable_root,
+            &self.cfg.settings,
+            &self.cfg.home_dir,
+            &self.cfg.config_file,
         )?;
 
         self.set_status_note(Some(text::STATUS_STARTING_CORE));
@@ -318,7 +334,7 @@ impl Worker {
         };
         let pid = self
             .kernel
-            .record_managed(child, self.cfg.home_dir(), &kernel_path);
+            .record_managed(child, &self.cfg.home_dir, &kernel_path);
         self.cached_version.clear();
 
         let cmd = synthetic_argv(Some(&kernel_path), &args);
@@ -332,7 +348,9 @@ impl Worker {
     }
 
     pub(super) fn force_restart_core(&mut self) -> Result<(), ActionError> {
-        let running = self.kernel.list_running(self.cfg.known_kernel_path());
+        let running = self
+            .kernel
+            .list_running(self.cfg.known_kernel_path.as_deref());
         self.force_restart_with_running(running)
     }
 
@@ -397,19 +415,24 @@ impl Worker {
         interactive: bool,
         prefetched: Option<Vec<RunningProcess>>,
     ) -> Result<StopOutcome, String> {
-        if self.kernel.kill_managed_if_running(self.cfg.home_dir()) {
+        if self.kernel.kill_managed_if_running(&self.cfg.home_dir) {
             self.cached_version.clear();
             return Ok(StopOutcome::Stopped);
         }
 
-        let running =
-            prefetched.unwrap_or_else(|| self.kernel.list_running(self.cfg.known_kernel_path()));
+        let running = prefetched.unwrap_or_else(|| {
+            self.kernel
+                .list_running(self.cfg.known_kernel_path.as_deref())
+        });
         let active_pid = self
             .kernel
-            .active_pid(self.cfg.known_kernel_path(), self.cfg.home_dir());
-        let tracked_target =
-            process::pick_target_process(&running, active_pid, self.cfg.known_kernel_path())
-                .cloned();
+            .active_pid(self.cfg.known_kernel_path.as_deref(), &self.cfg.home_dir);
+        let tracked_target = process::pick_target_process(
+            &running,
+            active_pid,
+            self.cfg.known_kernel_path.as_deref(),
+        )
+        .cloned();
         let target = match tracked_target {
             Some(found) => found,
             None => {
@@ -455,7 +478,7 @@ impl Worker {
     }
 
     fn clear_running_tracking(&mut self) {
-        self.kernel.clear_tracking(self.cfg.home_dir());
+        self.kernel.clear_tracking(&self.cfg.home_dir);
         self.cached_version.clear();
     }
 
@@ -475,7 +498,7 @@ impl Worker {
                     text::ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN,
                 ));
             }
-            if self.kernel.try_wait_managed_exited(self.cfg.home_dir()) {
+            if self.kernel.try_wait_managed_exited(&self.cfg.home_dir) {
                 self.cached_version.clear();
                 break Err(ActionError::transient_wait(
                     text::ERR_CORE_STOPPED_UNEXPECTEDLY,
@@ -646,8 +669,6 @@ mod tests {
     #[test]
     fn force_restart_declining_external_stop_preserves_deferred_restore_and_tasks() {
         let root = crate::config::test_temp_dir("worker_restart_preserve");
-        let settings_path = crate::config::tray::settings_path(&root);
-        std::fs::write(&settings_path, "").unwrap();
         let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
         let saved = crate::config::state_store::PersistedState {
             system_proxy: true,
@@ -658,13 +679,8 @@ mod tests {
         worker.sub_tasks.invalidate();
         worker.latency_tasks.begin();
 
-        // Simulate runtime tray.yml change while external core is running.
-        std::fs::write(&settings_path, "mihomo:\n  home: ./alt-home\n").unwrap();
-        worker.cfg.invalidate_settings_mtime();
-        let _ = worker.cfg.poll_changes(true);
-
         // Declining external stop in force_restart_with_running must preserve deferred restore,
-        // active latency task, and deferred config paths.
+        // active latency task, and current config paths.
         worker
             .force_restart_with_running(vec![RunningProcess {
                 pid: 999_991,
@@ -674,7 +690,7 @@ mod tests {
             .unwrap();
         assert!(worker.state_sync.has_deferred_restore());
         assert!(worker.latency_tasks.is_active());
-        assert_eq!(worker.cfg.home_dir(), root.join("config"));
+        assert_eq!(worker.cfg.home_dir, root.join("config"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

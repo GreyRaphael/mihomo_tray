@@ -215,7 +215,7 @@ impl Worker {
     fn spawn_apply_subscription_reload(&mut self, client: Client, generation: u64) {
         let sub_cache = self
             .cfg
-            .home_dir()
+            .home_dir
             .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
         self.sub_tasks.activate_chained_apply(generation);
         if !self.spawn_background_task(
@@ -261,7 +261,7 @@ impl Worker {
 
     pub(super) fn set_subscription_url(&mut self, url: &str) -> Result<(), ActionError> {
         let saved = self.capture_live_or_persisted_state();
-        mihomo::apply_subscription_url(self.cfg.config_file(), url)?;
+        mihomo::apply_subscription_url(&self.cfg.config_file, url)?;
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
             let (generation, spawn_now) = self.sub_tasks.begin_or_queue_apply();
             self.state_sync.defer_restore(generation, saved);
@@ -455,7 +455,7 @@ mod tests {
         worker.apply_pending_restore_if_needed(&mut mid_cfg);
         worker
             .state_sync
-            .sync_live_if_idle(worker.cfg.home_dir(), false, "rule", false);
+            .sync_live_if_idle(&worker.cfg.home_dir, false, "rule", false);
         assert_eq!(
             worker
                 .state_sync

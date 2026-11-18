@@ -13,9 +13,15 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 
 ### 本次更新（{{TAG}}）
 
-- **新增 `binance` 二进制规则集与 `🚑Fallback` 专线分流**：
-  - 在默认 `config/config.yaml` 的 `rule-providers` 中新增 `binance`（`MetaCubeX/meta-rules-dat` `binance.mrs`，24h 自动更新），并在 `rules` 中紧接 `ai` 规则后配置 `- RULE-SET,binance,🚑Fallback`，使 Binance 相关域名优先通过自动故障转移策略组 `🚑Fallback` 稳定代理。
-  - 在 GitHub Release 打包流程中预下载 `./config/rules/binance.mrs` 随压缩包一同分发，并补充配置单测校验；沿用 `v0.3.4` 的国内加密 DoH + `GEOIP,CN,DIRECT,no-resolve` 与 `Update Subscription` 相对时间菜单交互。
+- **无损配置与单实例 / 日志轮转加固**：
+  - 引入 `yaml-edit` 无损更新 `config.yaml` 订阅配置，保留用户原有注释与缩进格式，并防止误覆盖非 UTF-8 或暂时不可读配置文件；
+  - 改为全局单实例互斥锁并在持锁后初始化 `2 MB` 自动轮转日志（`file-rotate`），支持 `Restart Application` 平滑重拉与外部核心 `-f` 配置自动识别。
+- **TUN UAC 自提权链路与系统代理稳定性提升**：
+  - 完善按需 UAC 自提权（`--elevate-start` / `--elevate-stop`）：支持自定义内核路径与 `CommandLineToArgvW` 安全引号转义、提权目标白名单校验、提权后二次下发校验 TUN 并自动恢复路由模式；
+  - 合并写入 Windows `ProxyOverride`（保留用户已有规则与 `<local>`），控制器 HTTP 客户端禁用系统代理防止自环，修复核心异常退出/控制器未配置时的状态污染与空等。
+- **托盘菜单交互稳定化与内部架构精简**：
+  - 通过 `BTreeMap` 稳定化 + `MenuFingerprint` 哈希指纹 + 代际菜单 ID（`act_{generation}_{index}`）与弹出菜单防打断延迟重建，消除菜单闪烁与跨代误触；
+  - 异步化慢速测速与订阅重载并简化 `worker` / `CoreLifecycle` 架构边界，统一使用 `rustydialogs` / `arboard` / `which` / `url` / `time` 等成熟生态组件。
 
 ---
 

@@ -99,10 +99,8 @@ src/
 │   ├── process.rs        # .runtime.json lockfile + sysinfo process picking & termination
 │   └── worker/           # Background polling & command execution thread
 │       ├── mod.rs
-│       ├── config_tracker.rs
 │       ├── lifecycle.rs
-│       ├── state_sync.rs
-│       └── tasks.rs
+│       └── state_sync.rs
 ├── tray/
 │   ├── mod.rs
 │   ├── icon.rs           # Procedural RGBA icon renderer (32x32, outer ring + center mode dot)

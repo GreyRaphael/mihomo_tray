@@ -180,11 +180,13 @@ impl Worker {
             set_res?;
             return Ok(());
         }
-        let previous_mode = after.mode;
         if let Err(err) = &set_res {
             tracing::info!("Non-elevated set_tun(true) failed ({err}); attempting UAC elevation");
         }
+        self.elevate_and_enable_tun(&after.mode)
+    }
 
+    fn elevate_and_enable_tun(&mut self, previous_mode: &str) -> Result<(), ActionError> {
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
         let running = self
             .kernel
@@ -275,10 +277,10 @@ impl Worker {
         let tun_res = verify_or_enable_tun_after_elevation(&elevated_client);
         let needs_mode_restore = !previous_mode.is_empty()
             && match &tun_res {
-                Ok(cfg) => !cfg.mode.eq_ignore_ascii_case(&previous_mode),
+                Ok(cfg) => !cfg.mode.eq_ignore_ascii_case(previous_mode),
                 Err(_) => true,
             };
-        if needs_mode_restore && let Err(err) = elevated_client.set_mode(&previous_mode) {
+        if needs_mode_restore && let Err(err) = elevated_client.set_mode(previous_mode) {
             tracing::warn!(
                 "Failed to restore proxy mode '{previous_mode}' after TUN elevation: {err}"
             );
@@ -294,12 +296,8 @@ impl Worker {
         let active_pid = self
             .kernel
             .active_pid(self.cfg.known_kernel_path.as_deref(), &self.cfg.home_dir);
-        if process::pick_target_process(
-            &running,
-            active_pid,
-            self.cfg.known_kernel_path.as_deref(),
-        )
-        .is_some()
+        if process::pick_target_process(&running, active_pid, self.cfg.known_kernel_path.as_deref())
+            .is_some()
         {
             self.re_resolve_controller(&running);
             return Ok(());
@@ -487,6 +485,15 @@ impl Worker {
         budget: Duration,
         timeout_msg: &str,
     ) -> Result<(), ActionError> {
+        if self.client.is_none() {
+            self.set_status_note(None);
+            let err = self
+                .last_controller_error
+                .clone()
+                .unwrap_or_else(|| text::ERR_NO_CONTROLLER.to_string());
+            return Err(ActionError::general(err));
+        }
+
         let start = Instant::now();
         let mut waiting_notified = false;
         let res = loop {
@@ -557,13 +564,12 @@ fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<CoreConfigs, 
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use std::net::TcpListener;
     use std::path::PathBuf;
 
     use super::*;
     use crate::config::tray::TraySettings;
-    use crate::core::worker::tests::{read_http_request, test_worker};
+    use crate::core::worker::tests::{read_http_request, send_http_response, test_worker};
 
     #[test]
     fn verify_or_enable_tun_after_elevation_patches_and_verifies_tun() {
@@ -579,19 +585,12 @@ mod tests {
                     let json: serde_json::Value = serde_json::from_str(body).unwrap();
                     assert_eq!(json["tun"]["enable"].as_bool(), Some(true));
                     tun_on = true;
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                        .unwrap();
+                    send_http_response(&mut stream, "204 No Content", "");
                 } else {
                     let body = format!(
                         r#"{{"mode":"rule","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
                     );
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    stream.write_all(resp.as_bytes()).unwrap();
+                    send_http_response(&mut stream, "200 OK", &body);
                 }
             }
         });
@@ -610,17 +609,13 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = read_http_request(&mut stream);
                 if req.starts_with("PATCH /configs ") {
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                        .unwrap();
+                    send_http_response(&mut stream, "204 No Content", "");
                 } else {
-                    let body = r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                    send_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#,
                     );
-                    stream.write_all(resp.as_bytes()).unwrap();
                 }
             }
         });
@@ -629,6 +624,25 @@ mod tests {
         let err = verify_or_enable_tun_after_elevation(&client).unwrap_err();
         assert_eq!(err, text::ERR_TUN_FAILED_AFTER_ELEVATION);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn wait_for_controller_fails_immediately_when_controller_unresolved() {
+        let root = crate::config::test_temp_dir("worker_wait_no_client");
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+        worker.last_controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
+        worker.set_status_note(Some(text::STATUS_STARTING_CORE));
+
+        let start = Instant::now();
+        let err = worker
+            .wait_for_controller(Duration::from_secs(6), text::ERR_CORE_NOT_RESPONDING)
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(err.message, text::ERR_NO_CONTROLLER);
+        assert!(!err.transient_wait);
+        assert_eq!(_shared.lock().unwrap().status_note, None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

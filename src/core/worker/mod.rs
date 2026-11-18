@@ -205,16 +205,6 @@ struct LiveState {
     sysproxy: bool,
 }
 
-#[derive(Default)]
-struct PolledConfig {
-    controller_ok: bool,
-    mode: String,
-    mixed_port: u16,
-    tun: bool,
-    controller_error: Option<String>,
-    web_ui_url: Option<String>,
-}
-
 pub struct WorkerHandle {
     pub tx: Sender<WorkerCommand>,
     stop_requested: Arc<AtomicBool>,
@@ -760,13 +750,13 @@ impl Worker {
         )
     }
 
-    fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) {
+    fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) -> bool {
         let Some(mut restore) = self.state_sync.take_ready_restore() else {
-            return;
+            return true;
         };
         if self.stop_requested.load(Ordering::Acquire) {
             self.state_sync.arm_ready_restore(restore);
-            return;
+            return true;
         }
 
         if let Some(want_tun) = restore.tun
@@ -786,18 +776,22 @@ impl Worker {
                 Err(err) => {
                     if self.stop_requested.load(Ordering::Acquire) {
                         self.state_sync.arm_ready_restore(restore);
-                        return;
+                        return true;
+                    }
+                    let core_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
+                    self.set_action_error(Some(err));
+                    if !core_alive {
+                        return false;
                     }
                     self.state_sync
                         .update(&self.cfg.home_dir, |s| s.tun = Some(cfg.tun_enable));
-                    self.set_action_error(Some(err));
                 }
             }
         }
 
         if self.stop_requested.load(Ordering::Acquire) {
             self.state_sync.arm_ready_restore(restore);
-            return;
+            return true;
         }
 
         if let Some(ref mode) = restore.mode
@@ -822,6 +816,7 @@ impl Worker {
                 self.set_action_error(Some(ActionError::general(err)));
             }
         }
+        true
     }
 
     fn handle_quit(&mut self, interactive: bool) -> bool {
@@ -863,69 +858,56 @@ impl Worker {
         kernel_running
     }
 
-    fn poll_controller_configs(&mut self) -> PolledConfig {
+    fn poll_controller_configs(&mut self) -> (Option<CoreConfigs>, Option<String>) {
         let Some(client) = self.client.clone() else {
-            return PolledConfig::default();
+            return (None, None);
         };
         match client.get_configs() {
             Ok(mut cfg) => {
-                self.apply_pending_restore_if_needed(&mut cfg);
+                if !self.apply_pending_restore_if_needed(&mut cfg) {
+                    return (None, None);
+                }
                 let active_client = self.client.as_ref().unwrap_or(&client);
-                let web_ui_url =
-                    Some(active_client.format_web_ui_url(&self.cfg.settings.ui.web_url));
                 if self.cached_version.is_empty()
                     && let Ok(ver) = active_client.get_version()
                 {
                     self.cached_version = ver;
                 }
-                PolledConfig {
-                    controller_ok: true,
-                    mode: cfg.mode,
-                    mixed_port: cfg.mixed_port,
-                    tun: cfg.tun_enable,
-                    controller_error: None,
-                    web_ui_url,
-                }
+                (Some(cfg), None)
             }
-            Err(err) => PolledConfig {
-                controller_ok: false,
-                controller_error: Some(err),
-                ..PolledConfig::default()
-            },
+            Err(err) => (None, Some(err)),
         }
     }
 
     fn refresh(&mut self) {
         let kernel_running = self.resolve_live_controller();
-        let polled = self.poll_controller_configs();
+        let (polled_cfg, controller_error) = self.poll_controller_configs();
         let sysproxy = platform::proxy_is_enabled();
         self.cfg.refresh_autostart_if_stale();
 
-        self.live.controller_ok = polled.controller_ok;
-        self.live.mode = polled.mode.clone();
-        self.live.mixed_port = polled.mixed_port;
-        self.live.tun = polled.tun;
+        let controller_ok = polled_cfg.is_some();
+        self.live.controller_ok = controller_ok;
         self.live.sysproxy = sysproxy;
-
-        if polled.controller_ok {
+        if let Some(ref cfg) = polled_cfg {
+            self.live.mode = cfg.mode.clone();
+            self.live.mixed_port = cfg.mixed_port;
+            self.live.tun = cfg.tun_enable;
             self.state_sync.sync_live_if_idle(
                 &self.cfg.home_dir,
                 sysproxy,
-                &polled.mode,
-                polled.tun,
+                &cfg.mode,
+                cfg.tun_enable,
             );
-            if self
-                .action_error
-                .as_ref()
-                .is_some_and(|e| e.transient_wait)
-            {
+            if self.action_error.as_ref().is_some_and(|e| e.transient_wait) {
                 self.action_error = None;
             }
+        } else {
+            self.live.mode.clear();
+            self.live.mixed_port = 0;
+            self.live.tun = false;
         }
 
-        let (proxies_res, providers_res) = if polled.controller_ok
-            && let Some(client) = &self.client
-        {
+        let (proxies_res, providers_res) = if controller_ok && let Some(client) = &self.client {
             (Some(client.get_proxies()), Some(client.get_providers()))
         } else {
             (None, None)
@@ -933,8 +915,13 @@ impl Worker {
 
         {
             let mut snap = self.shared.lock().unwrap();
-            let controller_ok = polled.controller_ok;
-            self.apply_polled_config(&mut snap, polled, sysproxy, kernel_running);
+            self.apply_polled_config(
+                &mut snap,
+                polled_cfg,
+                controller_error,
+                sysproxy,
+                kernel_running,
+            );
             snap.action_error = self.action_error.as_ref().map(|e| e.message.clone());
 
             if !controller_ok {
@@ -957,32 +944,41 @@ impl Worker {
     fn apply_polled_config(
         &self,
         snap: &mut Snapshot,
-        polled: PolledConfig,
+        polled_cfg: Option<CoreConfigs>,
+        controller_error: Option<String>,
         sysproxy: bool,
         kernel_running: bool,
     ) {
-        snap.controller_ok = polled.controller_ok;
-        snap.version = if polled.controller_ok {
+        let controller_ok = polled_cfg.is_some();
+        let cfg = polled_cfg.unwrap_or_default();
+        snap.controller_ok = controller_ok;
+        snap.version = if controller_ok {
             self.cached_version.clone()
         } else {
             String::new()
         };
-        snap.mode = polled.mode;
-        snap.mixed_port = polled.mixed_port;
-        snap.tun = polled.tun;
+        snap.mode = cfg.mode;
+        snap.mixed_port = cfg.mixed_port;
+        snap.tun = cfg.tun_enable;
         snap.sysproxy = sysproxy;
         snap.autostart = self.cfg.cached_autostart;
         snap.kernel_running = kernel_running;
         snap.controller_error = if self.client.is_some() {
-            (!polled.controller_ok && kernel_running)
-                .then_some(polled.controller_error)
+            (!controller_ok && kernel_running)
+                .then_some(controller_error)
                 .flatten()
         } else if kernel_running || self.cfg.config_file.is_file() {
             self.last_controller_error.clone()
         } else {
             None
         };
-        snap.web_ui_url = polled.web_ui_url;
+        snap.web_ui_url = controller_ok
+            .then(|| {
+                self.client
+                    .as_ref()
+                    .map(|c| c.format_web_ui_url(&self.cfg.settings.ui.web_url))
+            })
+            .flatten();
         snap.resolved_config = Some(self.cfg.config_file.clone());
         snap.page_size = self.cfg.settings.groups.page_size;
     }
@@ -1113,6 +1109,22 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&data).into_owned()
+    }
+
+    pub(super) fn send_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        use std::io::Write;
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    }
+
+    fn stop_mock_server(port: u16) {
+        use std::io::Write;
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .unwrap()
+            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
     }
 
     pub(super) fn test_worker(
@@ -1302,7 +1314,6 @@ mod tests {
 
     #[test]
     fn subscription_async_reload_preserves_pending_restore_until_async_done() {
-        use std::io::Write;
         use std::net::TcpListener;
 
         let root = crate::config::test_temp_dir("worker_sub_restore");
@@ -1324,6 +1335,10 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = read_http_request(&mut stream);
+                if req.starts_with("POST /__stop ") {
+                    send_http_response(&mut stream, "200 OK", "");
+                    break;
+                }
                 let (status, body) = if req.starts_with("GET /version ") {
                     ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
                 } else if req.starts_with("GET /configs ") {
@@ -1353,21 +1368,10 @@ mod tests {
                         tun_on = t;
                     }
                     ("204 No Content", String::new())
-                } else if req.starts_with("POST /__stop ") {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .unwrap();
-                    break;
                 } else {
                     ("404 Not Found", String::new())
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
+                send_http_response(&mut stream, status, &body);
                 if req.starts_with("PATCH /configs ") && mode == "direct" && !tun_on {
                     let _ = done_tx.send(());
                 }
@@ -1391,7 +1395,7 @@ mod tests {
             mixed_port: 7890,
             tun_enable: false,
         };
-        worker.apply_pending_restore_if_needed(&mut mid_cfg);
+        assert!(worker.apply_pending_restore_if_needed(&mut mid_cfg));
         worker
             .state_sync
             .sync_live_if_idle(&worker.cfg.home_dir, false, "rule", false);
@@ -1405,21 +1409,17 @@ mod tests {
 
         let async_cmd = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         worker.handle_command(async_cmd).unwrap();
-        let polled = worker.poll_controller_configs();
-        assert!(polled.controller_ok);
-        assert_eq!(polled.mode, "direct");
+        let (polled, _) = worker.poll_controller_configs();
+        assert_eq!(polled.unwrap().mode, "direct");
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .unwrap()
-            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        stop_mock_server(port);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn set_mode_updates_live_state_immediately_so_capture_keeps_latest_mode() {
-        use std::io::Write;
         use std::net::TcpListener;
 
         let root = crate::config::test_temp_dir("worker_mode_truth");
@@ -1429,9 +1429,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let req = read_http_request(&mut stream);
             assert!(req.starts_with("PATCH /configs "));
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                .unwrap();
+            send_http_response(&mut stream, "204 No Content", "");
         });
 
         let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
@@ -1469,12 +1467,60 @@ mod tests {
             mixed_port: 7890,
             tun_enable: false,
         };
-        worker.apply_pending_restore_if_needed(&mut cfg);
+        assert!(worker.apply_pending_restore_if_needed(&mut cfg));
 
         worker.live.controller_ok = true;
         worker.live.tun = false;
         assert_eq!(worker.capture_live_or_persisted_state(), saved);
         assert_eq!(worker.state_sync.take_ready_restore(), Some(saved));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_tun_restore_with_dead_core_aborts_followups_and_reports_offline() {
+        use std::net::TcpListener;
+
+        let root = crate::config::test_temp_dir("worker_tun_dead_core");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Serve initial GET /configs, PATCH /configs, and verify GET /configs inside apply_tun_state,
+        // then exit so probe() detects the core is gone.
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("PATCH /configs ") {
+                    send_http_response(&mut stream, "403 Forbidden", "need elevation");
+                } else {
+                    send_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#,
+                    );
+                }
+            }
+        });
+
+        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        worker.state_sync.arm_ready_restore(PersistedState {
+            system_proxy: false,
+            mode: Some("global".to_string()),
+            tun: Some(true),
+        });
+
+        worker.refresh();
+        server.join().unwrap();
+
+        let snap = shared.lock().unwrap();
+        assert!(!snap.controller_ok);
+        assert_eq!(snap.web_ui_url, None);
+        assert_eq!(
+            snap.action_error.as_deref(),
+            Some(text::ERR_LOCATE_ELEVATE_PROCESS)
+        );
+        drop(snap);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1511,7 +1557,6 @@ mod tests {
 
     #[test]
     fn burst_coalescing_clears_earlier_error_when_later_command_succeeds() {
-        use std::io::Write;
         use std::net::TcpListener;
 
         let root = crate::config::test_temp_dir("worker_burst_clear");
@@ -1531,26 +1576,22 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = read_http_request(&mut stream);
                 let (status, body) = if req.starts_with("GET /version ") {
-                    ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
+                    ("200 OK", r#"{"version":"v1.19.0"}"#)
                 } else if req.starts_with("GET /configs ") {
                     (
                         "200 OK",
-                        r#"{"mode":"global","mixed-port":7890,"tun":{"enable":false}}"#.to_string(),
+                        r#"{"mode":"global","mixed-port":7890,"tun":{"enable":false}}"#,
                     )
                 } else if req.starts_with("PATCH /configs ") {
-                    ("204 No Content", String::new())
+                    ("204 No Content", "")
                 } else if req.starts_with("GET /proxies ") {
-                    ("200 OK", r#"{"proxies":{}}"#.to_string())
+                    ("200 OK", r#"{"proxies":{}}"#)
                 } else if req.starts_with("GET /providers/proxies ") {
-                    ("200 OK", r#"{"providers":{}}"#.to_string())
+                    ("200 OK", r#"{"providers":{}}"#)
                 } else {
-                    ("404 Not Found", String::new())
+                    ("404 Not Found", "")
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
+                send_http_response(&mut stream, status, body);
             }
         });
 
@@ -1582,7 +1623,6 @@ mod tests {
 
     #[test]
     fn transient_wait_error_clears_on_controller_recovery_while_preserving_other_errors() {
-        use std::io::Write;
         use std::net::TcpListener;
 
         let root = crate::config::test_temp_dir("worker_transient_err");
@@ -1602,32 +1642,24 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let req = read_http_request(&mut stream);
                 if req.starts_with("POST /__stop ") {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .unwrap();
+                    send_http_response(&mut stream, "200 OK", "");
                     break;
                 }
                 let (status, body) = if req.starts_with("GET /version ") {
-                    ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
+                    ("200 OK", r#"{"version":"v1.19.0"}"#)
                 } else if req.starts_with("GET /configs ") {
                     (
                         "200 OK",
-                        r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#.to_string(),
+                        r#"{"mode":"rule","mixed-port":7890,"tun":{"enable":false}}"#,
                     )
                 } else if req.starts_with("GET /proxies ") {
-                    ("200 OK", r#"{"proxies":{}}"#.to_string())
+                    ("200 OK", r#"{"proxies":{}}"#)
                 } else if req.starts_with("GET /providers/proxies ") {
-                    ("200 OK", r#"{"providers":{}}"#.to_string())
+                    ("200 OK", r#"{"providers":{}}"#)
                 } else {
-                    ("404 Not Found", String::new())
+                    ("404 Not Found", "")
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
+                send_http_response(&mut stream, status, body);
             }
         });
 
@@ -1650,9 +1682,7 @@ mod tests {
             Some(text::ERR_TUN_ELEVATION_DECLINED)
         );
 
-        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .unwrap()
-            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        stop_mock_server(port);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }

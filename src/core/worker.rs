@@ -88,7 +88,6 @@ struct Worker {
     last_config_mtime: Option<SystemTime>,
     settings_error: Option<String>,
     kernel_path_error: Option<String>,
-    resolve_error: Option<String>,
     last_controller_ok: bool,
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
@@ -106,8 +105,7 @@ struct Worker {
     last_autostart_check: Option<Instant>,
     home_dir: PathBuf,
     config_file: PathBuf,
-    persisted_state: PersistedState,
-    has_persisted_state: bool,
+    persisted_state: Option<PersistedState>,
     pending_restore: Option<PersistedState>,
 }
 
@@ -140,7 +138,6 @@ impl Worker {
             last_config_mtime,
             settings_error: startup_error,
             kernel_path_error: None,
-            resolve_error: None,
             last_controller_ok: false,
             shared,
             proxy,
@@ -158,8 +155,7 @@ impl Worker {
             last_autostart_check: None,
             home_dir,
             config_file,
-            persisted_state: PersistedState::default(),
-            has_persisted_state: false,
+            persisted_state: None,
             pending_restore: None,
         };
         (worker, rx)
@@ -233,23 +229,16 @@ impl Worker {
     }
 
     fn load_initial_persisted_state(&mut self) {
-        match state_store::load(&self.home_dir) {
-            Some(st) => {
-                self.has_persisted_state = true;
-                self.pending_restore = Some(st.clone());
-                self.persisted_state = st;
-            }
-            None => {
-                self.has_persisted_state = false;
-                self.pending_restore = None;
-                self.persisted_state = PersistedState::default();
-            }
-        }
+        self.persisted_state = state_store::load(&self.home_dir);
+        self.pending_restore = self.persisted_state.clone();
     }
 
-    fn save_persisted_state(&mut self) {
-        self.has_persisted_state = true;
-        state_store::save(&self.home_dir, &self.persisted_state);
+    fn update_persisted_state(&mut self, update: impl FnOnce(&mut PersistedState)) {
+        let state = self
+            .persisted_state
+            .get_or_insert_with(PersistedState::default);
+        update(state);
+        state_store::save(&self.home_dir, state);
     }
 
     fn load_settings_from_disk(&mut self) -> bool {
@@ -342,12 +331,10 @@ impl Worker {
         ) {
             Ok(client) => {
                 self.client = Some(client);
-                self.resolve_error = None;
                 self.set_controller_error(None);
             }
             Err(err) => {
                 self.client = None;
-                self.resolve_error = Some(err.clone());
                 self.set_controller_error(Some(err));
             }
         }
@@ -388,8 +375,7 @@ impl Worker {
 
     fn set_mode(&mut self, mode: &str) -> Result<(), String> {
         self.with_client(|c| c.set_mode(mode))?;
-        self.persisted_state.mode = Some(mode.to_string());
-        self.save_persisted_state();
+        self.update_persisted_state(|s| s.mode = Some(mode.to_string()));
         Ok(())
     }
 
@@ -407,8 +393,7 @@ impl Worker {
     fn toggle_system_proxy(&mut self) -> Result<(), String> {
         if platform::proxy_is_enabled() {
             platform::proxy_disable()?;
-            self.persisted_state.system_proxy = false;
-            self.save_persisted_state();
+            self.update_persisted_state(|s| s.system_proxy = false);
             return Ok(());
         }
         let client = self
@@ -420,8 +405,7 @@ impl Worker {
             return Err(text::ERR_NO_MIXED_PORT_FOR_PROXY.to_string());
         }
         platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)?;
-        self.persisted_state.system_proxy = true;
-        self.save_persisted_state();
+        self.update_persisted_state(|s| s.system_proxy = true);
         Ok(())
     }
 
@@ -433,8 +417,7 @@ impl Worker {
         let current = client.get_configs()?;
         let want_enable = !current.tun_enable;
         self.apply_tun_state(want_enable)?;
-        self.persisted_state.tun = Some(want_enable);
-        self.save_persisted_state();
+        self.update_persisted_state(|s| s.tun = Some(want_enable));
         Ok(())
     }
 
@@ -580,7 +563,10 @@ impl Worker {
     }
 
     fn disable_managed_system_proxy(&self) {
-        if self.persisted_state.system_proxy
+        if self
+            .persisted_state
+            .as_ref()
+            .is_some_and(|s| s.system_proxy)
             && platform::proxy_is_enabled()
             && let Err(err) = platform::proxy_disable()
         {
@@ -858,11 +844,7 @@ impl Worker {
                 tun: Some(snap.tun),
             }
         } else {
-            PersistedState {
-                system_proxy: self.persisted_state.system_proxy,
-                mode: self.persisted_state.mode.clone(),
-                tun: self.persisted_state.tun,
-            }
+            self.persisted_state.clone().unwrap_or_default()
         }
     }
 
@@ -885,8 +867,7 @@ impl Worker {
                     }
                 }
                 Err(err) => {
-                    self.persisted_state.tun = Some(false);
-                    self.save_persisted_state();
+                    self.update_persisted_state(|s| s.tun = Some(false));
                     self.set_action_error(Some(err));
                 }
             }
@@ -914,8 +895,7 @@ impl Worker {
 
     fn handle_quit(&mut self, interactive: bool) -> bool {
         let final_state = self.capture_live_or_persisted_state();
-        self.persisted_state = final_state;
-        self.save_persisted_state();
+        self.update_persisted_state(|s| *s = final_state);
         match self.stop_core_internal(interactive) {
             Ok(()) => {
                 let _ = self.proxy.send_event(AppEvent::QuitCompleted);
@@ -989,16 +969,7 @@ impl Worker {
         client_opt: Option<&Client>,
     ) -> (bool, String, u16, bool, Option<String>, Option<String>) {
         let Some(client) = client_opt else {
-            return (
-                false,
-                String::new(),
-                0,
-                false,
-                self.resolve_error
-                    .clone()
-                    .or_else(|| Some(text::ERR_NO_CONTROLLER.to_string())),
-                None,
-            );
+            return (false, String::new(), 0, false, None, None);
         };
         let web_ui_url = Some(client.format_web_ui_url(&self.settings.ui.web_url));
         match client.get_configs() {
@@ -1031,9 +1002,8 @@ impl Worker {
             mode: (!mode.is_empty()).then(|| mode.to_string()),
             tun: Some(tun),
         };
-        if !self.has_persisted_state || live != self.persisted_state {
-            self.persisted_state = live;
-            self.save_persisted_state();
+        if self.persisted_state.as_ref() != Some(&live) {
+            self.update_persisted_state(|s| *s = live);
         }
     }
 
@@ -1072,7 +1042,11 @@ impl Worker {
             snap.sysproxy = sysproxy;
             snap.autostart = autostart;
             snap.kernel_running = kernel_running;
-            snap.controller_error = controller_error;
+            if client_opt.is_some() {
+                snap.controller_error = controller_error;
+            } else if snap.controller_error.is_none() {
+                snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
+            }
             snap.web_ui_url = web_ui_url;
             snap.resolved_config = Some(self.config_file.clone());
             snap.page_size = self.settings.groups.page_size;

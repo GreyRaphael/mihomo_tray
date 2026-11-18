@@ -219,13 +219,10 @@ pub(crate) fn build_launch_args_for_paths(
 
 /// Resolves the controller HTTP client from argv -> env -> config.yaml -> tray.yml fallback.
 pub fn resolve_controller(
-    portable_root: &Path,
     settings: &TraySettings,
     running: &[RunningProcess],
-    preferred_config: Option<&Path>,
+    config_path: &Path,
 ) -> Result<Client, String> {
-    let (_, fallback_cfg) = resolve_home_and_config(portable_root, settings, None);
-    let config_path = preferred_config.unwrap_or(&fallback_cfg);
     let cfg_res = mihomo::read_file(config_path);
 
     let argv = matching_running_argv(running, config_path);
@@ -430,7 +427,7 @@ mod tests {
         settings.controller.secret = "from_tray".to_string();
 
         // No running process -> uses config.yaml over tray.yml fallback.
-        let client_cfg = resolve_controller(&root, &settings, &[], Some(&cfg_path)).unwrap();
+        let client_cfg = resolve_controller(&settings, &[], &cfg_path).unwrap();
         assert_eq!(client_cfg.port, 9090);
         assert_eq!(client_cfg.secret, "from_cfg");
 
@@ -448,7 +445,7 @@ mod tests {
                 "from_argv".to_string(),
             ],
         }];
-        let client_argv = resolve_controller(&root, &settings, &running, Some(&cfg_path)).unwrap();
+        let client_argv = resolve_controller(&settings, &running, &cfg_path).unwrap();
         assert_eq!(client_argv.port, 9095);
         assert_eq!(client_argv.secret, "from_argv");
 

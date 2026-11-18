@@ -83,10 +83,7 @@ impl Worker {
         &mut self,
         group: String,
     ) -> Result<CommandOutcome, String> {
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
+        let client = self.require_client()?.clone();
         if self.testing_latency {
             return Ok(CommandOutcome::KeepError);
         }
@@ -109,10 +106,7 @@ impl Worker {
     }
 
     pub(super) fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, String> {
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
+        let client = self.require_client()?.clone();
         if self.sub_tasks.active {
             return Ok(CommandOutcome::KeepError);
         }
@@ -151,7 +145,7 @@ impl Worker {
     fn spawn_apply_subscription_reload(&mut self, client: Client, generation: u64) {
         let sub_cache = self
             .cfg
-            .home_dir
+            .home_dir()
             .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
         if self.spawn_background_task(
             "mihomo-sub-apply",
@@ -197,7 +191,7 @@ impl Worker {
 
     pub(super) fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
         let saved = self.capture_live_or_persisted_state();
-        mihomo::apply_subscription_url(&self.cfg.config_file, url)?;
+        mihomo::apply_subscription_url(self.cfg.config_file(), url)?;
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
             let generation = self.sub_tasks.bump_generation();
             self.state_sync.defer_restore(generation, saved);
@@ -210,7 +204,7 @@ impl Worker {
             return Ok(());
         }
         self.sub_tasks.invalidate();
-        self.state_sync.set_ready_restore(saved);
+        self.state_sync.arm_ready_restore(saved);
         self.start_core_internal()
     }
 

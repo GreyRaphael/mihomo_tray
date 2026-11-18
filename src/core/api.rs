@@ -134,6 +134,7 @@ impl Client {
             other => other.to_string(),
         };
         let agent: Agent = Agent::config_builder()
+            .proxy(None)
             .http_status_as_error(false)
             .build()
             .into();

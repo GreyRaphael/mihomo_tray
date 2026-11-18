@@ -168,20 +168,20 @@ impl MihomoTrayApp {
             MenuAction::SetSubscriptionUrl => self.prompt_and_set_subscription(),
             MenuAction::OpenTrayConfig => {
                 crate::config::tray::ensure_sample_file(&self.settings_path);
-                self.open_target(&self.settings_path.display().to_string());
+                self.open_target(self.settings_path.clone());
             }
             MenuAction::OpenMihomoConfig => {
                 let target = self.resolved_config_or_default();
                 mihomo::ensure_default_config(&target);
-                self.open_target(&target.display().to_string());
+                self.open_target(target);
             }
             MenuAction::OpenPortableDir => {
-                self.open_target(&self.portable_root.display().to_string());
+                self.open_target(self.portable_root.clone());
             }
             MenuAction::OpenUiDir => {
                 let ui_dir = self.portable_root.join("ui");
                 let _ = std::fs::create_dir_all(&ui_dir);
-                self.open_target(&ui_dir.display().to_string());
+                self.open_target(ui_dir);
             }
             MenuAction::OpenLogFile => {
                 let target = if self.log_path.exists() {
@@ -189,7 +189,7 @@ impl MihomoTrayApp {
                 } else {
                     self.portable_root.join("logs")
                 };
-                self.open_target(&target.display().to_string());
+                self.open_target(target);
             }
             MenuAction::SetMode(mode) => self.send_worker(WorkerCommand::SetMode(mode)),
             MenuAction::ToggleSystemProxy => self.send_worker(WorkerCommand::ToggleSystemProxy),
@@ -371,9 +371,11 @@ impl MihomoTrayApp {
         }
     }
 
-    fn open_target(&mut self, target: &str) {
+    fn open_target(&mut self, target: impl AsRef<std::ffi::OsStr>) {
+        let target = target.as_ref();
         if let Err(err) = open::that_detached(target) {
-            self.set_action_error(crate::text::format_open_target_failed(target, &err));
+            let display = target.to_string_lossy();
+            self.set_action_error(crate::text::format_open_target_failed(&display, &err));
         }
     }
 
@@ -393,10 +395,10 @@ impl MihomoTrayApp {
 
     fn shutdown_on_exit(&mut self) {
         if let Some(mut worker) = self.worker.take() {
-            if !self.quitting {
-                self.quitting = true;
-                worker.send(WorkerCommand::Quit { interactive: false });
-            }
+            self.quitting = true;
+            // Always enqueue a non-interactive Quit so exiting while a QuitCancelled
+            // event is still pending in the UI queue never deadlocks `worker.join()`.
+            worker.send(WorkerCommand::Quit { interactive: false });
             worker.join();
         }
         self.tray_icon.take();

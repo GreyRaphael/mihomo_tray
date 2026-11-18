@@ -90,7 +90,7 @@ fn build_auto_launch() -> Result<auto_launch::AutoLaunch, String> {
     let exe = std::env::current_exe().map_err(|e| format!("failed to get executable path: {e}"))?;
     let exe_str = exe.to_string_lossy().into_owned();
     auto_launch::AutoLaunchBuilder::new()
-        .set_app_name("mihomo-tray")
+        .set_app_name(crate::text::APP_NAME)
         .set_app_path(&exe_str)
         .build()
         .map_err(|e| format!("failed to initialize auto-launch: {e}"))
@@ -173,7 +173,6 @@ fn show_message_dialog(
 
 /// Displays a blocking modal notice/error box to the user on desktop platforms.
 pub fn notify_error(title: &str, message: &str) {
-    #[cfg(not(windows))]
     tracing::error!("{title}: {message}");
 
     let _ = show_message_dialog(
@@ -186,7 +185,6 @@ pub fn notify_error(title: &str, message: &str) {
 
 /// Displays a blocking modal informational box to the user on desktop platforms.
 pub fn notify_info(title: &str, message: &str) {
-    #[cfg(not(windows))]
     tracing::info!("{title}: {message}");
 
     let _ = show_message_dialog(

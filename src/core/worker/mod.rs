@@ -32,6 +32,16 @@ enum CommandOutcome {
     KeepError,
 }
 
+#[derive(Default)]
+struct PolledConfig {
+    controller_ok: bool,
+    mode: String,
+    mixed_port: u16,
+    tun: bool,
+    controller_error: Option<String>,
+    web_ui_url: Option<String>,
+}
+
 pub struct WorkerHandle {
     pub tx: Sender<WorkerCommand>,
     stop_requested: Arc<AtomicBool>,
@@ -141,8 +151,8 @@ impl Worker {
         let cfg = ConfigTracker::new(portable_root, settings_path, settings, startup_error);
         {
             let mut snap = shared.lock().unwrap();
-            snap.page_size = cfg.settings.groups.page_size;
-            snap.resolved_config = cfg.config_file.clone();
+            snap.page_size = cfg.settings().groups.page_size;
+            snap.resolved_config = cfg.config_file().to_path_buf();
             snap.config_error = cfg.current_config_error();
         }
         let worker = Self {
@@ -168,7 +178,7 @@ impl Worker {
         self.startup();
 
         loop {
-            let interval = Duration::from_millis(self.cfg.settings.ui.poll_interval_ms as u64);
+            let interval = Duration::from_millis(self.cfg.settings().ui.poll_interval_ms as u64);
             match rx.recv_timeout(interval) {
                 Ok(cmd) => {
                     let mut outcome = CommandOutcome::KeepError;
@@ -216,21 +226,18 @@ impl Worker {
                     self.refresh();
                 }
                 Err(RecvTimeoutError::Timeout) => self.refresh(),
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.handle_quit(false);
-                    break;
-                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     }
 
     fn startup(&mut self) {
         self.reload_paths_and_runtime();
-        self.state_sync.load_initial(&self.cfg.home_dir);
+        self.state_sync.load_initial(self.cfg.home_dir());
         self.cfg.refresh_autostart_cache();
         let running = self
             .process_inspector
-            .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
+            .list_running_mihomo(self.cfg.known_kernel_path());
         self.re_resolve_controller(&running);
 
         let controller_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
@@ -239,7 +246,7 @@ impl Worker {
             // Core is already running; preserve its live mode/TUN instead of overriding from disk.
             self.state_sync.clear_pending();
         } else if running.is_empty()
-            && self.cfg.settings.mihomo.auto_start
+            && self.cfg.settings().mihomo.auto_start
             && let Err(err) = self.start_core_internal()
         {
             tracing::warn!("Auto-start core failed: {err}");
@@ -254,22 +261,19 @@ impl Worker {
     }
 
     fn reload_paths_and_runtime(&mut self) {
-        self.cfg.reload_settings_if_changed();
-        self.cfg.refresh_paths();
+        self.cfg.reload_settings_and_paths();
         self.sync_config_error();
 
-        if let Some(rec) = process::load_runtime_record(&self.cfg.home_dir) {
+        if let Some(rec) = process::load_runtime_record(self.cfg.home_dir()) {
             if self
                 .process_inspector
                 .is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path))
             {
                 self.recorded_pid = Some(rec.pid);
-                if self.cfg.known_kernel_path.is_none() {
-                    self.cfg.known_kernel_path = Some(rec.kernel_path);
-                }
+                self.cfg.set_known_kernel_path_if_none(rec.kernel_path);
             } else {
                 self.recorded_pid = None;
-                process::clear_runtime_record(&self.cfg.home_dir);
+                process::clear_runtime_record(self.cfg.home_dir());
             }
         }
     }
@@ -284,10 +288,12 @@ impl Worker {
                 .map(|()| CommandOutcome::ClearError),
             WorkerCommand::ToggleTun => self.toggle_tun().map(|()| CommandOutcome::ClearError),
             WorkerCommand::SelectProxy { group, member } => self
-                .with_client(|c| c.select_proxy(&group, &member))
+                .require_client()?
+                .select_proxy(&group, &member)
                 .map(|()| CommandOutcome::ClearError),
             WorkerCommand::UnfixGroup(group) => self
-                .with_client(|c| c.unfix_group(&group))
+                .require_client()?
+                .unfix_group(&group)
                 .map(|()| CommandOutcome::ClearError),
             WorkerCommand::TestGroupLatency(group) => self.start_test_group_latency(group),
             WorkerCommand::RefreshSubscriptions => self.start_refresh_subscriptions(),
@@ -309,62 +315,49 @@ impl Worker {
         }
     }
 
+    fn require_client(&self) -> Result<&Client, String> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())
+    }
+
     fn set_mode(&mut self, mode: ProxyMode) -> Result<(), String> {
         let mode_str = mode.as_api_str();
         if mode_str.is_empty() {
             return Err("unsupported proxy mode".to_string());
         }
-        self.with_client(|c| c.set_mode(mode_str))?;
+        self.require_client()?.set_mode(mode_str)?;
         self.state_sync
-            .update(&self.cfg.home_dir, |s| s.mode = Some(mode_str.to_string()));
+            .update(self.cfg.home_dir(), |s| s.mode = Some(mode_str.to_string()));
         self.shared.lock().unwrap().mode = mode_str.to_string();
         Ok(())
-    }
-
-    fn with_client<F>(&self, f: F) -> Result<(), String>
-    where
-        F: FnOnce(&Client) -> Result<(), String>,
-    {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        f(client)
     }
 
     fn toggle_system_proxy(&mut self) -> Result<(), String> {
         if platform::proxy_is_enabled() {
             platform::proxy_disable()?;
             self.state_sync
-                .update(&self.cfg.home_dir, |s| s.system_proxy = false);
+                .update(self.cfg.home_dir(), |s| s.system_proxy = false);
             self.shared.lock().unwrap().sysproxy = false;
             return Ok(());
         }
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        let cfg = client.get_configs()?;
+        let cfg = self.require_client()?.get_configs()?;
         if cfg.mixed_port == 0 {
             return Err(text::ERR_NO_MIXED_PORT_FOR_PROXY.to_string());
         }
-        platform::proxy_enable(cfg.mixed_port, &self.cfg.settings.proxy.bypass)?;
+        platform::proxy_enable(cfg.mixed_port, &self.cfg.settings().proxy.bypass)?;
         self.state_sync
-            .update(&self.cfg.home_dir, |s| s.system_proxy = true);
+            .update(self.cfg.home_dir(), |s| s.system_proxy = true);
         self.shared.lock().unwrap().sysproxy = true;
         Ok(())
     }
 
     fn toggle_tun(&mut self) -> Result<(), String> {
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        let current = client.get_configs()?;
+        let current = self.require_client()?.get_configs()?;
         let want_enable = !current.tun_enable;
         self.apply_tun_state(want_enable)?;
         self.state_sync
-            .update(&self.cfg.home_dir, |s| s.tun = Some(want_enable));
+            .update(self.cfg.home_dir(), |s| s.tun = Some(want_enable));
         self.shared.lock().unwrap().tun = want_enable;
         Ok(())
     }
@@ -374,7 +367,7 @@ impl Worker {
         let port = if snap_port > 0 {
             snap_port
         } else {
-            mihomo::read_file(&self.cfg.config_file)
+            mihomo::read_file(self.cfg.config_file())
                 .map(|info| info.mixed_port)
                 .unwrap_or(0)
         };
@@ -417,7 +410,7 @@ impl Worker {
                 }
                 Err(err) => {
                     self.state_sync
-                        .update(&self.cfg.home_dir, |s| s.tun = Some(false));
+                        .update(self.cfg.home_dir(), |s| s.tun = Some(cfg.tun_enable));
                     self.set_action_error(Some(err));
                 }
             }
@@ -436,7 +429,7 @@ impl Worker {
             if cfg.mixed_port == 0 {
                 self.set_action_error(Some(text::ERR_NO_MIXED_PORT_FOR_RESTORE.to_string()));
             } else if let Err(err) =
-                platform::proxy_enable(cfg.mixed_port, &self.cfg.settings.proxy.bypass)
+                platform::proxy_enable(cfg.mixed_port, &self.cfg.settings().proxy.bypass)
             {
                 self.set_action_error(Some(err));
             }
@@ -446,7 +439,7 @@ impl Worker {
     fn handle_quit(&mut self, interactive: bool) -> bool {
         let final_state = self.capture_live_or_persisted_state();
         self.state_sync
-            .update(&self.cfg.home_dir, |s| *s = final_state);
+            .update(self.cfg.home_dir(), |s| *s = final_state);
         match self.stop_core_internal(interactive) {
             Ok(()) => {
                 self.proxy.send(AppEvent::QuitCompleted);
@@ -461,38 +454,32 @@ impl Worker {
     }
 
     fn resolve_live_controller(&mut self) -> bool {
-        let reload = self.cfg.reload_settings_if_changed();
-        if reload.changed || self.cfg.settings_error.is_none() {
+        let tracked_alive = self.active_pid().is_some();
+        let changes = self.cfg.poll_changes(tracked_alive);
+        if changes.error_changed {
             self.sync_config_error();
         }
-        if reload.changed && self.cfg.settings_error.is_none() {
+        if changes.settings_changed && !self.cfg.has_settings_error() {
             self.set_action_error(None);
         }
 
-        let tracked_alive = self.active_pid().is_some();
-        if reload.changed && !tracked_alive {
-            self.cfg.refresh_paths();
-            self.sync_config_error();
-        }
-
-        let config_changed = self.cfg.config_file_changed();
-        let might_resolve = reload.controller_changed
-            || (reload.changed && !tracked_alive)
-            || config_changed
+        let might_resolve = changes.controller_changed
+            || (changes.settings_changed && !tracked_alive)
+            || changes.config_file_changed
             || self.client.is_none()
             || !self.last_controller_ok;
 
         let running = if !tracked_alive || might_resolve {
             self.process_inspector
-                .list_running_mihomo(self.cfg.known_kernel_path.as_deref())
+                .list_running_mihomo(self.cfg.known_kernel_path())
         } else {
             Vec::new()
         };
         let kernel_running = tracked_alive || !running.is_empty();
 
-        let need_resolve = reload.controller_changed
-            || (reload.changed && !kernel_running)
-            || config_changed
+        let need_resolve = changes.controller_changed
+            || (changes.settings_changed && !kernel_running)
+            || changes.config_file_changed
             || (kernel_running && (self.client.is_none() || !self.last_controller_ok));
         if need_resolve {
             self.re_resolve_controller(&running);
@@ -500,52 +487,62 @@ impl Worker {
         kernel_running
     }
 
-    fn poll_controller_configs(
-        &mut self,
-        client_opt: Option<&Client>,
-    ) -> (bool, String, u16, bool, Option<String>, Option<String>) {
-        let Some(client) = client_opt else {
-            return (false, String::new(), 0, false, None, None);
+    fn poll_controller_configs(&mut self) -> PolledConfig {
+        let Some(client) = self.client.clone() else {
+            return PolledConfig::default();
         };
-        let web_ui_url = Some(client.format_web_ui_url(&self.cfg.settings.ui.web_url));
+        let initial_url = Some(client.format_web_ui_url(&self.cfg.settings().ui.web_url));
         match client.get_configs() {
             Ok(mut cfg) => {
                 self.apply_pending_restore_if_needed(&mut cfg);
+                let active_client = self.client.as_ref().unwrap_or(&client);
+                let web_ui_url =
+                    Some(active_client.format_web_ui_url(&self.cfg.settings().ui.web_url));
                 if self.cached_version.is_empty()
-                    && let Ok(ver) = client.get_version()
+                    && let Ok(ver) = active_client.get_version()
                 {
                     self.cached_version = ver;
                 }
-                (
-                    true,
-                    cfg.mode,
-                    cfg.mixed_port,
-                    cfg.tun_enable,
-                    None,
+                PolledConfig {
+                    controller_ok: true,
+                    mode: cfg.mode,
+                    mixed_port: cfg.mixed_port,
+                    tun: cfg.tun_enable,
+                    controller_error: None,
                     web_ui_url,
-                )
+                }
             }
-            Err(err) => (false, String::new(), 0, false, Some(err), web_ui_url),
+            Err(err) => PolledConfig {
+                controller_ok: false,
+                controller_error: Some(err),
+                web_ui_url: initial_url,
+                ..PolledConfig::default()
+            },
         }
     }
 
     fn refresh(&mut self) {
         let kernel_running = self.resolve_live_controller();
-        let client_opt = self.client.clone();
-        let (controller_ok, mode, mixed_port, tun, controller_error, web_ui_url) =
-            self.poll_controller_configs(client_opt.as_ref());
-        self.last_controller_ok = controller_ok;
+        let polled = self.poll_controller_configs();
+        self.last_controller_ok = polled.controller_ok;
 
         let sysproxy = platform::proxy_is_enabled();
         self.cfg.refresh_autostart_if_stale();
-        let autostart = self.cfg.cached_autostart;
+        let autostart = self.cfg.cached_autostart();
 
-        if controller_ok {
-            self.state_sync
-                .sync_live_if_idle(&self.cfg.home_dir, sysproxy, &mode, tun);
+        if polled.controller_ok {
+            self.state_sync.sync_live_if_idle(
+                self.cfg.home_dir(),
+                sysproxy,
+                &polled.mode,
+                polled.tun,
+            );
         }
 
-        let (proxies_res, providers_res) = if controller_ok && let Some(client) = &client_opt {
+        let client_opt = self.client.clone();
+        let (proxies_res, providers_res) = if polled.controller_ok
+            && let Some(client) = &client_opt
+        {
             (Some(client.get_proxies()), Some(client.get_providers()))
         } else {
             (None, None)
@@ -553,32 +550,32 @@ impl Worker {
 
         {
             let mut snap = self.shared.lock().unwrap();
-            snap.controller_ok = controller_ok;
-            snap.version = if controller_ok {
+            snap.controller_ok = polled.controller_ok;
+            snap.version = if polled.controller_ok {
                 self.cached_version.clone()
             } else {
                 String::new()
             };
-            snap.mode = mode;
-            snap.mixed_port = mixed_port;
-            snap.tun = tun;
+            snap.mode = polled.mode;
+            snap.mixed_port = polled.mixed_port;
+            snap.tun = polled.tun;
             snap.sysproxy = sysproxy;
             snap.autostart = autostart;
             snap.kernel_running = kernel_running;
             if client_opt.is_some() {
-                snap.controller_error = if !controller_ok && !kernel_running {
+                snap.controller_error = if !polled.controller_ok && !kernel_running {
                     None
                 } else {
-                    controller_error
+                    polled.controller_error
                 };
             } else if snap.controller_error.is_none() {
                 snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
             }
-            snap.web_ui_url = web_ui_url;
-            snap.resolved_config = self.cfg.config_file.clone();
-            snap.page_size = self.cfg.settings.groups.page_size;
+            snap.web_ui_url = polled.web_ui_url;
+            snap.resolved_config = self.cfg.config_file().to_path_buf();
+            snap.page_size = self.cfg.settings().groups.page_size;
 
-            if !controller_ok {
+            if !polled.controller_ok {
                 snap.groups.clear();
                 snap.providers.clear();
                 snap.node_latency.clear();
@@ -588,9 +585,9 @@ impl Worker {
                     Some(Ok(proxies)) => {
                         snap.groups = state::order_and_filter_groups(
                             proxies.groups,
-                            &self.cfg.settings.groups.include,
-                            &self.cfg.settings.groups.exclude,
-                            &self.cfg.settings.groups.order,
+                            &self.cfg.settings().groups.include,
+                            &self.cfg.settings().groups.exclude,
+                            &self.cfg.settings().groups.order,
                         );
                         latencies = Some(proxies.latency);
                     }
@@ -812,7 +809,7 @@ mod tests {
         let initial = crate::config::tray::load(&settings_path).unwrap();
         let (mut worker, _rx, shared) = test_worker(&root, initial, None);
 
-        worker.cfg.refresh_paths();
+        worker.cfg.reload_settings_and_paths();
         worker.sync_config_error();
         assert!(shared.lock().unwrap().config_error.is_some());
 
@@ -825,9 +822,18 @@ mod tests {
         worker.cfg.invalidate_settings_mtime();
         worker.resolve_live_controller();
 
-        assert_eq!(worker.cfg.known_kernel_path.as_deref(), Some(exe.as_path()));
-        assert_eq!(worker.cfg.config_file, root.join("alt").join("config.yaml"));
+        assert_eq!(worker.cfg.known_kernel_path(), Some(exe.as_path()));
+        assert_eq!(
+            worker.cfg.config_file(),
+            root.join("alt").join("config.yaml")
+        );
         assert_eq!(shared.lock().unwrap().config_error, None);
+
+        // Runtime syntax error in tray.yml must surface in Snapshot.config_error.
+        std::fs::write(&settings_path, "mihomo: [unclosed").unwrap();
+        worker.cfg.invalidate_settings_mtime();
+        worker.resolve_live_controller();
+        assert!(shared.lock().unwrap().config_error.is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1000,7 +1006,7 @@ mod tests {
         worker.apply_pending_restore_if_needed(&mut mid_cfg);
         worker
             .state_sync
-            .sync_live_if_idle(&worker.cfg.home_dir, false, "rule", false);
+            .sync_live_if_idle(worker.cfg.home_dir(), false, "rule", false);
         assert_eq!(
             worker
                 .state_sync
@@ -1013,10 +1019,29 @@ mod tests {
         worker.handle_command(async_cmd).unwrap();
         assert!(worker.state_sync.has_ready_restore());
 
-        let (ok, mode, _, _, _, _) = worker.poll_controller_configs(worker.client.clone().as_ref());
-        assert!(ok);
-        assert_eq!(mode, "global");
+        let polled = worker.poll_controller_configs();
+        assert!(polled.controller_ok);
+        assert_eq!(polled.mode, "global");
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Now test that an explicit SetMode during deferred reload is not reverted by stale state.
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::SetSubscriptionUrl(
+                    "https://example.com/sub2".to_string()
+                ))
+                .unwrap(),
+            CommandOutcome::ClearError
+        );
+        assert!(worker.state_sync.has_deferred_restore());
+        worker
+            .handle_command(WorkerCommand::SetMode(ProxyMode::Direct))
+            .unwrap();
+        let async_cmd2 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(async_cmd2).unwrap();
+        let polled2 = worker.poll_controller_configs();
+        assert!(polled2.controller_ok);
+        assert_eq!(polled2.mode, "direct");
 
         let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .unwrap()

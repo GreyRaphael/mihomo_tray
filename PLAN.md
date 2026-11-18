@@ -33,7 +33,8 @@ mihomo-tray/
 │   └── mihomo.exe
 ├── config/               # Default mihomo -d directory (geodata, cache.db, rulesets)
 │   ├── config.yaml       # Default mihomo -f configuration file
-│   └── .runtime.json     # Ephemeral PID / controller lockfile while core is managed
+│   ├── .tray-state.json  # Remembered System Proxy / mode / TUN state across restarts
+│   └── .runtime.json     # Ephemeral PID / kernel path lockfile while core is managed
 ├── ui/                   # Optional user-supplied static WebUI (passed via -ext-ui)
 │   └── index.html
 └── logs/
@@ -47,8 +48,7 @@ mihomo-tray/
 ### 3.1 Cross-Platform Core Dependencies
 | Crate | Version | Purpose |
 |---|---|---|
-| `tray-icon` | `0.26` | System tray icon & click events (`muda-common-controls-v6` on Windows; `ksni` ready on Linux) |
-| `muda` | `0.21` | Native tray menu (`0.21.1+` includes Windows 16-bit command ID recycling, no fork needed) |
+| `tray-icon` | `0.26` | System tray icon & click events (`muda-common-controls-v6` on Windows; `ksni` ready on Linux; bundles `muda 0.21` with 16-bit ID recycling) |
 | `winit` | `0.30` | Event loop via `ApplicationHandler<AppEvent>` + `EventLoopProxy` for zero-spin wakeups |
 | `ureq` | `3.5` | Synchronous local HTTP/1.1 client (`default-features = false, features = ["json"]`, no TLS/Tokio) |
 | `serde` | `1.0` | Serialization/deserialization framework (`derive`) |

@@ -31,12 +31,38 @@ struct PartialMihomoYaml {
     external_controller_unix: Option<String>,
     #[serde(rename = "external-controller-pipe")]
     external_controller_pipe: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_scalar_string")]
     secret: Option<String>,
     #[serde(rename = "external-ui")]
     external_ui: Option<String>,
     #[serde(rename = "mixed-port")]
     mixed_port: Option<u16>,
     port: Option<u16>,
+}
+
+fn deserialize_opt_scalar_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ScalarOrString {
+        Str(String),
+        Int(i64),
+        Uint(u64),
+        Float(f64),
+        Bool(bool),
+    }
+
+    Option::<ScalarOrString>::deserialize(deserializer).map(|opt| {
+        opt.map(|v| match v {
+            ScalarOrString::Str(s) => s,
+            ScalarOrString::Int(i) => i.to_string(),
+            ScalarOrString::Uint(u) => u.to_string(),
+            ScalarOrString::Float(f) => f.to_string(),
+            ScalarOrString::Bool(b) => b.to_string(),
+        })
+    })
 }
 
 pub fn read_file(path: &Path) -> Result<MihomoConfigInfo, String> {
@@ -53,11 +79,6 @@ fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
         serde_yaml_ng::from_str(clean).map_err(|e| e.to_string())?
     };
     Ok(extract_config_info(parsed))
-}
-
-#[cfg(test)]
-fn parse_str(text: &str) -> MihomoConfigInfo {
-    try_parse_str(text).unwrap_or_default()
 }
 
 fn extract_config_info(parsed: PartialMihomoYaml) -> MihomoConfigInfo {
@@ -140,23 +161,26 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
         .as_mapping()
         .ok_or_else(|| format!("{} root must be a YAML mapping", path.display()))?;
 
-    // 1. Insert or update `proxy-providers.subscription`
-    let sub_doc = MappingBuilder::new()
-        .pair("type", "http")
-        .pair("url", url)
-        .pair("path", SUBSCRIPTION_LOCAL_PATH)
-        .pair("interval", SUBSCRIPTION_INTERVAL_SECS as i64)
-        .mapping("health-check", |hc| {
-            hc.pair("enable", true)
-                .pair("url", HEALTH_CHECK_URL)
-                .pair("interval", 300)
-        })
-        .build_document();
+    // 1. Insert or update `proxy-providers.subscription` while preserving user keys.
     if let Some(providers_map) = root_map.get_mapping("proxy-providers") {
-        providers_map.set(SUBSCRIPTION_PROVIDER_NAME, &sub_doc);
+        if let Some(sub_map) = providers_map.get_mapping(SUBSCRIPTION_PROVIDER_NAME) {
+            sub_map.set("type", "http");
+            sub_map.set("url", url);
+            sub_map.set("path", SUBSCRIPTION_LOCAL_PATH);
+            sub_map.set("interval", SUBSCRIPTION_INTERVAL_SECS as i64);
+            if let Some(hc_map) = sub_map.get_mapping("health-check") {
+                hc_map.set("enable", true);
+                hc_map.set("url", HEALTH_CHECK_URL);
+                hc_map.set("interval", 300);
+            } else {
+                sub_map.set("health-check", build_health_check_doc());
+            }
+        } else {
+            providers_map.set(SUBSCRIPTION_PROVIDER_NAME, build_subscription_doc(url));
+        }
     } else {
         let providers_doc = MappingBuilder::new()
-            .pair(SUBSCRIPTION_PROVIDER_NAME, &sub_doc)
+            .pair(SUBSCRIPTION_PROVIDER_NAME, build_subscription_doc(url))
             .build_document();
         root_map.set("proxy-providers", &providers_doc);
     }
@@ -173,6 +197,28 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
 
     Ok(())
+}
+
+fn build_health_check_doc() -> Document {
+    MappingBuilder::new()
+        .pair("enable", true)
+        .pair("url", HEALTH_CHECK_URL)
+        .pair("interval", 300)
+        .build_document()
+}
+
+fn build_subscription_doc(url: &str) -> Document {
+    MappingBuilder::new()
+        .pair("type", "http")
+        .pair("url", url)
+        .pair("path", SUBSCRIPTION_LOCAL_PATH)
+        .pair("interval", SUBSCRIPTION_INTERVAL_SECS as i64)
+        .mapping("health-check", |hc| {
+            hc.pair("enable", true)
+                .pair("url", HEALTH_CHECK_URL)
+                .pair("interval", 300)
+        })
+        .build_document()
 }
 
 fn wire_subscription_into_groups(root_map: &Mapping) {
@@ -285,21 +331,24 @@ external-controller: 127.0.0.1:9090
 secret: "my#secret"
 external-ui: ./ui
 "#;
-        let info = parse_str(yaml);
+        let info = try_parse_str(yaml).unwrap();
         assert_eq!(info.external_controller.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(info.secret.as_deref(), Some("my#secret"));
         assert_eq!(info.external_ui.as_deref(), Some("./ui"));
         assert_eq!(info.mixed_port, 7890);
         assert!(!info.other_controller_family);
 
-        let fallback_port = parse_str("port: 7891\n");
+        let fallback_port = try_parse_str("port: 7891\n").unwrap();
         assert_eq!(fallback_port.mixed_port, 7891);
+
+        let numeric_secret = try_parse_str("secret: 123456\n").unwrap();
+        assert_eq!(numeric_secret.secret.as_deref(), Some("123456"));
     }
 
     #[test]
     fn detects_non_http_controller_families() {
         let yaml = "external-controller-unix: /tmp/mihomo.sock\n";
-        let info = parse_str(yaml);
+        let info = try_parse_str(yaml).unwrap();
         assert!(info.other_controller_family);
         assert!(info.external_controller.is_none());
     }
@@ -409,6 +458,26 @@ proxy-groups:
             Some("https://example.com/sub2")
         );
         assert!(apply_subscription_url(&cfg, "https://").is_err());
+
+        // Custom keys inside `proxy-providers.subscription` must survive URL updates.
+        let with_custom = "\
+proxy-providers:
+  subscription:
+    type: http
+    url: https://example.com/old
+    filter: \"HK|SG\"
+    override:
+      udp: true
+";
+        std::fs::write(&cfg, with_custom).unwrap();
+        apply_subscription_url(&cfg, "https://example.com/new").unwrap();
+        let after_custom = std::fs::read_to_string(&cfg).unwrap();
+        assert!(after_custom.contains("filter: \"HK|SG\""));
+        assert!(after_custom.contains("udp: true"));
+        assert_eq!(
+            read_subscription_url(&cfg).as_deref(),
+            Some("https://example.com/new")
+        );
 
         let parsed: Value = serde_yaml_ng::from_str(&updated).unwrap();
         let use_list = parsed["proxy-groups"][0]["use"].as_sequence().unwrap();

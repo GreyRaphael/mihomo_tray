@@ -10,23 +10,31 @@ use crate::platform;
 const AUTOSTART_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SettingsReload {
-    pub changed: bool,
+struct SettingsReload {
+    changed: bool,
+    controller_changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PollChanges {
+    pub settings_changed: bool,
     pub controller_changed: bool,
+    pub config_file_changed: bool,
+    pub error_changed: bool,
 }
 
 pub(super) struct ConfigTracker {
-    pub portable_root: PathBuf,
+    portable_root: PathBuf,
     settings_path: PathBuf,
-    pub settings: TraySettings,
+    settings: TraySettings,
     last_settings_mtime: Option<SystemTime>,
     last_config_mtime: Option<SystemTime>,
-    pub settings_error: Option<String>,
-    pub kernel_path_error: Option<String>,
-    pub known_kernel_path: Option<PathBuf>,
-    pub home_dir: PathBuf,
-    pub config_file: PathBuf,
-    pub cached_autostart: bool,
+    settings_error: Option<String>,
+    kernel_path_error: Option<String>,
+    known_kernel_path: Option<PathBuf>,
+    home_dir: PathBuf,
+    config_file: PathBuf,
+    cached_autostart: bool,
     last_autostart_check: Option<Instant>,
 }
 
@@ -57,20 +65,80 @@ impl ConfigTracker {
         }
     }
 
+    pub fn portable_root(&self) -> &Path {
+        &self.portable_root
+    }
+
+    pub fn settings(&self) -> &TraySettings {
+        &self.settings
+    }
+
+    pub fn known_kernel_path(&self) -> Option<&Path> {
+        self.known_kernel_path.as_deref()
+    }
+
+    pub fn set_known_kernel_path_if_none(&mut self, path: PathBuf) {
+        if self.known_kernel_path.is_none() {
+            self.known_kernel_path = Some(path);
+        }
+    }
+
+    pub fn kernel_path_error(&self) -> Option<&str> {
+        self.kernel_path_error.as_deref()
+    }
+
+    pub fn home_dir(&self) -> &Path {
+        &self.home_dir
+    }
+
+    pub fn config_file(&self) -> &Path {
+        &self.config_file
+    }
+
+    pub fn cached_autostart(&self) -> bool {
+        self.cached_autostart
+    }
+
+    pub fn has_settings_error(&self) -> bool {
+        self.settings_error.is_some()
+    }
+
     pub fn current_config_error(&self) -> Option<String> {
         self.settings_error
             .clone()
             .or_else(|| self.kernel_path_error.clone())
     }
 
-    pub fn reload_settings_if_changed(&mut self) -> SettingsReload {
-        if file_mtime(&self.settings_path) == self.last_settings_mtime {
-            return SettingsReload {
-                changed: false,
-                controller_changed: false,
-            };
+    pub fn poll_changes(&mut self, tracked_alive: bool) -> PollChanges {
+        let prev_error = self.current_config_error();
+        let mut settings_changed = false;
+        let mut controller_changed = false;
+        let mut path_switched = false;
+
+        if file_mtime(&self.settings_path) != self.last_settings_mtime {
+            let reload = self.load_settings_from_disk();
+            settings_changed = reload.changed;
+            controller_changed = reload.controller_changed;
+            if settings_changed && !tracked_alive {
+                path_switched = self.refresh_paths();
+            }
         }
-        self.load_settings_from_disk()
+
+        let config_file_changed = path_switched || self.config_file_changed();
+        let error_changed = self.current_config_error() != prev_error;
+        PollChanges {
+            settings_changed,
+            controller_changed,
+            config_file_changed,
+            error_changed,
+        }
+    }
+
+    pub fn reload_settings_and_paths(&mut self) {
+        if file_mtime(&self.settings_path) != self.last_settings_mtime {
+            let _ = self.load_settings_from_disk();
+        }
+        self.refresh_paths();
     }
 
     fn load_settings_from_disk(&mut self) -> SettingsReload {
@@ -99,7 +167,7 @@ impl ConfigTracker {
         }
     }
 
-    pub fn refresh_paths(&mut self) {
+    fn refresh_paths(&mut self) -> bool {
         match discover::find_kernel(&self.portable_root, &self.settings) {
             Ok(path) => {
                 self.known_kernel_path = path;
@@ -110,6 +178,7 @@ impl ConfigTracker {
                 self.kernel_path_error = Some(err);
             }
         }
+        let prev_config = self.config_file.clone();
         let (home, cfg) = discover::resolve_home_and_config(
             &self.portable_root,
             &self.settings,
@@ -117,10 +186,12 @@ impl ConfigTracker {
         );
         self.home_dir = home;
         self.config_file = cfg;
+        let switched = self.config_file != prev_config;
         self.last_config_mtime = file_mtime(&self.config_file);
+        switched
     }
 
-    pub fn config_file_changed(&mut self) -> bool {
+    fn config_file_changed(&mut self) -> bool {
         let mtime = file_mtime(&self.config_file);
         if mtime != self.last_config_mtime {
             self.last_config_mtime = mtime;
@@ -159,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_parse_error_recovery_even_when_settings_match_defaults() {
+    fn tracks_parse_error_transitions_both_ways_even_with_defaults() {
         let root = crate::config::test_temp_dir("cfg_tracker_recover");
         let settings_path = tray::settings_path(&root);
         std::fs::write(&settings_path, "mihomo: [unclosed").unwrap();
@@ -172,13 +243,22 @@ mod tests {
         );
         assert!(tracker.current_config_error().is_some());
 
-        // Write valid empty YAML matching defaults -> must still report changed & clear error.
+        // Write valid empty YAML matching defaults -> must report changed & clear error.
         std::fs::write(&settings_path, "").unwrap();
         tracker.invalidate_settings_mtime();
-        let reload = tracker.reload_settings_if_changed();
-        assert!(reload.changed);
-        assert!(reload.controller_changed);
+        let recover = tracker.poll_changes(false);
+        assert!(recover.settings_changed);
+        assert!(recover.controller_changed);
+        assert!(recover.error_changed);
         assert_eq!(tracker.current_config_error(), None);
+
+        // Break YAML again at runtime -> must surface `error_changed`.
+        std::fs::write(&settings_path, "controller: [broken").unwrap();
+        tracker.invalidate_settings_mtime();
+        let broken = tracker.poll_changes(false);
+        assert!(!broken.settings_changed);
+        assert!(broken.error_changed);
+        assert!(tracker.current_config_error().is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }

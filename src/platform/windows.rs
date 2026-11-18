@@ -54,11 +54,11 @@ pub fn expand_env(value: &str) -> String {
 }
 
 pub fn resolve_shim_target(path: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(path).ok()?;
+    let shim_file = path.with_extension("shim");
+    let meta = std::fs::metadata(&shim_file).ok()?;
     if meta.len() > SCOOP_SHIM_MAX_BYTES {
         return None;
     }
-    let shim_file = path.with_extension("shim");
     let content = std::fs::read_to_string(shim_file).ok()?;
     let target = crate::platform::parse_shim_path(&content)?;
     target.is_file().then_some(target)

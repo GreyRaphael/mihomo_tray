@@ -11,7 +11,7 @@ use crate::text;
 pub enum MenuAction {
     OpenWebUi,
     SetSubscriptionUrl,
-    SetMode(String),
+    SetMode(ProxyMode),
     ToggleSystemProxy,
     ToggleTun,
     SelectProxy { group: String, member: String },
@@ -207,7 +207,7 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
             label,
             mode_enabled,
             active_mode == mode_variant,
-            MenuAction::SetMode(mode_variant.as_api_str().to_string()),
+            MenuAction::SetMode(mode_variant),
         );
     }
     let _ = menu.append(&PredefinedMenuItem::separator());

@@ -178,7 +178,7 @@ pub enum AsyncTaskKind {
 
 #[derive(Debug, Clone)]
 pub enum WorkerCommand {
-    SetMode(String),
+    SetMode(ProxyMode),
     ToggleSystemProxy,
     ToggleTun,
     SelectProxy {

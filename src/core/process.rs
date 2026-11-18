@@ -88,6 +88,7 @@ impl ProcessInspector {
                 .with_cmd(UpdateKind::Always),
         );
 
+        let expected_matcher = expected_kernel.map(ExpectedKernelMatcher::new);
         let self_pid = std::process::id();
         let mut out = Vec::new();
         for (pid, proc_info) in sys.processes() {
@@ -97,12 +98,13 @@ impl ProcessInspector {
             let name = proc_info.name().to_string_lossy();
             let exe = proc_info.exe().map(Path::to_path_buf);
 
-            let name_matches = platform::is_kernel_candidate_name(&name);
-            let path_matches = expected_kernel
-                .zip(exe.as_deref())
-                .is_some_and(|(want, got)| paths_match(want, got));
+            let matches = platform::is_kernel_candidate_name(&name)
+                || expected_matcher
+                    .as_ref()
+                    .zip(exe.as_deref())
+                    .is_some_and(|(matcher, got)| matcher.matches(got));
 
-            if name_matches || path_matches {
+            if matches {
                 let cmd = proc_info
                     .cmd()
                     .iter()
@@ -221,6 +223,48 @@ pub fn terminate_pid_and_wait(pid: u32) -> Result<(), String> {
         }
     }
     Err(format!("process {pid} did not exit within timeout"))
+}
+
+struct ExpectedKernelMatcher {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl ExpectedKernelMatcher {
+    fn new(raw: &Path) -> Self {
+        Self {
+            raw: raw.to_path_buf(),
+            canonical: std::fs::canonicalize(raw).ok(),
+        }
+    }
+
+    fn matches(&self, exe: &Path) -> bool {
+        if eq_path(&self.raw, exe)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|canon| eq_path(canon, exe))
+        {
+            return true;
+        }
+        let Some(got_name) = exe.file_name() else {
+            return false;
+        };
+        let same_filename = [
+            self.raw.file_name(),
+            self.canonical.as_deref().and_then(Path::file_name),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|want_name| eq_path(Path::new(want_name), Path::new(got_name)));
+        if !same_filename {
+            return false;
+        }
+        match (self.canonical.as_deref(), std::fs::canonicalize(exe)) {
+            (Some(ca), Ok(cb)) => eq_path(ca, &cb),
+            _ => false,
+        }
+    }
 }
 
 pub fn paths_match(a: &Path, b: &Path) -> bool {
@@ -367,6 +411,31 @@ mod tests {
             },
         );
         assert!(is_authorized_helper_exe("my-core.exe", &custom_exe, &root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expected_kernel_matcher_handles_canonical_and_unrelated_paths() {
+        let root = crate::config::test_temp_dir("kernel_matcher");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let real_exe = sub.join("custom-proxy");
+        std::fs::write(&real_exe, b"bin").unwrap();
+
+        let unnormalized = root.join("sub").join("..").join("sub").join("custom-proxy");
+        let matcher = ExpectedKernelMatcher::new(&unnormalized);
+        assert!(matcher.matches(&real_exe));
+        assert!(matcher.matches(&unnormalized));
+        assert!(!matcher.matches(&root.join("sub").join("other-proc")));
+
+        #[cfg(unix)]
+        {
+            let link = root.join("proxy-link");
+            std::os::unix::fs::symlink(&real_exe, &link).unwrap();
+            let link_matcher = ExpectedKernelMatcher::new(&link);
+            assert!(link_matcher.matches(&real_exe));
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

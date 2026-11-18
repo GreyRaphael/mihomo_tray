@@ -1,7 +1,6 @@
 //! Platform boundary isolating Windows-specific integrations from cross-platform core logic.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(windows))]
 mod stub;
@@ -12,8 +11,6 @@ mod windows;
 use stub as imp;
 #[cfg(windows)]
 use windows as imp;
-
-static PROMPT_OPEN: AtomicBool = AtomicBool::new(false);
 
 pub const ELEVATE_START_FLAG: &str = "--elevate-start";
 pub const ELEVATE_STOP_FLAG: &str = "--elevate-stop";
@@ -241,20 +238,6 @@ pub fn is_tray_menu_open() -> bool {
 
 /// Prompts the user with a simple modal text input box for a subscription URL.
 pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
-    if PROMPT_OPEN
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return None;
-    }
-    struct PromptGuard;
-    impl Drop for PromptGuard {
-        fn drop(&mut self) {
-            PROMPT_OPEN.store(false, Ordering::Release);
-        }
-    }
-    let _guard = PromptGuard;
-
     if !can_show_dialog() {
         tracing::warn!("No native text input backend available on this system");
         return None;

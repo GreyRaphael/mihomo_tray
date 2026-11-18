@@ -1,27 +1,33 @@
 //! Background worker thread for mihomo lifecycle, polling, and controller commands.
 
+mod config_tracker;
+mod state_sync;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use winit::event_loop::EventLoopProxy;
 
+use self::config_tracker::ConfigTracker;
+use self::state_sync::StateSync;
 use crate::config::mihomo;
-use crate::config::state_store::{self, PersistedState};
-use crate::config::tray::{self, TraySettings};
+use crate::config::state_store::PersistedState;
+use crate::config::tray::TraySettings;
 use crate::core::api::{Client, CoreConfigs};
 use crate::core::discover;
 use crate::core::process::{self, ManagedChild, ProcessInspector, RunningProcess, RuntimeRecord};
 use crate::platform;
-use crate::state::{self, AppEvent, AsyncTaskKind, Provider, SharedSnapshot, WorkerCommand};
+use crate::state::{
+    self, AppEvent, AsyncTaskKind, Provider, ProxyMode, SharedSnapshot, WorkerCommand,
+};
 use crate::text;
 
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
 const KERNEL_RESTART_BUDGET: Duration = Duration::from_secs(10);
-const AUTOSTART_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct WorkerHandle {
     pub tx: Sender<WorkerCommand>,
@@ -102,14 +108,8 @@ pub fn spawn(
 }
 
 struct Worker {
-    portable_root: PathBuf,
-    settings_path: PathBuf,
-    settings: TraySettings,
-    last_settings_mtime: Option<SystemTime>,
-    last_config_mtime: Option<SystemTime>,
-    settings_error: Option<String>,
-    kernel_path_error: Option<String>,
-    last_controller_ok: bool,
+    cfg: ConfigTracker,
+    state_sync: StateSync,
     shared: SharedSnapshot,
     proxy: UiNotifier,
     stop_requested: Arc<AtomicBool>,
@@ -119,22 +119,10 @@ struct Worker {
     pending_sub_reload: bool,
     process_inspector: ProcessInspector,
     managed: Option<ManagedChild>,
-    known_kernel_path: Option<PathBuf>,
     recorded_pid: Option<u32>,
     client: Option<Client>,
     cached_version: String,
-    cached_autostart: bool,
-    last_autostart_check: Option<Instant>,
-    home_dir: PathBuf,
-    config_file: PathBuf,
-    persisted_state: Option<PersistedState>,
-    pending_restore: Option<PersistedState>,
-    pending_reload_restore: Option<PersistedState>,
-}
-
-struct SettingsReload {
-    changed: bool,
-    controller_changed: bool,
+    last_controller_ok: bool,
 }
 
 impl Worker {
@@ -148,25 +136,16 @@ impl Worker {
         stop_requested: Arc<AtomicBool>,
     ) -> (Self, mpsc::Receiver<WorkerCommand>) {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
-        let (home_dir, config_file) =
-            discover::resolve_home_and_config(&portable_root, &settings, None);
-        let last_settings_mtime = file_mtime(&settings_path);
-        let last_config_mtime = file_mtime(&config_file);
+        let cfg = ConfigTracker::new(portable_root, settings_path, settings, startup_error);
         {
             let mut snap = shared.lock().unwrap();
-            snap.page_size = settings.groups.page_size;
-            snap.resolved_config = Some(config_file.clone());
-            snap.config_error = startup_error.clone();
+            snap.page_size = cfg.settings.groups.page_size;
+            snap.resolved_config = Some(cfg.config_file.clone());
+            snap.config_error = cfg.current_config_error();
         }
         let worker = Self {
-            portable_root,
-            settings_path,
-            settings,
-            last_settings_mtime,
-            last_config_mtime,
-            settings_error: startup_error,
-            kernel_path_error: None,
-            last_controller_ok: false,
+            cfg,
+            state_sync: StateSync::default(),
             shared,
             proxy,
             stop_requested,
@@ -176,17 +155,10 @@ impl Worker {
             pending_sub_reload: false,
             process_inspector: ProcessInspector::new(),
             managed: None,
-            known_kernel_path: None,
             recorded_pid: None,
             client: None,
             cached_version: String::new(),
-            cached_autostart: false,
-            last_autostart_check: None,
-            home_dir,
-            config_file,
-            persisted_state: None,
-            pending_restore: None,
-            pending_reload_restore: None,
+            last_controller_ok: false,
         };
         (worker, rx)
     }
@@ -195,7 +167,7 @@ impl Worker {
         self.startup();
 
         loop {
-            let interval = Duration::from_millis(self.settings.ui.poll_interval_ms as u64);
+            let interval = Duration::from_millis(self.cfg.settings.ui.poll_interval_ms as u64);
             match rx.recv_timeout(interval) {
                 Ok(WorkerCommand::Quit { interactive }) => {
                     if self.handle_quit(interactive) {
@@ -254,20 +226,20 @@ impl Worker {
 
     fn startup(&mut self) {
         self.reload_paths_and_runtime();
-        self.load_initial_persisted_state();
-        self.refresh_autostart_cache();
+        self.state_sync.load_initial(&self.cfg.home_dir);
+        self.cfg.refresh_autostart_cache();
         let running = self
             .process_inspector
-            .list_running_mihomo(self.known_kernel_path.as_deref());
+            .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
         self.re_resolve_controller(&running);
 
         let controller_alive = self.client.as_ref().is_some_and(|c| c.probe().is_ok());
 
         if controller_alive {
             // Core is already running; preserve its live mode/TUN instead of overriding from disk.
-            self.pending_restore = None;
+            self.state_sync.clear_pending_restore();
         } else if running.is_empty()
-            && self.settings.mihomo.auto_start
+            && self.cfg.settings.mihomo.auto_start
             && let Err(err) = self.start_core_internal()
         {
             tracing::warn!("Auto-start core failed: {err}");
@@ -281,119 +253,33 @@ impl Worker {
         }
     }
 
-    fn load_initial_persisted_state(&mut self) {
-        self.persisted_state = state_store::load(&self.home_dir);
-        self.pending_restore = self.persisted_state.clone();
-    }
-
-    fn update_persisted_state(&mut self, update: impl FnOnce(&mut PersistedState)) {
-        let state = self
-            .persisted_state
-            .get_or_insert_with(PersistedState::default);
-        update(state);
-        state_store::save(&self.home_dir, state);
-    }
-
-    fn load_settings_from_disk(&mut self) -> SettingsReload {
-        self.last_settings_mtime = file_mtime(&self.settings_path);
-        let prev_settings = self.settings.clone();
-        let prev_controller = self.settings.controller.clone();
-        let had_error = self.settings_error.is_some();
-        match tray::load(&self.settings_path) {
-            Ok(reloaded) => {
-                let changed = had_error || reloaded != prev_settings;
-                let controller_changed = had_error || reloaded.controller != prev_controller;
-                self.settings = reloaded;
-                self.settings_error = None;
-                self.sync_config_error();
-                SettingsReload {
-                    changed,
-                    controller_changed,
-                }
-            }
-            Err(err) => {
-                self.settings_error = Some(err);
-                self.sync_config_error();
-                SettingsReload {
-                    changed: false,
-                    controller_changed: false,
-                }
-            }
-        }
-    }
-
-    fn refresh_paths(&mut self) {
-        match discover::find_kernel(&self.portable_root, &self.settings) {
-            Ok(path) => {
-                self.known_kernel_path = path;
-                self.kernel_path_error = None;
-            }
-            Err(err) => {
-                self.known_kernel_path = None;
-                self.kernel_path_error = Some(err);
-            }
-        }
-        let (home, cfg) = discover::resolve_home_and_config(
-            &self.portable_root,
-            &self.settings,
-            self.known_kernel_path.as_deref(),
-        );
-        self.home_dir = home;
-        self.config_file = cfg;
-        self.last_config_mtime = file_mtime(&self.config_file);
-        self.sync_config_error();
-    }
-
-    fn reload_settings_if_changed(&mut self) -> SettingsReload {
-        if file_mtime(&self.settings_path) == self.last_settings_mtime {
-            return SettingsReload {
-                changed: false,
-                controller_changed: false,
-            };
-        }
-        self.load_settings_from_disk()
-    }
-
-    fn refresh_autostart_cache(&mut self) {
-        self.cached_autostart = platform::autostart_is_enabled();
-        self.last_autostart_check = Some(Instant::now());
-    }
-
-    fn refresh_autostart_if_stale(&mut self) {
-        if self
-            .last_autostart_check
-            .is_none_or(|t| t.elapsed() >= AUTOSTART_REFRESH_INTERVAL)
-        {
-            self.refresh_autostart_cache();
-        }
-    }
-
     fn reload_paths_and_runtime(&mut self) {
-        self.reload_settings_if_changed();
-        self.refresh_paths();
+        self.cfg.reload_settings_if_changed();
+        self.cfg.refresh_paths();
+        self.sync_config_error();
 
-        if let Some(rec) = process::load_runtime_record(&self.home_dir) {
+        if let Some(rec) = process::load_runtime_record(&self.cfg.home_dir) {
             if self
                 .process_inspector
                 .is_recorded_kernel_alive(rec.pid, Some(&rec.kernel_path))
             {
                 self.recorded_pid = Some(rec.pid);
-                if self.known_kernel_path.is_none() {
-                    self.known_kernel_path = Some(rec.kernel_path);
+                if self.cfg.known_kernel_path.is_none() {
+                    self.cfg.known_kernel_path = Some(rec.kernel_path);
                 }
             } else {
                 self.recorded_pid = None;
-                process::clear_runtime_record(&self.home_dir);
+                process::clear_runtime_record(&self.cfg.home_dir);
             }
         }
     }
 
     fn re_resolve_controller(&mut self, running: &[RunningProcess]) {
         match discover::resolve_controller(
-            &self.portable_root,
-            &self.settings,
+            &self.cfg.portable_root,
+            &self.cfg.settings,
             running,
-            Some(&self.config_file),
+            Some(&self.cfg.config_file),
         ) {
             Ok(client) => {
                 self.client = Some(client);
@@ -408,7 +294,7 @@ impl Worker {
 
     fn handle_command(&mut self, cmd: WorkerCommand) -> Result<bool, String> {
         match cmd {
-            WorkerCommand::SetMode(mode) => self.set_mode(&mode).map(|()| true),
+            WorkerCommand::SetMode(mode) => self.set_mode(mode).map(|()| true),
             WorkerCommand::ToggleSystemProxy => self.toggle_system_proxy().map(|()| true),
             WorkerCommand::ToggleTun => self.toggle_tun().map(|()| true),
             WorkerCommand::SelectProxy { group, member } => self
@@ -427,7 +313,7 @@ impl Worker {
             WorkerCommand::ToggleAutostart => {
                 let enabled = platform::autostart_is_enabled();
                 let res = platform::autostart_set(!enabled);
-                self.refresh_autostart_cache();
+                self.cfg.refresh_autostart_cache();
                 res.map(|()| true)
             }
             WorkerCommand::AsyncDone { kind, error } => self.handle_async_done(kind, error),
@@ -462,9 +348,7 @@ impl Worker {
                         return Ok(false);
                     }
                     self.set_status_note(None);
-                    if let Some(restore) = self.pending_reload_restore.take() {
-                        self.pending_restore = Some(restore);
-                    }
+                    self.state_sync.promote_reload_restore(true);
                     return Ok(false);
                 }
                 self.set_status_note(None);
@@ -486,10 +370,7 @@ impl Worker {
                     }
                 }
                 self.set_status_note(None);
-                let restore = self.pending_reload_restore.take();
-                if reload_ok && restore.is_some() {
-                    self.pending_restore = restore;
-                }
+                self.state_sync.promote_reload_restore(reload_ok);
                 match error {
                     Some(err) => Err(err),
                     None => Ok(false),
@@ -498,9 +379,14 @@ impl Worker {
         }
     }
 
-    fn set_mode(&mut self, mode: &str) -> Result<(), String> {
-        self.with_client(|c| c.set_mode(mode))?;
-        self.update_persisted_state(|s| s.mode = Some(mode.to_string()));
+    fn set_mode(&mut self, mode: ProxyMode) -> Result<(), String> {
+        let mode_str = mode.as_api_str();
+        if mode_str.is_empty() {
+            return Err("unsupported proxy mode".to_string());
+        }
+        self.with_client(|c| c.set_mode(mode_str))?;
+        self.state_sync
+            .update(&self.cfg.home_dir, |s| s.mode = Some(mode_str.to_string()));
         Ok(())
     }
 
@@ -518,7 +404,8 @@ impl Worker {
     fn toggle_system_proxy(&mut self) -> Result<(), String> {
         if platform::proxy_is_enabled() {
             platform::proxy_disable()?;
-            self.update_persisted_state(|s| s.system_proxy = false);
+            self.state_sync
+                .update(&self.cfg.home_dir, |s| s.system_proxy = false);
             return Ok(());
         }
         let client = self
@@ -529,8 +416,9 @@ impl Worker {
         if cfg.mixed_port == 0 {
             return Err(text::ERR_NO_MIXED_PORT_FOR_PROXY.to_string());
         }
-        platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)?;
-        self.update_persisted_state(|s| s.system_proxy = true);
+        platform::proxy_enable(cfg.mixed_port, &self.cfg.settings.proxy.bypass)?;
+        self.state_sync
+            .update(&self.cfg.home_dir, |s| s.system_proxy = true);
         Ok(())
     }
 
@@ -542,7 +430,8 @@ impl Worker {
         let current = client.get_configs()?;
         let want_enable = !current.tun_enable;
         self.apply_tun_state(want_enable)?;
-        self.update_persisted_state(|s| s.tun = Some(want_enable));
+        self.state_sync
+            .update(&self.cfg.home_dir, |s| s.tun = Some(want_enable));
         Ok(())
     }
 
@@ -574,21 +463,21 @@ impl Worker {
         // TUN failed to activate -> elevate running kernel via hidden UAC self-helper.
         let running = self
             .process_inspector
-            .list_running_mihomo(self.known_kernel_path.as_deref());
+            .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
         let target = process::pick_target_process(
             &running,
             self.active_pid(),
-            self.known_kernel_path.as_deref(),
+            self.cfg.known_kernel_path.as_deref(),
         )
         .ok_or_else(|| text::ERR_LOCATE_ELEVATE_PROCESS.to_string())?;
 
         let kernel_path = target
             .exe
             .clone()
-            .or_else(|| self.known_kernel_path.clone());
+            .or_else(|| self.cfg.known_kernel_path.clone());
         let launch_args = discover::build_launch_args(
-            &self.portable_root,
-            &self.settings,
+            &self.cfg.portable_root,
+            &self.cfg.settings,
             kernel_path.as_deref(),
         )?;
 
@@ -613,7 +502,7 @@ impl Worker {
         self.cached_version.clear();
         if let Some(ref kernel) = kernel_path {
             process::save_runtime_record(
-                &self.home_dir,
+                &self.cfg.home_dir,
                 &RuntimeRecord {
                     pid: new_pid,
                     kernel_path: kernel.clone(),
@@ -639,11 +528,11 @@ impl Worker {
         self.reload_paths_and_runtime();
         let running = self
             .process_inspector
-            .list_running_mihomo(self.known_kernel_path.as_deref());
+            .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
         if process::pick_target_process(
             &running,
             self.active_pid(),
-            self.known_kernel_path.as_deref(),
+            self.cfg.known_kernel_path.as_deref(),
         )
         .is_some()
         {
@@ -651,22 +540,25 @@ impl Worker {
             return Ok(());
         }
 
-        let kernel_path = discover::find_kernel(&self.portable_root, &self.settings)?
+        let kernel_path = discover::find_kernel(&self.cfg.portable_root, &self.cfg.settings)?
             .ok_or_else(|| text::ERR_CORE_NOT_FOUND.to_string())?;
-        self.known_kernel_path = Some(kernel_path.clone());
+        self.cfg.known_kernel_path = Some(kernel_path.clone());
 
         let (home_dir, config_file) = discover::resolve_home_and_config(
-            &self.portable_root,
-            &self.settings,
+            &self.cfg.portable_root,
+            &self.cfg.settings,
             Some(&kernel_path),
         );
-        self.home_dir = home_dir.clone();
-        self.config_file = config_file.clone();
+        self.cfg.home_dir = home_dir.clone();
+        self.cfg.config_file = config_file.clone();
         let _ = std::fs::create_dir_all(&home_dir);
         mihomo::ensure_default_config(&config_file);
 
-        let args =
-            discover::build_launch_args(&self.portable_root, &self.settings, Some(&kernel_path))?;
+        let args = discover::build_launch_args(
+            &self.cfg.portable_root,
+            &self.cfg.settings,
+            Some(&kernel_path),
+        )?;
 
         self.set_status_note(Some(text::STATUS_STARTING_CORE));
         let child = process::spawn_normal(&kernel_path, &args)?;
@@ -675,7 +567,7 @@ impl Worker {
         self.recorded_pid = Some(pid);
         self.cached_version.clear();
         process::save_runtime_record(
-            &self.home_dir,
+            &self.cfg.home_dir,
             &RuntimeRecord {
                 pid,
                 kernel_path: kernel_path.clone(),
@@ -694,10 +586,7 @@ impl Worker {
     }
 
     fn disable_managed_system_proxy(&self) {
-        if self
-            .persisted_state
-            .as_ref()
-            .is_some_and(|s| s.system_proxy)
+        if self.state_sync.has_persisted_system_proxy()
             && platform::proxy_is_enabled()
             && let Err(err) = platform::proxy_disable()
         {
@@ -707,7 +596,7 @@ impl Worker {
 
     fn stop_core_internal(&mut self, interactive: bool) -> Result<(), String> {
         self.set_status_note(Some(text::STATUS_STOPPING_CORE));
-        let res = self.stop_active_kernel(interactive);
+        let res = self.stop_active_kernel(interactive, None);
         self.set_status_note(None);
         match res {
             Ok(()) => {
@@ -733,46 +622,47 @@ impl Worker {
 
     fn force_restart_core(&mut self) -> Result<(), String> {
         let saved = self.capture_live_or_persisted_state();
-        self.pending_restore = Some(saved);
+        self.state_sync.set_pending_restore(saved);
         self.reload_paths_and_runtime();
         let running = self
             .process_inspector
-            .list_running_mihomo(self.known_kernel_path.as_deref());
-        if !running.is_empty() {
+            .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
+        if self.managed.is_some() || !running.is_empty() {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
-            let stop_res = self.stop_active_kernel(true);
+            let stop_res = self.stop_active_kernel(true, Some(running));
             self.set_status_note(None);
             stop_res?;
         }
         self.start_core_internal()
     }
 
-    fn stop_active_kernel(&mut self, interactive: bool) -> Result<(), String> {
+    fn stop_active_kernel(
+        &mut self,
+        interactive: bool,
+        prefetched: Option<Vec<RunningProcess>>,
+    ) -> Result<(), String> {
         // First try managed non-elevated child directly.
         if let Some(mut managed) = self.managed.take() {
             if matches!(managed.child.try_wait(), Ok(None)) {
                 if managed.child.kill().is_ok() {
                     let _ = managed.child.wait();
-                    self.recorded_pid = None;
-                    self.cached_version.clear();
-                    process::clear_runtime_record(&self.home_dir);
+                    self.clear_running_tracking();
                     return Ok(());
                 }
             } else {
-                self.recorded_pid = None;
-                self.cached_version.clear();
-                process::clear_runtime_record(&self.home_dir);
+                self.clear_running_tracking();
                 return Ok(());
             }
         }
 
-        let running = self
-            .process_inspector
-            .list_running_mihomo(self.known_kernel_path.as_deref());
+        let running = prefetched.unwrap_or_else(|| {
+            self.process_inspector
+                .list_running_mihomo(self.cfg.known_kernel_path.as_deref())
+        });
         let target = process::pick_target_process(
             &running,
             self.active_pid(),
-            self.known_kernel_path.as_deref(),
+            self.cfg.known_kernel_path.as_deref(),
         )
         .cloned()
         .or_else(|| {
@@ -788,7 +678,7 @@ impl Worker {
 
         let Some(target) = target else {
             self.recorded_pid = None;
-            process::clear_runtime_record(&self.home_dir);
+            process::clear_runtime_record(&self.cfg.home_dir);
             return Ok(());
         };
 
@@ -805,10 +695,14 @@ impl Worker {
             }
         }
 
+        self.clear_running_tracking();
+        Ok(())
+    }
+
+    fn clear_running_tracking(&mut self) {
         self.recorded_pid = None;
         self.cached_version.clear();
-        process::clear_runtime_record(&self.home_dir);
-        Ok(())
+        process::clear_runtime_record(&self.cfg.home_dir);
     }
 
     fn wait_for_controller(&mut self, budget: Duration, timeout_msg: &str) -> Result<(), String> {
@@ -822,7 +716,7 @@ impl Worker {
             {
                 self.managed = None;
                 self.recorded_pid = None;
-                process::clear_runtime_record(&self.home_dir);
+                process::clear_runtime_record(&self.cfg.home_dir);
                 return Err(text::ERR_CORE_STOPPED_UNEXPECTEDLY.to_string());
             }
             if let Some(client) = &self.client
@@ -843,7 +737,7 @@ impl Worker {
         let port = if snap_port > 0 {
             snap_port
         } else {
-            mihomo::read_file(&self.config_file)
+            mihomo::read_file(&self.cfg.config_file)
                 .map(|info| info.mixed_port)
                 .unwrap_or(0)
         };
@@ -970,6 +864,7 @@ impl Worker {
 
     fn spawn_apply_subscription_reload(&mut self, client: Client) {
         let sub_cache = self
+            .cfg
             .home_dir
             .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
         if self.spawn_background_task(
@@ -997,18 +892,18 @@ impl Worker {
             },
         ) {
             self.sub_task_active = true;
-        } else if let Some(restore) = self.pending_reload_restore.take() {
-            self.pending_restore = Some(restore);
+        } else {
+            self.state_sync.promote_reload_restore(true);
         }
     }
 
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
         let saved = self.capture_live_or_persisted_state();
-        mihomo::apply_subscription_url(&self.config_file, url)?;
+        mihomo::apply_subscription_url(&self.cfg.config_file, url)?;
         if let Some(client) = self.client.clone()
             && client.probe().is_ok()
         {
-            self.pending_reload_restore = Some(saved);
+            self.state_sync.arm_reload_restore(saved);
             if self.sub_task_active {
                 self.pending_sub_reload = true;
                 self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
@@ -1018,34 +913,19 @@ impl Worker {
             return Ok(());
         }
         self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
-        self.pending_restore = Some(saved);
+        self.state_sync.set_pending_restore(saved);
         let res = self.start_core_internal();
         self.set_status_note(None);
         res
     }
 
     fn capture_live_or_persisted_state(&self) -> PersistedState {
-        if let Some(pending) = self
-            .pending_restore
-            .as_ref()
-            .or(self.pending_reload_restore.as_ref())
-        {
-            return pending.clone();
-        }
         let snap = self.shared.lock().unwrap();
-        if snap.controller_ok {
-            PersistedState {
-                system_proxy: platform::proxy_is_enabled(),
-                mode: (!snap.mode.is_empty()).then(|| snap.mode.clone()),
-                tun: Some(snap.tun),
-            }
-        } else {
-            self.persisted_state.clone().unwrap_or_default()
-        }
+        self.state_sync.capture_live_or_persisted(&snap)
     }
 
     fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) {
-        let Some(restore) = self.pending_restore.take() else {
+        let Some(restore) = self.state_sync.take_pending_restore() else {
             return;
         };
 
@@ -1063,7 +943,8 @@ impl Worker {
                     }
                 }
                 Err(err) => {
-                    self.update_persisted_state(|s| s.tun = Some(false));
+                    self.state_sync
+                        .update(&self.cfg.home_dir, |s| s.tun = Some(false));
                     self.set_action_error(Some(err));
                 }
             }
@@ -1082,7 +963,7 @@ impl Worker {
             if cfg.mixed_port == 0 {
                 self.set_action_error(Some(text::ERR_NO_MIXED_PORT_FOR_RESTORE.to_string()));
             } else if let Err(err) =
-                platform::proxy_enable(cfg.mixed_port, &self.settings.proxy.bypass)
+                platform::proxy_enable(cfg.mixed_port, &self.cfg.settings.proxy.bypass)
             {
                 self.set_action_error(Some(err));
             }
@@ -1091,7 +972,8 @@ impl Worker {
 
     fn handle_quit(&mut self, interactive: bool) -> bool {
         let final_state = self.capture_live_or_persisted_state();
-        self.update_persisted_state(|s| *s = final_state);
+        self.state_sync
+            .update(&self.cfg.home_dir, |s| *s = final_state);
         match self.stop_core_internal(interactive) {
             Ok(()) => {
                 self.proxy.send(AppEvent::QuitCompleted);
@@ -1115,37 +997,36 @@ impl Worker {
         if let Some(pid) = self.recorded_pid {
             if self
                 .process_inspector
-                .is_recorded_kernel_alive(pid, self.known_kernel_path.as_deref())
+                .is_recorded_kernel_alive(pid, self.cfg.known_kernel_path.as_deref())
             {
                 return Some(pid);
             }
             self.recorded_pid = None;
-            process::clear_runtime_record(&self.home_dir);
+            process::clear_runtime_record(&self.cfg.home_dir);
         }
         None
     }
 
     fn resolve_live_controller(&mut self) -> bool {
-        let reload = self.reload_settings_if_changed();
+        let reload = self.cfg.reload_settings_if_changed();
+        if reload.changed || self.cfg.settings_error.is_none() {
+            self.sync_config_error();
+        }
         let tracked_alive = self.active_pid().is_some();
         let mut running = if !tracked_alive || self.client.is_none() || reload.changed {
             self.process_inspector
-                .list_running_mihomo(self.known_kernel_path.as_deref())
+                .list_running_mihomo(self.cfg.known_kernel_path.as_deref())
         } else {
             Vec::new()
         };
         let kernel_running = tracked_alive || !running.is_empty();
 
         if reload.changed && !kernel_running {
-            self.refresh_paths();
+            self.cfg.refresh_paths();
+            self.sync_config_error();
         }
 
-        let config_mtime = file_mtime(&self.config_file);
-        let config_changed = config_mtime != self.last_config_mtime;
-        if config_changed {
-            self.last_config_mtime = config_mtime;
-        }
-
+        let config_changed = self.cfg.config_file_changed();
         let need_resolve = reload.controller_changed
             || (reload.changed && !kernel_running)
             || config_changed
@@ -1154,7 +1035,7 @@ impl Worker {
             if running.is_empty() && kernel_running {
                 running = self
                     .process_inspector
-                    .list_running_mihomo(self.known_kernel_path.as_deref());
+                    .list_running_mihomo(self.cfg.known_kernel_path.as_deref());
             }
             self.re_resolve_controller(&running);
         }
@@ -1168,7 +1049,7 @@ impl Worker {
         let Some(client) = client_opt else {
             return (false, String::new(), 0, false, None, None);
         };
-        let web_ui_url = Some(client.format_web_ui_url(&self.settings.ui.web_url));
+        let web_ui_url = Some(client.format_web_ui_url(&self.cfg.settings.ui.web_url));
         match client.get_configs() {
             Ok(mut cfg) => {
                 self.apply_pending_restore_if_needed(&mut cfg);
@@ -1190,20 +1071,6 @@ impl Worker {
         }
     }
 
-    fn sync_live_persisted_state(&mut self, sysproxy: bool, mode: &str, tun: bool) {
-        if self.pending_restore.is_some() || self.pending_reload_restore.is_some() {
-            return;
-        }
-        let live = PersistedState {
-            system_proxy: sysproxy,
-            mode: (!mode.is_empty()).then(|| mode.to_string()),
-            tun: Some(tun),
-        };
-        if self.persisted_state.as_ref() != Some(&live) {
-            self.update_persisted_state(|s| *s = live);
-        }
-    }
-
     fn refresh(&mut self) {
         let kernel_running = self.resolve_live_controller();
         let client_opt = self.client.clone();
@@ -1212,11 +1079,12 @@ impl Worker {
         self.last_controller_ok = controller_ok;
 
         let sysproxy = platform::proxy_is_enabled();
-        self.refresh_autostart_if_stale();
-        let autostart = self.cached_autostart;
+        self.cfg.refresh_autostart_if_stale();
+        let autostart = self.cfg.cached_autostart;
 
         if controller_ok {
-            self.sync_live_persisted_state(sysproxy, &mode, tun);
+            self.state_sync
+                .sync_live_if_idle(&self.cfg.home_dir, sysproxy, &mode, tun);
         }
 
         let (proxies_res, providers_res) = if controller_ok && let Some(client) = &client_opt {
@@ -1249,27 +1117,29 @@ impl Worker {
                 snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
             }
             snap.web_ui_url = web_ui_url;
-            snap.resolved_config = Some(self.config_file.clone());
-            snap.page_size = self.settings.groups.page_size;
+            snap.resolved_config = Some(self.cfg.config_file.clone());
+            snap.page_size = self.cfg.settings.groups.page_size;
 
             if !controller_ok {
                 snap.groups.clear();
                 snap.providers.clear();
                 snap.node_latency.clear();
             } else {
-                match (proxies_res, providers_res) {
-                    (Some(Ok(proxies)), Some(Ok(prov))) => {
-                        snap.groups = state::order_and_filter_groups(
-                            proxies.groups,
-                            &self.settings.groups.include,
-                            &self.settings.groups.exclude,
-                            &self.settings.groups.order,
-                        );
-                        snap.providers = prov.providers;
-                        let mut latencies = proxies.latency;
+                let mut latencies = None;
+                if let Some(Ok(proxies)) = proxies_res {
+                    snap.groups = state::order_and_filter_groups(
+                        proxies.groups,
+                        &self.cfg.settings.groups.include,
+                        &self.cfg.settings.groups.exclude,
+                        &self.cfg.settings.groups.order,
+                    );
+                    latencies = Some(proxies.latency);
+                }
+                if let Some(Ok(prov)) = providers_res {
+                    snap.providers = prov.providers;
+                    if let Some(ref mut map) = latencies {
                         for (name, delay) in prov.latency {
-                            latencies
-                                .entry(name)
+                            map.entry(name)
                                 .and_modify(|existing| {
                                     if existing.is_none() {
                                         *existing = delay;
@@ -1277,21 +1147,10 @@ impl Worker {
                                 })
                                 .or_insert(delay);
                         }
-                        snap.node_latency = latencies;
                     }
-                    (Some(Ok(proxies)), _) => {
-                        snap.groups = state::order_and_filter_groups(
-                            proxies.groups,
-                            &self.settings.groups.include,
-                            &self.settings.groups.exclude,
-                            &self.settings.groups.order,
-                        );
-                        snap.node_latency = proxies.latency;
-                    }
-                    (_, Some(Ok(prov))) => {
-                        snap.providers = prov.providers;
-                    }
-                    _ => {}
+                }
+                if let Some(map) = latencies {
+                    snap.node_latency = map;
                 }
             }
         }
@@ -1309,17 +1168,10 @@ impl Worker {
         });
     }
 
-    fn set_config_error(&self, err: Option<String>) {
+    fn sync_config_error(&self) {
+        let err = self.cfg.current_config_error();
         let mut snap = self.shared.lock().unwrap();
         snap.config_error = err;
-    }
-
-    fn sync_config_error(&self) {
-        let err = self
-            .settings_error
-            .clone()
-            .or_else(|| self.kernel_path_error.clone());
-        self.set_config_error(err);
     }
 
     fn set_action_error(&self, err: Option<String>) {
@@ -1331,10 +1183,6 @@ impl Worker {
         let mut snap = self.shared.lock().unwrap();
         snap.controller_error = err;
     }
-}
-
-fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<(), String> {
@@ -1351,6 +1199,7 @@ fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         use std::io::Read;
@@ -1468,8 +1317,8 @@ mod tests {
         settings: TraySettings,
         startup_error: Option<String>,
     ) -> (Worker, mpsc::Receiver<WorkerCommand>, SharedSnapshot) {
-        let settings_path = tray::settings_path(root);
-        let shared = Arc::new(std::sync::Mutex::new(crate::state::Snapshot::default()));
+        let settings_path = crate::config::tray::settings_path(root);
+        let shared = Arc::new(Mutex::new(crate::state::Snapshot::default()));
         let (ui_tx, _ui_rx) = mpsc::channel();
         let (worker, rx) = Worker::new(
             root.to_path_buf(),
@@ -1491,12 +1340,13 @@ mod tests {
         let exe = core_dir.join("my-core");
         std::fs::write(&exe, b"bin").unwrap();
 
-        let settings_path = tray::settings_path(&root);
+        let settings_path = crate::config::tray::settings_path(&root);
         std::fs::write(&settings_path, "mihomo:\n  path: ./custom/missing\n").unwrap();
-        let initial = tray::load(&settings_path).unwrap();
+        let initial = crate::config::tray::load(&settings_path).unwrap();
         let (mut worker, _rx, shared) = test_worker(&root, initial, None);
 
-        worker.refresh_paths();
+        worker.cfg.refresh_paths();
+        worker.sync_config_error();
         assert!(shared.lock().unwrap().config_error.is_some());
 
         std::fs::write(
@@ -1505,11 +1355,11 @@ mod tests {
         )
         .unwrap();
         // Force mtime check to observe edit deterministically across fast filesystems.
-        worker.last_settings_mtime = None;
+        worker.cfg.last_settings_mtime = None;
         worker.resolve_live_controller();
 
-        assert_eq!(worker.known_kernel_path.as_deref(), Some(exe.as_path()));
-        assert_eq!(worker.config_file, root.join("alt").join("config.yaml"));
+        assert_eq!(worker.cfg.known_kernel_path.as_deref(), Some(exe.as_path()));
+        assert_eq!(worker.cfg.config_file, root.join("alt").join("config.yaml"));
         assert_eq!(shared.lock().unwrap().config_error, None);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1520,7 +1370,6 @@ mod tests {
         let root = crate::config::test_temp_dir("worker_error_mask");
         let cfg_dir = root.join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        // Unbound loopback port -> GET /configs would fail with connection refused.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -1542,7 +1391,6 @@ mod tests {
         assert_eq!(snap.error(), Some(text::ERR_CORE_NOT_FOUND));
         drop(snap);
 
-        // Even with no action_error, intentionally stopped core has no spurious HTTP error.
         worker.set_action_error(None);
         worker.refresh();
         assert_eq!(shared.lock().unwrap().error(), None);
@@ -1558,7 +1406,6 @@ mod tests {
         worker.set_action_error(Some("subscription refresh failed".to_string()));
         worker.testing_latency = true;
 
-        // Simulate `Worker::run` processing a clean `LatencyTest` completion while an error is active.
         let clears = worker
             .handle_command(WorkerCommand::AsyncDone {
                 kind: AsyncTaskKind::LatencyTest,
@@ -1609,7 +1456,6 @@ mod tests {
                         ),
                     )
                 } else if req.starts_with("PUT /configs?force=true ") {
-                    // Reloading config.yaml resets live mode/tun before restore runs.
                     mode = "rule".to_string();
                     tun_on = false;
                     ("204 No Content", String::new())
@@ -1662,13 +1508,12 @@ mod tests {
             snap.mode = "global".to_string();
             snap.tun = false;
         }
-        worker.persisted_state = Some(PersistedState {
+        worker.state_sync.persisted = Some(PersistedState {
             system_proxy: false,
             mode: Some("global".to_string()),
             tun: Some(false),
         });
 
-        // Start async subscription reload.
         assert!(
             worker
                 .handle_command(WorkerCommand::SetSubscriptionUrl(
@@ -1676,31 +1521,31 @@ mod tests {
                 ))
                 .unwrap()
         );
-        assert!(worker.pending_restore.is_none());
-        assert!(worker.pending_reload_restore.is_some());
+        assert!(worker.state_sync.pending_restore.is_none());
+        assert!(worker.state_sync.pending_reload_restore.is_some());
 
-        // An intermediate poll before `AsyncDone` must NOT consume `pending_reload_restore` or overwrite mode!
         let mut mid_cfg = CoreConfigs {
             mode: "rule".to_string(),
             mixed_port: 7890,
             tun_enable: false,
         };
         worker.apply_pending_restore_if_needed(&mut mid_cfg);
-        worker.sync_live_persisted_state(false, "rule", false);
+        worker
+            .state_sync
+            .sync_live_if_idle(&worker.cfg.home_dir, false, "rule", false);
         assert_eq!(
             worker
-                .persisted_state
+                .state_sync
+                .persisted
                 .as_ref()
                 .and_then(|s| s.mode.as_deref()),
             Some("global")
         );
 
-        // Wait for the background reload thread to finish and send `AsyncDone`.
         let async_cmd = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         worker.handle_command(async_cmd).unwrap();
-        assert!(worker.pending_restore.is_some());
+        assert!(worker.state_sync.pending_restore.is_some());
 
-        // Next `poll_controller_configs` applies `pending_restore`, switching mode back to `global`.
         let (ok, mode, _, _, _, _) = worker.poll_controller_configs(worker.client.clone().as_ref());
         assert!(ok);
         assert_eq!(mode, "global");

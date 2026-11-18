@@ -157,14 +157,14 @@ pub fn build_launch_args(
     kernel_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     for (flag, owner) in [
-        ("d", "mihomo.home"),
-        ("f", "mihomo.config"),
-        ("ext-ctl", "controller.address"),
-        ("secret", "controller.secret"),
+        ("d", "mihomo.home in tray.yml"),
+        ("f", "mihomo.config in tray.yml"),
+        ("ext-ctl", "external-controller in config.yaml"),
+        ("secret", "secret in config.yaml"),
     ] {
         if has_flag(&settings.mihomo.args, flag) {
             return Err(format!(
-                "Do not pass -{flag} in mihomo.args; configure {owner} in tray.yml instead."
+                "Do not pass -{flag} in mihomo.args; configure {owner} instead."
             ));
         }
     }
@@ -196,15 +196,11 @@ pub fn build_launch_args(
     }
 
     // Materialize CLASH_OVERRIDE_* into explicit flags so elevated child processes preserve them.
-    if let Ok(ctl) = std::env::var("CLASH_OVERRIDE_EXTERNAL_CONTROLLER")
-        && !ctl.trim().is_empty()
-    {
+    if let Some(ctl) = env_non_empty("CLASH_OVERRIDE_EXTERNAL_CONTROLLER") {
         args.push("-ext-ctl".to_string());
         args.push(ctl);
     }
-    if let Ok(secret) = std::env::var("CLASH_OVERRIDE_SECRET")
-        && !secret.trim().is_empty()
-    {
+    if let Some(secret) = env_non_empty("CLASH_OVERRIDE_SECRET") {
         args.push("-secret".to_string());
         args.push(secret);
     }

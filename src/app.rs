@@ -39,6 +39,7 @@ pub struct MihomoTrayApp {
     pending_menu_rebuild: bool,
     last_click: Instant,
     version_dialog_open: Arc<AtomicBool>,
+    prompt_dialog_open: Arc<AtomicBool>,
     quitting: bool,
     restart_on_exit: bool,
 }
@@ -71,6 +72,7 @@ impl MihomoTrayApp {
             pending_menu_rebuild: false,
             last_click: Instant::now() - CLICK_DEBOUNCE,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
+            prompt_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
             restart_on_exit: false,
         }
@@ -169,17 +171,7 @@ impl MihomoTrayApp {
                 self.open_target(&self.settings_path.display().to_string());
             }
             MenuAction::OpenMihomoConfig => {
-                let target = self
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .resolved_config
-                    .clone()
-                    .unwrap_or_else(|| {
-                        self.portable_root
-                            .join("config")
-                            .join(crate::text::MIHOMO_CONFIG_NAME)
-                    });
+                let target = self.resolved_config_or_default();
                 mihomo::ensure_default_config(&target);
                 self.open_target(&target.display().to_string());
             }
@@ -233,22 +225,33 @@ impl MihomoTrayApp {
         }
     }
 
-    fn show_version_dialog(&self) {
-        if self
-            .version_dialog_open
+    fn resolved_config_or_default(&self) -> PathBuf {
+        self.shared
+            .lock()
+            .unwrap()
+            .resolved_config
+            .clone()
+            .unwrap_or_else(|| {
+                self.portable_root
+                    .join("config")
+                    .join(crate::text::MIHOMO_CONFIG_NAME)
+            })
+    }
+
+    fn spawn_singleton_dialog(
+        flag: &Arc<AtomicBool>,
+        thread_name: &str,
+        f: impl FnOnce() + Send + 'static,
+    ) {
+        if flag
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
-        let open_flag = Arc::clone(&self.version_dialog_open);
-        let (core_ver, cfg_path) = {
-            let snap = self.shared.lock().unwrap();
-            (snap.version.clone(), snap.resolved_config.clone())
-        };
-        let portable = self.portable_root.clone();
+        let open_flag = Arc::clone(flag);
         if std::thread::Builder::new()
-            .name("version-dialog".to_string())
+            .name(thread_name.to_string())
             .spawn(move || {
                 struct ResetFlag(Arc<AtomicBool>);
                 impl Drop for ResetFlag {
@@ -257,36 +260,37 @@ impl MihomoTrayApp {
                     }
                 }
                 let _reset = ResetFlag(open_flag);
-                let msg =
-                    crate::text::format_version_dialog(&core_ver, &portable, cfg_path.as_deref());
-                platform::notify_info(crate::text::TITLE_VERSION, &msg);
+                f();
             })
             .is_err()
         {
-            self.version_dialog_open.store(false, Ordering::Release);
+            flag.store(false, Ordering::Release);
         }
+    }
+
+    fn show_version_dialog(&self) {
+        let (core_ver, cfg_path) = {
+            let snap = self.shared.lock().unwrap();
+            (snap.version.clone(), snap.resolved_config.clone())
+        };
+        let portable = self.portable_root.clone();
+        Self::spawn_singleton_dialog(&self.version_dialog_open, "version-dialog", move || {
+            let msg = crate::text::format_version_dialog(&core_ver, &portable, cfg_path.as_deref());
+            platform::notify_info(crate::text::TITLE_VERSION, &msg);
+        });
     }
 
     fn prompt_and_set_subscription(&self) {
         let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;
         };
-        let cfg_path = self
-            .shared
-            .lock()
-            .unwrap()
-            .resolved_config
-            .clone()
-            .unwrap_or_else(|| self.portable_root.join("config").join("config.yaml"));
-
-        let _ = std::thread::Builder::new()
-            .name("sub-prompt".to_string())
-            .spawn(move || {
-                let current = mihomo::read_subscription_url(&cfg_path);
-                if let Some(url) = platform::prompt_subscription_url(current.as_deref()) {
-                    let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
-                }
-            });
+        let cfg_path = self.resolved_config_or_default();
+        Self::spawn_singleton_dialog(&self.prompt_dialog_open, "sub-prompt", move || {
+            let current = mihomo::read_subscription_url(&cfg_path);
+            if let Some(url) = platform::prompt_subscription_url(current.as_deref()) {
+                let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
+            }
+        });
     }
 
     fn apply_snapshot(&mut self, rebuild_menu: bool) {

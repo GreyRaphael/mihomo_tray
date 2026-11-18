@@ -1,5 +1,7 @@
 //! Cross-platform native tray menu builder built on `tray_icon::menu` (`muda 0.21`).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -31,54 +33,33 @@ pub enum MenuAction {
     Quit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MenuFingerprint {
-    status_line: String,
-    error: Option<String>,
-    web_ui_url: Option<String>,
-    mode: ProxyMode,
-    controller_ok: bool,
-    has_mixed_port: bool,
-    sysproxy: bool,
-    tun: bool,
-    autostart: bool,
-    groups: Vec<Group>,
-    visible_latencies: Vec<Option<u32>>,
-    update_subscription_label: String,
-    has_resolved_config: bool,
-    page_size: usize,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuFingerprint(u64);
 
 impl MenuFingerprint {
     pub fn from_snapshot(snap: &Snapshot, now_unix: i64) -> Self {
-        let visible_latencies = if snap.controller_ok {
-            snap.groups
-                .iter()
-                .flat_map(|g| g.members.iter())
-                .map(|m| snap.latency_for(m))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Self {
-            status_line: snap.status_line(),
-            error: snap.error().map(ToString::to_string),
-            web_ui_url: snap.web_ui_url.clone(),
-            mode: snap.proxy_mode(),
-            controller_ok: snap.controller_ok,
-            has_mixed_port: snap.mixed_port > 0,
-            sysproxy: snap.sysproxy,
-            tun: snap.tun,
-            autostart: snap.autostart,
-            groups: snap.groups.clone(),
-            visible_latencies,
-            update_subscription_label: text::format_update_subscription_label(
-                snap.subscription_updated_at(),
-                now_unix,
-            ),
-            has_resolved_config: snap.resolved_config.is_some(),
-            page_size: snap.page_size,
+        let mut hasher = DefaultHasher::new();
+        snap.status_line().hash(&mut hasher);
+        snap.error().hash(&mut hasher);
+        snap.web_ui_url.is_some().hash(&mut hasher);
+        snap.proxy_mode().hash(&mut hasher);
+        snap.controller_ok.hash(&mut hasher);
+        (snap.mixed_port > 0).hash(&mut hasher);
+        snap.sysproxy.hash(&mut hasher);
+        snap.tun.hash(&mut hasher);
+        snap.autostart.hash(&mut hasher);
+        snap.groups.hash(&mut hasher);
+        if snap.controller_ok {
+            for group in &snap.groups {
+                for member in &group.members {
+                    snap.latency_for(member).hash(&mut hasher);
+                }
+            }
         }
+        text::format_update_subscription_label(snap.subscription_updated_at(), now_unix)
+            .hash(&mut hasher);
+        snap.page_size.hash(&mut hasher);
+        Self(hasher.finish())
     }
 }
 
@@ -246,7 +227,7 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
 
     // 6. Open & More submenus + Quit
     let open_sub = Submenu::new(text::MENU_OPEN, true);
-    append_open_items(&open_sub, snapshot, &mut recorder);
+    append_open_items(&open_sub, &mut recorder);
     let _ = menu.append(&open_sub);
 
     let more_sub = Submenu::new(text::MENU_MORE, true);
@@ -365,7 +346,7 @@ fn append_member_item(
     );
 }
 
-fn append_open_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRecorder) {
+fn append_open_items(sub: &Submenu, recorder: &mut ActionRecorder) {
     append_menu_item(
         sub,
         recorder,
@@ -377,7 +358,7 @@ fn append_open_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRe
         sub,
         recorder,
         text::MENU_OPEN_MIHOMO_CONFIG,
-        snapshot.resolved_config.is_some(),
+        true,
         Some(MenuAction::OpenMihomoConfig),
     );
     append_menu_item(
@@ -598,9 +579,12 @@ mod tests {
         };
         let now = 1_700_000_000;
         let mut s2 = s1.clone();
+        s2.web_ui_url = Some("http://127.0.0.1:9090/ui/".to_string());
+        let mut s3 = s2.clone();
+        s3.web_ui_url = Some("http://127.0.0.1:9091/ui/".to_string());
         assert_eq!(
-            MenuFingerprint::from_snapshot(&s1, now),
-            MenuFingerprint::from_snapshot(&s2, now)
+            MenuFingerprint::from_snapshot(&s2, now),
+            MenuFingerprint::from_snapshot(&s3, now)
         );
         s2.mode = "global".to_string();
         assert_ne!(

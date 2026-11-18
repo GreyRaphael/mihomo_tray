@@ -61,7 +61,12 @@ fn main() {
         }
     };
 
-    let shared = Arc::new(Mutex::new(Snapshot::default()));
+    let initial_config =
+        crate::core::discover::resolve_home_and_config(&portable_root, &settings, None).1;
+    let shared = Arc::new(Mutex::new(Snapshot {
+        resolved_config: initial_config,
+        ..Default::default()
+    }));
     let event_loop = EventLoop::<AppEvent>::with_user_event()
         .build()
         .unwrap_or_else(|err| {

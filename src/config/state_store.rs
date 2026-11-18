@@ -15,7 +15,7 @@ pub struct PersistedState {
     pub tun: Option<bool>,
 }
 
-pub fn state_path(home_dir: &Path) -> PathBuf {
+fn state_path(home_dir: &Path) -> PathBuf {
     home_dir.join(STATE_FILE_NAME)
 }
 

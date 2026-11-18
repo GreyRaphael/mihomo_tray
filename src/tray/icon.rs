@@ -21,7 +21,7 @@ pub fn render_icon(key: IconKey) -> Result<Icon, String> {
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).map_err(|e| format!("failed to build icon: {e}"))
 }
 
-pub fn render_rgba(key: IconKey, size: u32) -> Vec<u8> {
+fn render_rgba(key: IconKey, size: u32) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let outer_color = state_color(key.state);
     let inner_color = mode_color(key.mode);

@@ -56,7 +56,7 @@ pub fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
 }
 
 #[cfg(test)]
-pub fn parse_str(text: &str) -> MihomoConfigInfo {
+fn parse_str(text: &str) -> MihomoConfigInfo {
     try_parse_str(text).unwrap_or_default()
 }
 

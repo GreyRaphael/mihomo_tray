@@ -129,7 +129,7 @@ fn discover_portable_config(portable_root: &Path, kernel_path: Option<&Path>) ->
 }
 
 /// Resolves optional external-ui directory to pass via `-ext-ui`.
-pub fn resolve_external_ui(
+fn resolve_external_ui(
     portable_root: &Path,
     settings: &TraySettings,
     config_info: &MihomoConfigInfo,
@@ -283,7 +283,7 @@ fn matching_running_argv(running: &[RunningProcess], wanted_config: &Path) -> Op
     None
 }
 
-pub fn argv_config(args: &[String]) -> Option<PathBuf> {
+fn argv_config(args: &[String]) -> Option<PathBuf> {
     if let Some(f) = flag_value(args, "f") {
         let p = PathBuf::from(f);
         return p.is_absolute().then_some(p);
@@ -306,7 +306,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     })
 }
 
-pub fn flag_value(args: &[String], flag: &str) -> Option<String> {
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let short = format!("-{flag}");
     let long = format!("--{flag}");
     let mut found = None;

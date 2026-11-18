@@ -30,10 +30,15 @@ pub struct RuntimeRecord {
 #[derive(Debug)]
 pub struct ManagedChild {
     pub child: Child,
-    pub pid: u32,
 }
 
-pub fn runtime_record_path(home_dir: &Path) -> PathBuf {
+impl ManagedChild {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+fn runtime_record_path(home_dir: &Path) -> PathBuf {
     home_dir.join(RUNTIME_LOCK_NAME)
 }
 
@@ -193,8 +198,7 @@ pub fn spawn_normal(exe: &Path, args: &[String]) -> Result<ManagedChild, String>
     let cwd = exe.parent();
     let child = platform::spawn_hidden(exe, args, cwd)
         .map_err(|e| format!("failed to start {}: {e}", exe.display()))?;
-    let pid = child.id();
-    Ok(ManagedChild { child, pid })
+    Ok(ManagedChild { child })
 }
 
 pub fn terminate_pid_and_wait(pid: u32) -> Result<(), String> {

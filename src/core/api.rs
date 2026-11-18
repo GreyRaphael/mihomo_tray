@@ -129,7 +129,7 @@ impl Client {
         }
 
         let host = match raw_host {
-            "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+            "0.0.0.0" | "[::]" => "127.0.0.1".to_string(),
             other => other.to_string(),
         };
         let agent: Agent = Agent::config_builder()
@@ -435,7 +435,7 @@ fn last_history_delay(entry: &Value) -> Option<u32> {
     last.get("delay").and_then(Value::as_u64).map(|d| d as u32)
 }
 
-pub fn percent_encode(input: &str) -> String {
+fn percent_encode(input: &str) -> String {
     utf8_percent_encode(input, UNRESERVED_ENCODE_SET).to_string()
 }
 

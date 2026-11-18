@@ -47,26 +47,33 @@ mihomo-tray/
 ### 3.1 Cross-Platform Core Dependencies
 | Crate | Version | Purpose |
 |---|---|---|
-| `tray-icon` | `0.26.1` | System tray icon & click events (`muda-common-controls-v6` on Windows; `ksni` ready on Linux) |
-| `muda` | `0.21.2` | Native tray menu (`0.21.1+` includes Windows 16-bit command ID recycling, no fork needed) |
-| `winit` | `0.30.13` | Event loop via `ApplicationHandler<AppEvent>` + `EventLoopProxy` for zero-spin wakeups |
-| `ureq` | `3.5.2` | Synchronous local HTTP/1.1 client (`default-features = false, features = ["json"]`, no TLS/Tokio) |
-| `serde` | `1.0.229` | Serialization/deserialization framework (`derive`) |
-| `serde_json` | `1.0.154` | Mihomo REST API payload parsing |
-| `serde_yaml_ng` | `0.10.0` | Full YAML parsing for `tray.yml` and `config.yaml` |
-| `sysinfo` | `0.40.3` | Cross-platform process inspection (`default-features = false, features = ["system"]`) |
-| `open` | `5.4.5` | Open WebUI URL, config files, and portable folders in system default apps |
-| `single-instance` | `0.3.3` | Global single-instance mutex (`mihomo-tray`) |
-| `auto-launch` | `0.6.0` | Cross-platform startup registration (`Start with Windows`) |
-| `tracing` | `0.1.44` | Structured diagnostic logging |
-| `tracing-subscriber` | `0.3.23` | Formatting file logger writing to `./logs/` |
+| `tray-icon` | `0.26` | System tray icon & click events (`muda-common-controls-v6` on Windows; `ksni` ready on Linux) |
+| `muda` | `0.21` | Native tray menu (`0.21.1+` includes Windows 16-bit command ID recycling, no fork needed) |
+| `winit` | `0.30` | Event loop via `ApplicationHandler<AppEvent>` + `EventLoopProxy` for zero-spin wakeups |
+| `ureq` | `3.5` | Synchronous local HTTP/1.1 client (`default-features = false, features = ["json"]`, no TLS/Tokio) |
+| `serde` | `1.0` | Serialization/deserialization framework (`derive`) |
+| `serde_json` | `1.0` | Mihomo REST API payload parsing |
+| `serde_yaml_ng` | `0.10` | Typed YAML inspection for `tray.yml` and `config.yaml` |
+| `yaml-edit` | `0.3` | Lossless CST-based YAML updates preserving user comments/formatting in `config.yaml` |
+| `url` / `percent-encoding` | `2.5` / `2.3` | Controller/subscription URL parsing & query/path encoding |
+| `time` | `0.3` | RFC 3339 timestamp parsing for provider `updatedAt` |
+| `sysinfo` | `0.40` | Cross-platform process inspection (`default-features = false, features = ["system"]`) |
+| `which` | `8.0` | Cross-platform `PATH` kernel lookup (with Scoop `.shim` resolution on Windows) |
+| `open` | `5.4` | Open WebUI URL, config files, and portable folders in system default apps |
+| `arboard` | `3.7` | Cross-platform clipboard copy (`Copy Environment Variables`) |
+| `rustydialogs` | `0.5` | Native message dialogs, Yes/No confirmations, and subscription input prompts |
+| `single-instance` | `0.3` | Global single-instance mutex (`mihomo-tray`) |
+| `auto-launch` | `0.6` | Cross-platform startup registration (`Start with Windows`) |
+| `file-rotate` | `0.8` | Size-based log rotation (`2 MB`) in `./logs/` |
+| `tracing` | `0.1` | Structured diagnostic logging |
+| `tracing-subscriber` | `0.3` | Formatting logger backed by `file-rotate` |
 
 ### 3.2 Windows-Only Dependencies (`[target.'cfg(windows)']`)
 | Crate | Version | Purpose |
 |---|---|---|
-| `winresource` | `0.1.34` | `build.rs` single-pass embedding of `assets/app.ico` + DPI/UTF-8 manifest (avoids `CVT1100` conflicts) |
-| `winreg` | `0.56.0` | Per-user `Internet Settings` registry updates |
-| `windows-sys` | `0.61.2` | `InternetSetOptionW`, `MessageBoxW`, `ShellExecuteExW` (`CommandLineToArgvW`-safe quoting), DPI-aware prompt dialog |
+| `winresource` | `0.1` | `build.rs` single-pass embedding of `assets/app.ico` + DPI/UTF-8 manifest (avoids `CVT1100` conflicts) |
+| `winreg` | `0.56` | Per-user `Internet Settings` registry updates |
+| `windows-sys` | `0.61` | `InternetSetOptionW`, `ExpandEnvironmentStringsW`, `ShellExecuteExW` (`CommandLineToArgvW`-safe quoting), `GetGUIThreadInfo` |
 
 > **Implementation note**: `ShellExecuteExW` via `windows-sys` is used directly for UAC elevation instead of `runas 1.2.0`, because `runas 1.2.0` over-escapes backslashes inside quoted Windows paths containing spaces and leaks the child process handle.
 
@@ -90,15 +97,17 @@ src/
 │   ├── api.rs            # Mihomo REST client (ureq 3.5)
 │   ├── discover.rs       # Kernel binary, config/home/ui, controller resolution & launch args
 │   ├── process.rs        # .runtime.json lockfile + sysinfo process picking & termination
-│   └── worker.rs         # Background polling & command execution thread
+│   └── worker/           # Background polling & command execution thread
+│       ├── mod.rs
+│       ├── config_tracker.rs
+│       └── state_sync.rs
 ├── tray/
 │   ├── mod.rs
 │   ├── icon.rs           # Procedural RGBA icon renderer (32x32, outer ring + center mode dot)
-│   └── menu.rs           # muda 0.21 menu builder with fingerprint diffing, Action dispatch & paging
+│   └── menu.rs           # muda 0.21 menu builder with hash fingerprint diffing, Action dispatch & paging
 └── platform/
-    ├── mod.rs            # Platform abstraction boundary + #[cfg] target dispatch
-    ├── windows.rs        # Win10+ implementation (WinINet proxy, UAC helper, MessageBoxW)
-    ├── windows_prompt.rs # DPI-aware Win32 subscription URL modal input dialog
+    ├── mod.rs            # Platform abstraction boundary + rustydialogs/arboard/auto-launch + #[cfg] dispatch
+    ├── windows.rs        # Win10+ implementation (WinINet proxy, UAC helper, Scoop shim, GUI menu probe)
     └── stub.rs           # Non-Windows fallback/scaffold for host testing & future Linux/macOS
 ```
 
@@ -107,7 +116,7 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
 1. `portable_root()` & `kernel_candidates()`: Windows uses `exe.parent()` and `*.exe`; macOS can later back out of `.app/Contents/MacOS`; Linux can drop `.exe` and support symlinks.
 2. `SystemProxy`: Windows uses `winreg` + `InternetSetOptionW` (preserving user-curated bypass entries and avoiding unnecessary refreshes); Linux/macOS can later plug in `gsettings`/`kconfig` and `networksetup`.
 3. `PrivilegeHelper`: Windows spawns self with `--elevate-start` / `--elevate-stop` via `ShellExecuteExW` (`"runas"`); Linux can later use `pkexec setcap` / `pkexec`; macOS can use `osascript` or privileged launch.
-4. `notify_error()` / `after_event_loop_ready()`: Windows uses `MessageBoxW`; macOS can apply `NSApplicationActivationPolicy::Accessory`; Linux can degrade gracefully when no SNI tray host exists.
+4. `notify_error()` / `confirm_yes_no()` / `prompt_subscription_url()`: Unified cross-platform via `rustydialogs`, with graceful headless fallback on non-Windows.
 
 ---
 
@@ -158,4 +167,4 @@ Business modules (`config`, `core`, `tray`, `app`, `state`, `text`) **never impo
    - REST client (`ureq`) request/response verification against an ephemeral loopback mock HTTP server
    - Procedural RGBA icon generation invariants
 2. **Windows Target Verification (`cargo check --target x86_64-pc-windows-gnu --all-targets` & `cargo clippy --target x86_64-pc-windows-gnu --all-targets`)**:
-   - Verify full Windows Win10+ compilation (`windows.rs`, `windows_prompt.rs`, `build.rs`, `tray-icon`, `muda`, `winit`, `winreg`, `windows-sys`) with zero warnings/errors.
+   - Verify full Windows Win10+ compilation (`windows.rs`, `build.rs`, `tray-icon`, `muda`, `winit`, `winreg`, `windows-sys`, `rustydialogs`) with zero warnings/errors.

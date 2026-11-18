@@ -257,7 +257,7 @@ pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
 
 /// Extracts the target executable path from a Scoop `.shim` file (`path = "..."`).
 #[cfg(any(windows, test))]
-pub fn parse_shim_path(content: &str) -> Option<PathBuf> {
+pub(super) fn parse_shim_path(content: &str) -> Option<PathBuf> {
     content
         .strip_prefix('\u{feff}')
         .unwrap_or(content)
@@ -285,7 +285,10 @@ pub fn parse_shim_path(content: &str) -> Option<PathBuf> {
 /// - When `extra_bypass` is empty and an entry already exists, returns `None` to preserve user settings.
 /// - When `extra_bypass` is non-empty (or no entry exists yet), merges deduplicated entries and ensures `<local>` is included.
 #[cfg(any(windows, test))]
-pub fn merge_proxy_override(existing: Option<&str>, extra_bypass: &[String]) -> Option<String> {
+pub(super) fn merge_proxy_override(
+    existing: Option<&str>,
+    extra_bypass: &[String],
+) -> Option<String> {
     let extras: Vec<&str> = extra_bypass
         .iter()
         .flat_map(|item| item.split(';'))
@@ -328,7 +331,7 @@ pub fn merge_proxy_override(existing: Option<&str>, extra_bypass: &[String]) -> 
 /// Quotes arguments following Microsoft `CommandLineToArgvW` rules so paths with spaces,
 /// backslashes, and UNC prefixes survive `ShellExecuteExW` verbatim.
 #[cfg(any(windows, test))]
-pub fn quote_win32_args(args: &[String]) -> String {
+pub(super) fn quote_win32_args(args: &[String]) -> String {
     let mut out = String::new();
     for (idx, arg) in args.iter().enumerate() {
         if idx > 0 {

@@ -140,7 +140,7 @@ impl Worker {
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = cfg.settings.groups.page_size;
-            snap.resolved_config = Some(cfg.config_file.clone());
+            snap.resolved_config = cfg.config_file.clone();
             snap.config_error = cfg.current_config_error();
         }
         let worker = Self {
@@ -562,7 +562,7 @@ impl Worker {
 
         self.set_status_note(Some(text::STATUS_STARTING_CORE));
         let child = process::spawn_normal(&kernel_path, &args)?;
-        let pid = child.pid;
+        let pid = child.pid();
         self.managed = Some(child);
         self.recorded_pid = Some(pid);
         self.cached_version.clear();
@@ -990,7 +990,7 @@ impl Worker {
     fn active_pid(&mut self) -> Option<u32> {
         if let Some(ref mut managed) = self.managed {
             if matches!(managed.child.try_wait(), Ok(None)) {
-                return Some(managed.pid);
+                return Some(managed.pid());
             }
             self.managed = None;
         }
@@ -1117,7 +1117,7 @@ impl Worker {
                 snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
             }
             snap.web_ui_url = web_ui_url;
-            snap.resolved_config = Some(self.cfg.config_file.clone());
+            snap.resolved_config = self.cfg.config_file.clone();
             snap.page_size = self.cfg.settings.groups.page_size;
 
             if !controller_ok {

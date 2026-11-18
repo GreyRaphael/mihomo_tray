@@ -1,14 +1,14 @@
 //! Shared runtime state, worker commands, and UI wakeup events.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
 
 /// Normalized proxy routing mode shown on the tray icon and menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ProxyMode {
     #[default]
     Rule,
@@ -47,7 +47,7 @@ pub enum OperationalState {
     Tun,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Group {
     pub name: String,
     pub kind: String,
@@ -88,11 +88,14 @@ pub struct Snapshot {
     pub action_error: Option<String>,
     pub controller_error: Option<String>,
     pub web_ui_url: Option<String>,
-    pub resolved_config: Option<PathBuf>,
+    pub resolved_config: PathBuf,
     pub page_size: usize,
 }
 
 impl Snapshot {
+    pub fn resolved_config_path(&self) -> Option<&Path> {
+        (!self.resolved_config.as_os_str().is_empty()).then_some(self.resolved_config.as_path())
+    }
     pub fn operational_state(&self) -> OperationalState {
         if !self.controller_ok {
             OperationalState::Unreachable

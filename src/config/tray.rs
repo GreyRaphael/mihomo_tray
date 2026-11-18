@@ -148,7 +148,7 @@ pub fn resolve_portable_path(portable_root: &Path, raw: &str) -> Option<PathBuf>
 }
 
 /// Lexically cleans `.` and `..` components without requiring the path to already exist on disk.
-pub fn normalize_path(path: &Path) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

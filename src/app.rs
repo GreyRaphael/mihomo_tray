@@ -229,8 +229,8 @@ impl MihomoTrayApp {
         self.shared
             .lock()
             .unwrap()
-            .resolved_config
-            .clone()
+            .resolved_config_path()
+            .map(PathBuf::from)
             .unwrap_or_else(|| {
                 self.portable_root
                     .join("config")
@@ -271,7 +271,10 @@ impl MihomoTrayApp {
     fn show_version_dialog(&self) {
         let (core_ver, cfg_path) = {
             let snap = self.shared.lock().unwrap();
-            (snap.version.clone(), snap.resolved_config.clone())
+            (
+                snap.version.clone(),
+                snap.resolved_config_path().map(PathBuf::from),
+            )
         };
         let portable = self.portable_root.clone();
         Self::spawn_singleton_dialog(&self.version_dialog_open, "version-dialog", move || {

@@ -24,7 +24,7 @@ mihomo:
   # Empty = <home>/config.yaml (or ./config.yaml if present at portable root).
   config: ""
 
-  # Extra CLI arguments forwarded to mihomo (do not duplicate -d, -f, -ext-ctl, or -secret).
+  # Extra CLI arguments forwarded to mihomo (do not duplicate -d, -f, -ext-ctl, -secret, or -ext-ui when ui.external_ui is set).
   args: []
 
   # Start the core automatically when mihomo-tray launches.

@@ -38,14 +38,28 @@ struct PartialMihomoYaml {
     port: Option<u16>,
 }
 
-pub fn read_file(path: &Path) -> std::io::Result<MihomoConfigInfo> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(parse_str(&text))
+pub fn read_file(path: &Path) -> Result<MihomoConfigInfo, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    try_parse_str(&text).map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
-pub fn parse_str(text: &str) -> MihomoConfigInfo {
+pub fn try_parse_str(text: &str) -> Result<MihomoConfigInfo, String> {
     let clean = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let parsed: PartialMihomoYaml = serde_yaml_ng::from_str(clean).unwrap_or_default();
+    let parsed: PartialMihomoYaml = if clean.trim().is_empty() {
+        PartialMihomoYaml::default()
+    } else {
+        serde_yaml_ng::from_str(clean).map_err(|e| e.to_string())?
+    };
+    Ok(extract_config_info(parsed))
+}
+
+#[cfg(test)]
+pub fn parse_str(text: &str) -> MihomoConfigInfo {
+    try_parse_str(text).unwrap_or_default()
+}
+
+fn extract_config_info(parsed: PartialMihomoYaml) -> MihomoConfigInfo {
     let non_empty = |opt: Option<String>| -> Option<String> {
         opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     };
@@ -394,5 +408,11 @@ external-ui: ./ui
         assert_eq!(std::fs::read(&cfg).unwrap(), raw_gbk);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_parse_str_rejects_invalid_yaml_and_accepts_empty() {
+        assert_eq!(try_parse_str("   \n").unwrap(), MihomoConfigInfo::default());
+        assert!(try_parse_str("external-controller: [unclosed").is_err());
     }
 }

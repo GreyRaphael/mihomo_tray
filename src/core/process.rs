@@ -147,19 +147,19 @@ impl ProcessInspector {
         let name = proc_info.name().to_string_lossy();
         matches_recorded_kernel(&name, proc_info.exe(), expected_kernel)
     }
-}
 
-pub fn is_pid_alive(pid: u32) -> bool {
-    let Ok(mut sys) = System::new() else {
-        return false;
-    };
-    let sys_pid = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[sys_pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(sys_pid).is_some()
+    pub fn is_pid_alive(&mut self, pid: u32) -> bool {
+        let Some(sys) = self.system_mut() else {
+            return false;
+        };
+        let sys_pid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sys_pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys.process(sys_pid).is_some()
+    }
 }
 
 fn matches_recorded_kernel(name: &str, exe: Option<&Path>, expected_kernel: Option<&Path>) -> bool {

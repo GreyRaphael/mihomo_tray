@@ -223,7 +223,7 @@ pub fn resolve_controller(
 ) -> Result<Client, String> {
     let (_, fallback_cfg) = resolve_home_and_config(portable_root, settings, None);
     let config_path = preferred_config.unwrap_or(&fallback_cfg);
-    let cfg_info = mihomo::read_file(config_path).ok();
+    let cfg_res = mihomo::read_file(config_path);
 
     let argv = matching_running_argv(running, config_path);
     let argv_ctl = argv.as_deref().and_then(|a| flag_value(a, "ext-ctl"));
@@ -232,10 +232,12 @@ pub fn resolve_controller(
     let env_ctl = env_non_empty("CLASH_OVERRIDE_EXTERNAL_CONTROLLER");
     let env_secret = env_non_empty("CLASH_OVERRIDE_SECRET");
 
-    let cfg_ctl = cfg_info
+    let cfg_ctl = cfg_res
         .as_ref()
+        .ok()
         .and_then(|c| c.external_controller.clone());
-    let cfg_secret = cfg_info.as_ref().and_then(|c| c.secret.clone());
+    let cfg_secret = cfg_res.as_ref().ok().and_then(|c| c.secret.clone());
+    let other_controller_family = cfg_res.as_ref().is_ok_and(|c| c.other_controller_family);
 
     let address = argv_ctl.or(env_ctl).or(cfg_ctl).or_else(|| {
         let trimmed = settings.controller.address.trim();
@@ -243,7 +245,12 @@ pub fn resolve_controller(
     });
 
     let Some(address) = address else {
-        if cfg_info.as_ref().is_some_and(|c| c.other_controller_family) {
+        if let Err(err) = cfg_res
+            && config_path.is_file()
+        {
+            return Err(err);
+        }
+        if other_controller_family {
             return Err(format!(
                 "{} configures only TLS/unix/pipe external-controller, which is unsupported.",
                 config_path.display()

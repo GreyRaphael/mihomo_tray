@@ -36,14 +36,14 @@ fn main() {
 
     let after_restart_pid = parse_after_restart_pid();
     if let Some(old_pid) = after_restart_pid {
+        let mut inspector = process::ProcessInspector::new();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process::is_pid_alive(old_pid) {
+        while Instant::now() < deadline && inspector.is_pid_alive(old_pid) {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
-    let instance_key = single_instance_key(&portable_root);
-    let instance = acquire_single_instance(&instance_key, after_restart_pid.is_some());
+    let instance = acquire_single_instance(text::APP_NAME, after_restart_pid.is_some());
     let Some(instance) = instance else {
         return;
     };
@@ -52,7 +52,12 @@ fn main() {
     tray_cfg::ensure_sample_file(&settings_path);
     let (settings, startup_error) = match tray_cfg::load(&settings_path) {
         Ok(s) => (s, None),
-        Err(err) => (tray_cfg::TraySettings::default(), Some(err)),
+        Err(err) => {
+            let mut defaults = tray_cfg::TraySettings::default();
+            // Do not auto-launch a default core when user settings failed to parse.
+            defaults.mihomo.auto_start = false;
+            (defaults, Some(err))
+        }
     };
 
     let shared = Arc::new(Mutex::new(Snapshot::default()));
@@ -173,15 +178,4 @@ fn init_logging(portable_root: &Path) -> PathBuf {
         }
     }
     log_file
-}
-
-fn single_instance_key(portable_root: &Path) -> String {
-    let normalized = portable_root.to_string_lossy().to_ascii_lowercase();
-    // 64-bit FNV-1a hash keeps lock names unique per portable directory without extra crates.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in normalized.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("mihomo-tray-{hash:016x}")
 }

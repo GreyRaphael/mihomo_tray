@@ -84,6 +84,7 @@ pub struct Snapshot {
     pub node_latency: BTreeMap<String, Option<u32>>,
     pub providers: Vec<Provider>,
     pub status_note: Option<String>,
+    pub config_error: Option<String>,
     pub action_error: Option<String>,
     pub controller_error: Option<String>,
     pub web_ui_url: Option<String>,
@@ -115,6 +116,7 @@ impl Snapshot {
     pub fn error(&self) -> Option<&str> {
         self.controller_error
             .as_deref()
+            .or(self.config_error.as_deref())
             .or(self.action_error.as_deref())
     }
 
@@ -262,5 +264,20 @@ mod tests {
             .map(|x| x.name)
             .collect();
         assert_eq!(out, vec!["GLOBAL", "Streaming", "Proxy", "Alpha"]);
+    }
+
+    #[test]
+    fn snapshot_error_follows_controller_then_config_then_action_priority() {
+        let mut snap = Snapshot {
+            action_error: Some("action failed".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(snap.error(), Some("action failed"));
+
+        snap.config_error = Some("invalid tray.yml".to_string());
+        assert_eq!(snap.error(), Some("invalid tray.yml"));
+
+        snap.controller_error = Some("controller unreachable".to_string());
+        assert_eq!(snap.error(), Some("controller unreachable"));
     }
 }

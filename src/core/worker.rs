@@ -85,7 +85,11 @@ struct Worker {
     settings_path: PathBuf,
     settings: TraySettings,
     last_settings_mtime: Option<SystemTime>,
-    settings_parse_error: bool,
+    last_config_mtime: Option<SystemTime>,
+    settings_error: Option<String>,
+    kernel_path_error: Option<String>,
+    resolve_error: Option<String>,
+    last_controller_ok: bool,
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
     stop_requested: Arc<AtomicBool>,
@@ -117,21 +121,23 @@ impl Worker {
         let (home_dir, config_file) =
             discover::resolve_home_and_config(&portable_root, &settings, None);
         let last_settings_mtime = file_mtime(&settings_path);
-        let has_startup_error = startup_error.is_some();
+        let last_config_mtime = file_mtime(&config_file);
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = settings.groups.page_size;
             snap.resolved_config = Some(config_file.clone());
-            if let Some(err) = startup_error {
-                snap.action_error = Some(err);
-            }
+            snap.config_error = startup_error.clone();
         }
         Self {
             portable_root,
             settings_path,
             settings,
             last_settings_mtime,
-            settings_parse_error: has_startup_error,
+            last_config_mtime,
+            settings_error: startup_error,
+            kernel_path_error: None,
+            resolve_error: None,
+            last_controller_ok: false,
             shared,
             proxy,
             stop_requested,
@@ -238,37 +244,33 @@ impl Worker {
         state_store::save(&self.home_dir, &self.persisted_state);
     }
 
-    fn load_settings_from_disk(&mut self, report_error: bool) -> bool {
+    fn load_settings_from_disk(&mut self) -> bool {
         self.last_settings_mtime = file_mtime(&self.settings_path);
         let prev_controller = self.settings.controller.clone();
         match tray::load(&self.settings_path) {
             Ok(reloaded) => {
                 self.settings = reloaded;
-                if self.settings_parse_error {
-                    self.settings_parse_error = false;
-                    self.set_action_error(None);
-                }
+                self.settings_error = None;
+                self.sync_config_error();
                 self.settings.controller != prev_controller
             }
             Err(err) => {
-                if report_error {
-                    self.settings_parse_error = true;
-                    self.set_action_error(Some(err));
-                }
+                self.settings_error = Some(err);
+                self.sync_config_error();
                 false
             }
         }
     }
 
-    fn reload_settings_and_paths(&mut self, report_error: bool) {
-        self.load_settings_from_disk(report_error);
+    fn refresh_paths(&mut self) {
         match discover::find_kernel(&self.portable_root, &self.settings) {
-            Ok(path) => self.known_kernel_path = path,
+            Ok(path) => {
+                self.known_kernel_path = path;
+                self.kernel_path_error = None;
+            }
             Err(err) => {
                 self.known_kernel_path = None;
-                if report_error {
-                    self.set_action_error(Some(err));
-                }
+                self.kernel_path_error = Some(err);
             }
         }
         let (home, cfg) = discover::resolve_home_and_config(
@@ -278,13 +280,15 @@ impl Worker {
         );
         self.home_dir = home;
         self.config_file = cfg;
+        self.last_config_mtime = file_mtime(&self.config_file);
+        self.sync_config_error();
     }
 
     fn reload_settings_if_changed(&mut self) -> bool {
         if file_mtime(&self.settings_path) == self.last_settings_mtime {
             return false;
         }
-        self.load_settings_from_disk(true)
+        self.load_settings_from_disk()
     }
 
     fn refresh_autostart_cache(&mut self) {
@@ -302,7 +306,8 @@ impl Worker {
     }
 
     fn reload_paths_and_runtime(&mut self) {
-        self.reload_settings_and_paths(true);
+        self.reload_settings_if_changed();
+        self.refresh_paths();
 
         if let Some(rec) = process::load_runtime_record(&self.home_dir) {
             if self
@@ -329,10 +334,12 @@ impl Worker {
         ) {
             Ok(client) => {
                 self.client = Some(client);
+                self.resolve_error = None;
                 self.set_controller_error(None);
             }
             Err(err) => {
                 self.client = None;
+                self.resolve_error = Some(err.clone());
                 self.set_controller_error(Some(err));
             }
         }
@@ -844,8 +851,9 @@ impl Worker {
     }
 
     fn resolve_live_controller(&mut self) -> bool {
+        let settings_changed = self.reload_settings_if_changed();
         let tracked_alive = self.active_pid().is_some();
-        let mut running = if !tracked_alive || self.client.is_none() {
+        let mut running = if !tracked_alive || self.client.is_none() || settings_changed {
             self.process_inspector
                 .list_running_mihomo(self.known_kernel_path.as_deref())
         } else {
@@ -853,19 +861,26 @@ impl Worker {
         };
         let kernel_running = tracked_alive || !running.is_empty();
 
-        if !kernel_running {
-            self.reload_settings_and_paths(false);
-            self.re_resolve_controller(&running);
-        } else {
-            let controller_cfg_changed = self.reload_settings_if_changed();
-            if self.client.is_none() || controller_cfg_changed {
-                if running.is_empty() {
-                    running = self
-                        .process_inspector
-                        .list_running_mihomo(self.known_kernel_path.as_deref());
-                }
-                self.re_resolve_controller(&running);
+        if settings_changed && !kernel_running {
+            self.refresh_paths();
+        }
+
+        let config_mtime = file_mtime(&self.config_file);
+        let config_changed = config_mtime != self.last_config_mtime;
+        if config_changed {
+            self.last_config_mtime = config_mtime;
+        }
+
+        let need_resolve = settings_changed
+            || config_changed
+            || (kernel_running && (self.client.is_none() || !self.last_controller_ok));
+        if need_resolve {
+            if running.is_empty() && kernel_running {
+                running = self
+                    .process_inspector
+                    .list_running_mihomo(self.known_kernel_path.as_deref());
             }
+            self.re_resolve_controller(&running);
         }
         kernel_running
     }
@@ -880,7 +895,9 @@ impl Worker {
                 String::new(),
                 0,
                 false,
-                Some(text::ERR_NO_CONTROLLER.to_string()),
+                self.resolve_error
+                    .clone()
+                    .or_else(|| Some(text::ERR_NO_CONTROLLER.to_string())),
                 None,
             );
         };
@@ -962,6 +979,7 @@ impl Worker {
         let client_opt = self.client.clone();
         let (controller_ok, mode, mixed_port, tun, controller_error, web_ui_url) =
             self.poll_controller_configs(client_opt.as_ref());
+        self.last_controller_ok = controller_ok;
 
         let sysproxy = platform::proxy_is_enabled();
         self.refresh_autostart_if_stale();
@@ -1014,6 +1032,19 @@ impl Worker {
         let _ = self.proxy.send_event(AppEvent::SnapshotUpdated {
             rebuild_menu: false,
         });
+    }
+
+    fn set_config_error(&self, err: Option<String>) {
+        let mut snap = self.shared.lock().unwrap();
+        snap.config_error = err;
+    }
+
+    fn sync_config_error(&self) {
+        let err = self
+            .settings_error
+            .clone()
+            .or_else(|| self.kernel_path_error.clone());
+        self.set_config_error(err);
     }
 
     fn set_action_error(&self, err: Option<String>) {

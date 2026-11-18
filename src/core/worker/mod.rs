@@ -5,6 +5,7 @@ mod lifecycle;
 mod state_sync;
 mod tasks;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,11 +20,11 @@ use self::state_sync::StateSync;
 use self::tasks::SubscriptionTaskState;
 use crate::config::mihomo;
 use crate::config::state_store::PersistedState;
-use crate::config::tray::TraySettings;
-use crate::core::api::{Client, CoreConfigs};
+use crate::config::tray::{GroupsSettings, TraySettings};
+use crate::core::api::{Client, CoreConfigs, ProvidersData, ProxiesData};
 use crate::core::process::{self, ManagedChild, ProcessInspector};
 use crate::platform;
-use crate::state::{self, AppEvent, ProxyMode, SharedSnapshot, WorkerCommand};
+use crate::state::{self, AppEvent, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand};
 use crate::text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,7 @@ struct Worker {
     managed: Option<ManagedChild>,
     recorded_pid: Option<u32>,
     client: Option<Client>,
+    last_controller_error: Option<String>,
     cached_version: String,
     last_controller_ok: bool,
 }
@@ -168,6 +170,7 @@ impl Worker {
             managed: None,
             recorded_pid: None,
             client: None,
+            last_controller_error: None,
             cached_version: String::new(),
             last_controller_ok: false,
         };
@@ -250,9 +253,11 @@ impl Worker {
             && let Err(err) = self.start_core_internal()
         {
             tracing::warn!("Auto-start core failed: {err}");
-            let has_error = self.shared.lock().unwrap().action_error.is_some();
-            if !has_error {
-                self.set_action_error(Some(err));
+            if self.cfg.current_config_error().as_deref() != Some(err.as_str()) {
+                let has_error = self.shared.lock().unwrap().action_error.is_some();
+                if !has_error {
+                    self.set_action_error(Some(err));
+                }
             }
         }
         if !self.stop_requested.load(Ordering::Acquire) {
@@ -311,7 +316,7 @@ impl Worker {
                 res.map(|()| CommandOutcome::ClearError)
             }
             WorkerCommand::AsyncDone { kind, error } => self.handle_async_done(kind, error),
-            WorkerCommand::Quit { .. } => Ok(CommandOutcome::KeepError),
+            WorkerCommand::Quit { .. } => unreachable!("Quit is handled directly in Worker::run"),
         }
     }
 
@@ -391,9 +396,13 @@ impl Worker {
     }
 
     fn apply_pending_restore_if_needed(&mut self, cfg: &mut CoreConfigs) {
-        let Some(restore) = self.state_sync.take_ready_restore() else {
+        let Some(mut restore) = self.state_sync.take_ready_restore() else {
             return;
         };
+        if self.stop_requested.load(Ordering::Acquire) {
+            self.state_sync.arm_ready_restore(restore);
+            return;
+        }
 
         if let Some(want_tun) = restore.tun
             && want_tun != cfg.tun_enable
@@ -407,8 +416,13 @@ impl Worker {
                     } else {
                         cfg.tun_enable = want_tun;
                     }
+                    restore.tun = Some(cfg.tun_enable);
                 }
                 Err(err) => {
+                    if self.stop_requested.load(Ordering::Acquire) {
+                        self.state_sync.arm_ready_restore(restore);
+                        return;
+                    }
                     self.state_sync
                         .update(self.cfg.home_dir(), |s| s.tun = Some(cfg.tun_enable));
                     self.set_action_error(Some(err));
@@ -416,13 +430,20 @@ impl Worker {
             }
         }
 
+        if self.stop_requested.load(Ordering::Acquire) {
+            self.state_sync.arm_ready_restore(restore);
+            return;
+        }
+
         if let Some(ref mode) = restore.mode
             && !mode.is_empty()
             && !cfg.mode.eq_ignore_ascii_case(mode)
             && let Some(client) = &self.client
-            && client.set_mode(mode).is_ok()
         {
-            cfg.mode = mode.clone();
+            match client.set_mode(mode) {
+                Ok(()) => cfg.mode = mode.clone(),
+                Err(err) => self.set_action_error(Some(err)),
+            }
         }
 
         if restore.system_proxy {
@@ -528,7 +549,6 @@ impl Worker {
 
         let sysproxy = platform::proxy_is_enabled();
         self.cfg.refresh_autostart_if_stale();
-        let autostart = self.cfg.cached_autostart();
 
         if polled.controller_ok {
             self.state_sync.sync_live_if_idle(
@@ -539,9 +559,8 @@ impl Worker {
             );
         }
 
-        let client_opt = self.client.clone();
         let (proxies_res, providers_res) = if polled.controller_ok
-            && let Some(client) = &client_opt
+            && let Some(client) = &self.client
         {
             (Some(client.get_proxies()), Some(client.get_providers()))
         } else {
@@ -550,86 +569,57 @@ impl Worker {
 
         {
             let mut snap = self.shared.lock().unwrap();
-            snap.controller_ok = polled.controller_ok;
-            snap.version = if polled.controller_ok {
-                self.cached_version.clone()
-            } else {
-                String::new()
-            };
-            snap.mode = polled.mode;
-            snap.mixed_port = polled.mixed_port;
-            snap.tun = polled.tun;
-            snap.sysproxy = sysproxy;
-            snap.autostart = autostart;
-            snap.kernel_running = kernel_running;
-            if client_opt.is_some() {
-                snap.controller_error = if !polled.controller_ok && !kernel_running {
-                    None
-                } else {
-                    polled.controller_error
-                };
-            } else if snap.controller_error.is_none() {
-                snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
-            }
-            snap.web_ui_url = polled.web_ui_url;
-            snap.resolved_config = self.cfg.config_file().to_path_buf();
-            snap.page_size = self.cfg.settings().groups.page_size;
+            let controller_ok = polled.controller_ok;
+            self.apply_polled_config(&mut snap, polled, sysproxy, kernel_running);
 
-            if !polled.controller_ok {
+            if !controller_ok {
                 snap.groups.clear();
                 snap.providers.clear();
                 snap.node_latency.clear();
             } else {
-                let mut latencies = None;
-                match proxies_res {
-                    Some(Ok(proxies)) => {
-                        snap.groups = state::order_and_filter_groups(
-                            proxies.groups,
-                            &self.cfg.settings().groups.include,
-                            &self.cfg.settings().groups.exclude,
-                            &self.cfg.settings().groups.order,
-                        );
-                        latencies = Some(proxies.latency);
-                    }
-                    Some(Err(err)) => {
-                        tracing::warn!("Failed to poll /proxies: {err}");
-                    }
-                    None => {}
-                }
-                match providers_res {
-                    Some(Ok(prov)) => {
-                        snap.providers = prov.providers;
-                        match latencies {
-                            Some(ref mut map) => {
-                                for (name, delay) in prov.latency {
-                                    map.entry(name)
-                                        .and_modify(|existing| {
-                                            if existing.is_none() {
-                                                *existing = delay;
-                                            }
-                                        })
-                                        .or_insert(delay);
-                                }
-                            }
-                            None => {
-                                for (name, delay) in prov.latency {
-                                    snap.node_latency.insert(name, delay);
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(err)) => {
-                        tracing::warn!("Failed to poll /providers/proxies: {err}");
-                    }
-                    None => {}
-                }
-                if let Some(map) = latencies {
-                    snap.node_latency = map;
-                }
+                apply_proxies_and_providers(
+                    &mut snap,
+                    &self.cfg.settings().groups,
+                    proxies_res,
+                    providers_res,
+                );
             }
         }
         self.proxy
             .send(AppEvent::SnapshotUpdated { rebuild_menu: true });
+    }
+
+    fn apply_polled_config(
+        &self,
+        snap: &mut Snapshot,
+        polled: PolledConfig,
+        sysproxy: bool,
+        kernel_running: bool,
+    ) {
+        snap.controller_ok = polled.controller_ok;
+        snap.version = if polled.controller_ok {
+            self.cached_version.clone()
+        } else {
+            String::new()
+        };
+        snap.mode = polled.mode;
+        snap.mixed_port = polled.mixed_port;
+        snap.tun = polled.tun;
+        snap.sysproxy = sysproxy;
+        snap.autostart = self.cfg.cached_autostart();
+        snap.kernel_running = kernel_running;
+        snap.controller_error = if self.client.is_some() {
+            (!polled.controller_ok && kernel_running)
+                .then_some(polled.controller_error)
+                .flatten()
+        } else {
+            self.last_controller_error
+                .clone()
+                .or_else(|| Some(text::ERR_NO_CONTROLLER.to_string()))
+        };
+        snap.web_ui_url = polled.web_ui_url;
+        snap.resolved_config = self.cfg.config_file().to_path_buf();
+        snap.page_size = self.cfg.settings().groups.page_size;
     }
 
     fn set_status_note(&self, note: Option<&str>) {
@@ -652,10 +642,60 @@ impl Worker {
         let mut snap = self.shared.lock().unwrap();
         snap.action_error = err;
     }
+}
 
-    fn set_controller_error(&self, err: Option<String>) {
-        let mut snap = self.shared.lock().unwrap();
-        snap.controller_error = err;
+fn apply_proxies_and_providers(
+    snap: &mut Snapshot,
+    groups_cfg: &GroupsSettings,
+    proxies_res: Option<Result<ProxiesData, String>>,
+    providers_res: Option<Result<ProvidersData, String>>,
+) {
+    let mut latencies = match proxies_res {
+        Some(Ok(proxies)) => {
+            snap.groups = state::order_and_filter_groups(
+                proxies.groups,
+                &groups_cfg.include,
+                &groups_cfg.exclude,
+                &groups_cfg.order,
+            );
+            Some(proxies.latency)
+        }
+        Some(Err(err)) => {
+            tracing::warn!("Failed to poll /proxies: {err}");
+            None
+        }
+        None => None,
+    };
+
+    match providers_res {
+        Some(Ok(prov)) => {
+            snap.providers = prov.providers;
+            match latencies {
+                Some(ref mut map) => merge_latency(map, prov.latency),
+                None => merge_latency(&mut snap.node_latency, prov.latency),
+            }
+        }
+        Some(Err(err)) => {
+            tracing::warn!("Failed to poll /providers/proxies: {err}");
+        }
+        None => {}
+    }
+
+    if let Some(map) = latencies {
+        snap.node_latency = map;
+    }
+}
+
+fn merge_latency(target: &mut BTreeMap<String, Option<u32>>, extra: BTreeMap<String, Option<u32>>) {
+    for (name, delay) in extra {
+        target
+            .entry(name)
+            .and_modify(|existing| {
+                if existing.is_none() {
+                    *existing = delay;
+                }
+            })
+            .or_insert(delay);
     }
 }
 
@@ -1083,5 +1123,176 @@ mod tests {
 
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shutdown_interruption_preserves_pending_tun_restore_state() {
+        let root = crate::config::test_temp_dir("worker_tun_interrupt");
+        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        let saved = PersistedState {
+            system_proxy: true,
+            mode: Some("global".to_string()),
+            tun: Some(true),
+        };
+        worker.state_sync.arm_ready_restore(saved.clone());
+        worker.stop_requested.store(true, Ordering::Release);
+
+        let mut cfg = CoreConfigs {
+            mode: "rule".to_string(),
+            mixed_port: 7890,
+            tun_enable: false,
+        };
+        worker.apply_pending_restore_if_needed(&mut cfg);
+
+        assert!(worker.state_sync.has_ready_restore());
+        assert_eq!(
+            worker.state_sync.persisted().and_then(|s| s.tun),
+            Some(true)
+        );
+        shared.lock().unwrap().controller_ok = true;
+        shared.lock().unwrap().tun = false;
+        assert_eq!(worker.capture_live_or_persisted_state().tun, Some(true));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_active_kernel_reports_declined_and_ambiguous_external_processes() {
+        let root = crate::config::test_temp_dir("worker_stop_outcome");
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+
+        worker
+            .state_sync
+            .arm_ready_restore(PersistedState::default());
+        let single_external = vec![crate::core::process::RunningProcess {
+            pid: 999_991,
+            exe: Some(PathBuf::from("/external/mihomo")),
+            cmd: Vec::new(),
+        }];
+        let declined = worker
+            .stop_active_kernel(false, Some(single_external))
+            .unwrap();
+        assert_eq!(declined, lifecycle::StopOutcome::DeclinedByUser);
+        assert_eq!(worker.should_start_after_stop(declined), Ok(false));
+        assert!(!worker.state_sync.has_ready_restore());
+
+        worker
+            .state_sync
+            .arm_ready_restore(PersistedState::default());
+        let multi_external = vec![
+            crate::core::process::RunningProcess {
+                pid: 999_991,
+                exe: Some(PathBuf::from("/external/mihomo-1")),
+                cmd: Vec::new(),
+            },
+            crate::core::process::RunningProcess {
+                pid: 999_992,
+                exe: Some(PathBuf::from("/external/mihomo-2")),
+                cmd: Vec::new(),
+            },
+        ];
+        let ambiguous = worker
+            .stop_active_kernel(true, Some(multi_external))
+            .unwrap();
+        assert_eq!(ambiguous, lifecycle::StopOutcome::AmbiguousExternal);
+        assert_eq!(
+            worker.should_start_after_stop(ambiguous).unwrap_err(),
+            text::ERR_MULTIPLE_EXTERNAL_CORES
+        );
+        assert!(!worker.state_sync.has_ready_restore());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalidated_subscription_task_does_not_block_or_clear_new_task() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let root = crate::config::test_temp_dir("worker_sub_invalidate");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                let resp = if req.starts_with("GET /providers/proxies ") {
+                    let body = r#"{"providers":{"subscription":{"vehicleType":"HTTP","updatedAt":"2025-01-01T08:00:00+08:00"}}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+
+        worker.sub_tasks.invalidate();
+        let stale_gen = 0;
+        worker
+            .handle_command(WorkerCommand::RefreshSubscriptions)
+            .unwrap();
+        assert!(worker.sub_tasks.is_active());
+        assert_eq!(
+            shared.lock().unwrap().status_note.as_deref(),
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION)
+        );
+
+        // Stale completion from before invalidation must not clobber the active gen-1 task.
+        worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::RefreshSubscriptions {
+                    generation: stale_gen,
+                },
+                error: Some("stale timeout".to_string()),
+            })
+            .unwrap();
+        assert!(worker.sub_tasks.is_active());
+        assert_eq!(
+            shared.lock().unwrap().status_note.as_deref(),
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION)
+        );
+        assert_eq!(shared.lock().unwrap().action_error, None);
+
+        let real_done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(real_done).unwrap();
+        assert!(!worker.sub_tasks.is_active());
+        assert_eq!(shared.lock().unwrap().status_note, None);
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_latency_preserves_measured_delays_when_proxies_poll_fails() {
+        let mut snap = Snapshot::default();
+        snap.node_latency.insert("Node-A".to_string(), Some(25));
+        snap.node_latency.insert("Node-B".to_string(), None);
+
+        let mut prov_latency = BTreeMap::new();
+        prov_latency.insert("Node-A".to_string(), None);
+        prov_latency.insert("Node-B".to_string(), Some(40));
+        prov_latency.insert("Node-C".to_string(), Some(60));
+
+        let prov = ProvidersData {
+            providers: Vec::new(),
+            latency: prov_latency,
+        };
+        apply_proxies_and_providers(
+            &mut snap,
+            &GroupsSettings::default(),
+            Some(Err("temporary /proxies failure".to_string())),
+            Some(Ok(prov)),
+        );
+
+        assert_eq!(snap.node_latency.get("Node-A"), Some(&Some(25)));
+        assert_eq!(snap.node_latency.get("Node-B"), Some(&Some(40)));
+        assert_eq!(snap.node_latency.get("Node-C"), Some(&Some(60)));
     }
 }

@@ -11,6 +11,7 @@ pub(crate) const SUBSCRIPTION_PROVIDER_NAME: &str = "subscription";
 const SUBSCRIPTION_INTERVAL_SECS: u64 = 43_200; // 12 hours
 pub(crate) const SUBSCRIPTION_LOCAL_PATH: &str = "./providers/subscription.yaml";
 pub(crate) const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
+const HEALTH_CHECK_INTERVAL_SECS: i64 = 300;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MihomoConfigInfo {
@@ -171,7 +172,7 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
             if let Some(hc_map) = sub_map.get_mapping("health-check") {
                 hc_map.set("enable", true);
                 hc_map.set("url", HEALTH_CHECK_URL);
-                hc_map.set("interval", 300);
+                hc_map.set("interval", HEALTH_CHECK_INTERVAL_SECS);
             } else {
                 sub_map.set("health-check", build_health_check_doc());
             }
@@ -203,7 +204,7 @@ fn build_health_check_doc() -> Document {
     MappingBuilder::new()
         .pair("enable", true)
         .pair("url", HEALTH_CHECK_URL)
-        .pair("interval", 300)
+        .pair("interval", HEALTH_CHECK_INTERVAL_SECS)
         .build_document()
 }
 
@@ -213,11 +214,7 @@ fn build_subscription_doc(url: &str) -> Document {
         .pair("url", url)
         .pair("path", SUBSCRIPTION_LOCAL_PATH)
         .pair("interval", SUBSCRIPTION_INTERVAL_SECS as i64)
-        .mapping("health-check", |hc| {
-            hc.pair("enable", true)
-                .pair("url", HEALTH_CHECK_URL)
-                .pair("interval", 300)
-        })
+        .pair("health-check", build_health_check_doc())
         .build_document()
 }
 

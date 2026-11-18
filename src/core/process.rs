@@ -14,6 +14,26 @@ use crate::text::RUNTIME_LOCK_NAME;
 
 const STOP_WAIT_BUDGET: Duration = Duration::from_secs(3);
 
+pub const HELPER_EXIT_INVALID_ARGS: i32 = -1;
+const HELPER_EXIT_UNAUTHORIZED: i32 = -2;
+const HELPER_EXIT_STOP_FAILED: i32 = -3;
+const HELPER_EXIT_SPAWN_FAILED: i32 = -4;
+const HELPER_EXIT_PID_OVERFLOW: i32 = -5;
+
+/// Translates an internal elevated helper exit code into a concise diagnostic phrase.
+pub fn helper_exit_reason(code: i32) -> Option<&'static str> {
+    match code {
+        HELPER_EXIT_INVALID_ARGS => Some("invalid helper arguments"),
+        HELPER_EXIT_UNAUTHORIZED => {
+            Some("target process is missing or not an authorized mihomo binary")
+        }
+        HELPER_EXIT_STOP_FAILED => Some("failed to terminate existing mihomo process"),
+        HELPER_EXIT_SPAWN_FAILED => Some("failed to launch elevated mihomo executable"),
+        HELPER_EXIT_PID_OVERFLOW => Some("spawned PID exceeds supported i32 range"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunningProcess {
     pub pid: u32,
@@ -204,7 +224,11 @@ pub fn spawn_normal(exe: &Path, args: &[String]) -> Result<ManagedChild, String>
 pub fn terminate_pid_and_wait(pid: u32) -> Result<(), String> {
     let mut sys = System::new().map_err(|e| format!("failed to inspect process list: {e}"))?;
     let sys_pid = Pid::from_u32(pid);
-    sys.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
     let Some(proc_info) = sys.process(sys_pid) else {
         return Ok(());
     };
@@ -293,30 +317,57 @@ fn eq_path(a: &Path, b: &Path) -> bool {
 /// Elevated helper entrypoint (`--elevate-stop <pid>`).
 pub fn helper_stop_pid(pid: u32) -> i32 {
     if pid == 0 {
-        return -1;
+        eprintln!("elevated stop helper rejected pid 0");
+        return HELPER_EXIT_INVALID_ARGS;
     }
     if process_exe_for_pid(pid).is_none() {
-        return -2;
+        eprintln!("elevated stop helper rejected missing or unauthorized pid {pid}");
+        return HELPER_EXIT_UNAUTHORIZED;
     }
     match terminate_pid_and_wait(pid) {
         Ok(()) => 0,
-        Err(_) => -3,
+        Err(err) => {
+            eprintln!("elevated stop helper failed to terminate pid {pid}: {err}");
+            HELPER_EXIT_STOP_FAILED
+        }
     }
 }
 
 /// Elevated helper entrypoint (`--elevate-start <pid> <args...>`).
 /// Reads the real executable image from `<pid>` so the caller never injects an arbitrary executable path.
 pub fn helper_start_from_pid(pid: u32, args: &[String]) -> i32 {
+    if pid == 0 {
+        eprintln!("elevated start helper rejected pid 0");
+        return HELPER_EXIT_INVALID_ARGS;
+    }
     let Some(exe) = process_exe_for_pid(pid) else {
-        return -2;
+        eprintln!("elevated start helper rejected missing or unauthorized pid {pid}");
+        return HELPER_EXIT_UNAUTHORIZED;
     };
-    if terminate_pid_and_wait(pid).is_err() {
-        return -3;
+    if let Err(err) = terminate_pid_and_wait(pid) {
+        eprintln!("elevated start helper failed to terminate pid {pid}: {err}");
+        return HELPER_EXIT_STOP_FAILED;
     }
     let cwd = exe.parent();
     match platform::spawn_hidden(&exe, args, cwd) {
-        Ok(child) => child.id() as i32,
-        Err(_) => -4,
+        Ok(child) => match i32::try_from(child.id()) {
+            Ok(id) if id > 0 => id,
+            _ => {
+                eprintln!(
+                    "elevated start helper spawned {} with out-of-range pid {}",
+                    exe.display(),
+                    child.id()
+                );
+                HELPER_EXIT_PID_OVERFLOW
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "elevated start helper failed to spawn {}: {err}",
+                exe.display()
+            );
+            HELPER_EXIT_SPAWN_FAILED
+        }
     }
 }
 
@@ -466,5 +517,21 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn helper_entrypoints_validate_pid_zero_and_describe_exit_codes() {
+        assert_eq!(helper_stop_pid(0), HELPER_EXIT_INVALID_ARGS);
+        assert_eq!(helper_start_from_pid(0, &[]), HELPER_EXIT_INVALID_ARGS);
+        for code in [
+            HELPER_EXIT_INVALID_ARGS,
+            HELPER_EXIT_UNAUTHORIZED,
+            HELPER_EXIT_STOP_FAILED,
+            HELPER_EXIT_SPAWN_FAILED,
+            HELPER_EXIT_PID_OVERFLOW,
+        ] {
+            assert!(helper_exit_reason(code).is_some());
+        }
+        assert_eq!(helper_exit_reason(0), None);
     }
 }

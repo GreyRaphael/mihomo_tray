@@ -37,7 +37,8 @@ pub struct MihomoTrayApp {
     last_tooltip: String,
     last_menu_fingerprint: Option<MenuFingerprint>,
     pending_menu_rebuild: bool,
-    last_click: Instant,
+    last_click: Option<Instant>,
+    last_gui_error: Option<String>,
     version_dialog_open: Arc<AtomicBool>,
     prompt_dialog_open: Arc<AtomicBool>,
     quitting: bool,
@@ -70,7 +71,8 @@ impl MihomoTrayApp {
             last_tooltip: String::new(),
             last_menu_fingerprint: None,
             pending_menu_rebuild: false,
-            last_click: Instant::now() - CLICK_DEBOUNCE,
+            last_click: None,
+            last_gui_error: None,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             prompt_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
@@ -373,9 +375,32 @@ impl MihomoTrayApp {
 
     fn open_target(&mut self, target: impl AsRef<std::ffi::OsStr>) {
         let target = target.as_ref();
-        if let Err(err) = open::that_detached(target) {
-            let display = target.to_string_lossy();
-            self.set_action_error(crate::text::format_open_target_failed(&display, &err));
+        match open::that_detached(target) {
+            Ok(()) => self.clear_gui_action_error(),
+            Err(err) => {
+                let display = target.to_string_lossy();
+                let msg = crate::text::format_open_target_failed(&display, &err);
+                self.last_gui_error = Some(msg.clone());
+                self.set_action_error(msg);
+            }
+        }
+    }
+
+    fn clear_gui_action_error(&mut self) {
+        let Some(gui_err) = self.last_gui_error.take() else {
+            return;
+        };
+        let cleared = {
+            let mut snap = self.shared.lock().unwrap();
+            if snap.action_error.as_deref() == Some(gui_err.as_str()) {
+                snap.action_error = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cleared {
+            self.apply_snapshot(true);
         }
     }
 
@@ -406,10 +431,13 @@ impl MihomoTrayApp {
 
     fn debounce_pass(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.last_click) < CLICK_DEBOUNCE {
+        if self
+            .last_click
+            .is_some_and(|prev| now.duration_since(prev) < CLICK_DEBOUNCE)
+        {
             return false;
         }
-        self.last_click = now;
+        self.last_click = Some(now);
         true
     }
 }

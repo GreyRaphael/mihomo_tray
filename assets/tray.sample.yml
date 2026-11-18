@@ -43,7 +43,7 @@ proxy:
 groups:
   # Explicit group display order; remaining groups are sorted case-insensitively.
   order: []
-  # Include only these groups (empty = all switchable groups).
+  # Include only these groups (empty = all non-hidden groups).
   include: []
   # Exclude these groups.
   exclude: []

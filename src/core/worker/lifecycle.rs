@@ -14,16 +14,23 @@ use crate::text;
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
 const KERNEL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopOutcome {
+    Stopped,
+    DeclinedByUser,
+    AmbiguousExternal,
+}
+
 impl Worker {
     pub(super) fn re_resolve_controller(&mut self, running: &[RunningProcess]) {
         match discover::resolve_controller(self.cfg.settings(), running, self.cfg.config_file()) {
             Ok(client) => {
                 self.client = Some(client);
-                self.set_controller_error(None);
+                self.last_controller_error = None;
             }
             Err(err) => {
                 self.client = None;
-                self.set_controller_error(Some(err));
+                self.last_controller_error = Some(err);
             }
         }
     }
@@ -101,7 +108,14 @@ impl Worker {
 
         let new_pid = match code {
             Ok(c) if c > 0 => c as u32,
-            Ok(c) => return Err(text::format_elevated_helper_failed(c)),
+            Ok(c) => {
+                let reason = process::helper_exit_reason(c);
+                tracing::error!(
+                    "Elevated helper failed while starting mihomo (code {c}: {})",
+                    reason.unwrap_or("unknown")
+                );
+                return Err(text::format_elevated_helper_failed(c, reason));
+            }
             Err(_) => return Err(text::ERR_TUN_ELEVATION_DECLINED.to_string()),
         };
 
@@ -209,14 +223,32 @@ impl Worker {
             self.set_status_note(Some(text::STATUS_RESTARTING_CORE));
             let stop_res = self.stop_active_kernel(true, Some(running));
             self.set_status_note(None);
-            stop_res?;
+            if !self.should_start_after_stop(stop_res?)? {
+                return Ok(());
+            }
         }
         self.start_core_internal()
     }
 
+    pub(super) fn should_start_after_stop(&mut self, outcome: StopOutcome) -> Result<bool, String> {
+        match outcome {
+            StopOutcome::Stopped => Ok(true),
+            StopOutcome::DeclinedByUser => {
+                self.state_sync.clear_pending();
+                Ok(false)
+            }
+            StopOutcome::AmbiguousExternal => {
+                self.state_sync.clear_pending();
+                Err(text::ERR_MULTIPLE_EXTERNAL_CORES.to_string())
+            }
+        }
+    }
+
     pub(super) fn stop_core_internal(&mut self, interactive: bool) -> Result<(), String> {
         match self.stop_active_kernel(interactive, None) {
-            Ok(()) => {
+            Ok(
+                StopOutcome::Stopped | StopOutcome::DeclinedByUser | StopOutcome::AmbiguousExternal,
+            ) => {
                 self.disable_managed_system_proxy();
                 Ok(())
             }
@@ -246,22 +278,22 @@ impl Worker {
         }
     }
 
-    fn stop_active_kernel(
+    pub(super) fn stop_active_kernel(
         &mut self,
         interactive: bool,
         prefetched: Option<Vec<RunningProcess>>,
-    ) -> Result<(), String> {
+    ) -> Result<StopOutcome, String> {
         // First try managed non-elevated child directly.
         if let Some(mut managed) = self.managed.take() {
             if matches!(managed.child.try_wait(), Ok(None)) {
                 if managed.child.kill().is_ok() {
                     let _ = managed.child.wait();
                     self.clear_running_tracking();
-                    return Ok(());
+                    return Ok(StopOutcome::Stopped);
                 }
             } else {
                 self.clear_running_tracking();
-                return Ok(());
+                return Ok(StopOutcome::Stopped);
             }
         }
 
@@ -269,24 +301,29 @@ impl Worker {
             self.process_inspector
                 .list_running_mihomo(self.cfg.known_kernel_path())
         });
-        let target =
+        let tracked_target =
             process::pick_target_process(&running, self.active_pid(), self.cfg.known_kernel_path())
-                .cloned()
-                .or_else(|| {
-                    if interactive && running.len() == 1 {
-                        let candidate = &running[0];
-                        let msg =
-                            text::format_confirm_stop_core(candidate.pid, candidate.exe.as_deref());
-                        if platform::confirm_yes_no(text::TITLE_CONFIRM_STOP, &msg) {
-                            return Some(candidate.clone());
-                        }
-                    }
-                    None
-                });
-
-        let Some(target) = target else {
-            self.clear_running_tracking();
-            return Ok(());
+                .cloned();
+        let target = match tracked_target {
+            Some(found) => found,
+            None => {
+                if running.is_empty() {
+                    self.clear_running_tracking();
+                    return Ok(StopOutcome::Stopped);
+                }
+                if running.len() > 1 {
+                    return Ok(StopOutcome::AmbiguousExternal);
+                }
+                if !interactive {
+                    return Ok(StopOutcome::DeclinedByUser);
+                }
+                let candidate = &running[0];
+                let msg = text::format_confirm_stop_core(candidate.pid, candidate.exe.as_deref());
+                if !platform::confirm_yes_no(text::TITLE_CONFIRM_STOP, &msg) {
+                    return Ok(StopOutcome::DeclinedByUser);
+                }
+                candidate.clone()
+            }
         };
 
         if process::terminate_pid_and_wait(target.pid).is_err() {
@@ -298,12 +335,17 @@ impl Worker {
                 target.pid.to_string(),
             ])?;
             if code != 0 {
+                let reason = process::helper_exit_reason(code).unwrap_or("unknown");
+                tracing::error!(
+                    "Elevated stop helper failed for pid {} (code {code}: {reason})",
+                    target.pid
+                );
                 return Err(text::ERR_STOP_ELEVATION_REQUIRED.to_string());
             }
         }
 
         self.clear_running_tracking();
-        Ok(())
+        Ok(StopOutcome::Stopped)
     }
 
     fn clear_running_tracking(&mut self) {
@@ -314,6 +356,7 @@ impl Worker {
 
     fn wait_for_controller(&mut self, budget: Duration, timeout_msg: &str) -> Result<(), String> {
         let start = Instant::now();
+        let mut waiting_notified = false;
         let res = loop {
             if start.elapsed() >= budget {
                 break Err(timeout_msg.to_string());
@@ -333,8 +376,9 @@ impl Worker {
             {
                 break Ok(());
             }
-            if start.elapsed() >= Duration::from_secs(2) {
+            if !waiting_notified && start.elapsed() >= Duration::from_secs(2) {
                 self.set_status_note(Some(text::STATUS_WAITING_CONTROLLER));
+                waiting_notified = true;
             }
             std::thread::sleep(Duration::from_millis(200));
         };

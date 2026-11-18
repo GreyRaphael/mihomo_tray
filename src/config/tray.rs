@@ -115,7 +115,7 @@ pub fn load(path: &Path) -> Result<TraySettings, String> {
     }
 }
 
-pub fn parse(content: &str) -> Result<TraySettings, serde_yaml_ng::Error> {
+fn parse(content: &str) -> Result<TraySettings, serde_yaml_ng::Error> {
     let clean = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut settings: TraySettings = if clean.trim().is_empty() {
         TraySettings::default()

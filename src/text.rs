@@ -60,6 +60,8 @@ pub const ERR_NO_MIXED_PORT_FOR_RESTORE: &str =
     "mihomo mixed-port/port is 0 or not configured; cannot restore system proxy.";
 pub const ERR_LOCATE_ELEVATE_PROCESS: &str =
     "Could not locate the running mihomo process to elevate.";
+pub const ERR_MULTIPLE_EXTERNAL_CORES: &str =
+    "Multiple external mihomo processes are running; stop them before restarting.";
 pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
     "No subscription provider configured. Use Set Subscription URL first.";
 pub const ERR_INVALID_SUBSCRIPTION_URL: &str =
@@ -111,8 +113,13 @@ pub fn format_open_target_failed(target: &str, err: &dyn std::fmt::Display) -> S
     format!("Failed to open '{target}': {err}")
 }
 
-pub fn format_elevated_helper_failed(code: i32) -> String {
-    format!("Elevated helper failed while restarting mihomo (code {code}).")
+pub fn format_elevated_helper_failed(code: i32, reason: Option<&str>) -> String {
+    match reason {
+        Some(detail) => {
+            format!("Elevated helper failed while restarting mihomo (code {code}: {detail}).")
+        }
+        None => format!("Elevated helper failed while restarting mihomo (code {code})."),
+    }
 }
 
 pub fn format_tun_enable_after_elevation_failed(err: &str) -> String {

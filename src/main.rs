@@ -26,16 +26,19 @@ use crate::state::{AppEvent, Snapshot};
 
 fn main() {
     // Handle elevated helper invocations before acquiring single-instance locks or GUI loops.
-    if let Some(exit_code) =
-        platform::try_run_helper(process::helper_stop_pid, process::helper_start_from_pid)
-    {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(exit_code) = try_run_helper(
+        &cli_args,
+        process::helper_stop_pid,
+        process::helper_start_from_pid,
+    ) {
         std::process::exit(exit_code);
     }
 
     let portable_root = platform::portable_root();
     let log_path = init_logging(&portable_root);
 
-    let after_restart_pid = parse_after_restart_pid();
+    let after_restart_pid = parse_after_restart_pid(&cli_args);
     if let Some(old_pid) = after_restart_pid {
         let mut inspector = process::ProcessInspector::new();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -110,8 +113,30 @@ fn main() {
     }
 }
 
-fn parse_after_restart_pid() -> Option<u32> {
-    let args: Vec<String> = std::env::args().collect();
+fn try_run_helper(
+    args: &[String],
+    stop_pid: fn(u32) -> i32,
+    start_from_pid: fn(u32, &[String]) -> i32,
+) -> Option<i32> {
+    let flag = args.get(1)?.as_str();
+    match flag {
+        platform::ELEVATE_STOP_FLAG => {
+            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
+                return Some(process::HELPER_EXIT_INVALID_ARGS);
+            };
+            Some(stop_pid(pid))
+        }
+        platform::ELEVATE_START_FLAG => {
+            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
+                return Some(process::HELPER_EXIT_INVALID_ARGS);
+            };
+            Some(start_from_pid(pid, &args[3..]))
+        }
+        _ => None,
+    }
+}
+
+fn parse_after_restart_pid(args: &[String]) -> Option<u32> {
     if args.get(1).map(String::as_str) == Some(platform::AFTER_RESTART_FLAG) {
         return args.get(2).and_then(|s| s.parse::<u32>().ok());
     }
@@ -193,4 +218,50 @@ fn init_logging(portable_root: &Path) -> PathBuf {
         }
     }
     log_file
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_stop(pid: u32) -> i32 {
+        (pid as i32) + 10
+    }
+
+    fn fake_start(pid: u32, extra: &[String]) -> i32 {
+        (pid as i32) + (extra.len() as i32)
+    }
+
+    #[test]
+    fn dispatches_helper_and_after_restart_cli_args() {
+        let normal = vec!["mihomo-tray".to_string()];
+        assert_eq!(try_run_helper(&normal, fake_stop, fake_start), None);
+        assert_eq!(parse_after_restart_pid(&normal), None);
+
+        let bad_stop = vec![
+            "mihomo-tray".to_string(),
+            platform::ELEVATE_STOP_FLAG.to_string(),
+            "not-a-pid".to_string(),
+        ];
+        assert_eq!(
+            try_run_helper(&bad_stop, fake_stop, fake_start),
+            Some(process::HELPER_EXIT_INVALID_ARGS)
+        );
+
+        let good_start = vec![
+            "mihomo-tray".to_string(),
+            platform::ELEVATE_START_FLAG.to_string(),
+            "42".to_string(),
+            "-d".to_string(),
+            "./config".to_string(),
+        ];
+        assert_eq!(try_run_helper(&good_start, fake_stop, fake_start), Some(44));
+
+        let restart = vec![
+            "mihomo-tray".to_string(),
+            platform::AFTER_RESTART_FLAG.to_string(),
+            "99".to_string(),
+        ];
+        assert_eq!(parse_after_restart_pid(&restart), Some(99));
+    }
 }

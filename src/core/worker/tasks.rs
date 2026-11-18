@@ -10,20 +10,48 @@ use crate::text;
 
 #[derive(Default)]
 pub(super) struct SubscriptionTaskState {
-    pub active: bool,
-    pub pending_reload: bool,
-    pub generation: u64,
+    active_generation: Option<u64>,
+    pending_reload: bool,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCompletion {
+    Stale,
+    ChainedReload,
+    Current,
 }
 
 impl SubscriptionTaskState {
+    pub fn is_active(&self) -> bool {
+        self.active_generation.is_some()
+    }
+
+    fn mark_started(&mut self, generation: u64) {
+        self.active_generation = Some(generation);
+    }
+
     fn bump_generation(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.generation
     }
 
     pub fn invalidate(&mut self) {
-        self.bump_generation();
+        self.generation = self.generation.wrapping_add(1);
+        self.active_generation = None;
         self.pending_reload = false;
+    }
+
+    fn complete(&mut self, task_gen: u64) -> TaskCompletion {
+        if self.active_generation != Some(task_gen) {
+            return TaskCompletion::Stale;
+        }
+        self.active_generation = None;
+        if self.pending_reload {
+            self.pending_reload = false;
+            return TaskCompletion::ChainedReload;
+        }
+        TaskCompletion::Current
     }
 }
 
@@ -107,7 +135,7 @@ impl Worker {
 
     pub(super) fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, String> {
         let client = self.require_client()?.clone();
-        if self.sub_tasks.active {
+        if self.sub_tasks.is_active() {
             return Ok(CommandOutcome::KeepError);
         }
         let generation = self.sub_tasks.generation;
@@ -135,7 +163,7 @@ impl Worker {
                 (AsyncTaskKind::RefreshSubscriptions { generation }, err)
             },
         ) {
-            self.sub_tasks.active = true;
+            self.sub_tasks.mark_started(generation);
             Ok(CommandOutcome::ClearError)
         } else {
             Ok(CommandOutcome::KeepError)
@@ -183,7 +211,7 @@ impl Worker {
                 )
             },
         ) {
-            self.sub_tasks.active = true;
+            self.sub_tasks.mark_started(generation);
         } else {
             self.state_sync.resolve_deferred(generation, true);
         }
@@ -195,7 +223,7 @@ impl Worker {
         if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
             let generation = self.sub_tasks.bump_generation();
             self.state_sync.defer_restore(generation, saved);
-            if self.sub_tasks.active {
+            if self.sub_tasks.is_active() {
                 self.sub_tasks.pending_reload = true;
                 self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
             } else {
@@ -223,29 +251,30 @@ impl Worker {
             }
             AsyncTaskKind::RefreshSubscriptions { generation }
             | AsyncTaskKind::ApplySubscription { generation, .. } => {
-                self.sub_tasks.active = false;
-                if self.sub_tasks.pending_reload {
-                    self.sub_tasks.pending_reload = false;
-                    if let Some(err) = error {
-                        tracing::warn!("Superseded subscription task failed: {err}");
+                match self.sub_tasks.complete(generation) {
+                    TaskCompletion::Stale => {
+                        if let Some(err) = error {
+                            tracing::debug!("Ignoring stale subscription task error: {err}");
+                        }
+                        Ok(CommandOutcome::KeepError)
                     }
-                    self.chain_pending_sub_reload();
-                    return Ok(CommandOutcome::KeepError);
-                }
-
-                self.set_status_note(None);
-                if generation != self.sub_tasks.generation {
-                    if let Some(err) = error {
-                        tracing::debug!("Ignoring stale subscription task error: {err}");
+                    TaskCompletion::ChainedReload => {
+                        if let Some(err) = error {
+                            tracing::warn!("Superseded subscription task failed: {err}");
+                        }
+                        self.chain_pending_sub_reload();
+                        Ok(CommandOutcome::KeepError)
                     }
-                    return Ok(CommandOutcome::KeepError);
-                }
-                if let AsyncTaskKind::ApplySubscription { reload_ok, .. } = kind {
-                    self.state_sync.resolve_deferred(generation, reload_ok);
-                }
-                match error {
-                    Some(err) => Err(err),
-                    None => Ok(CommandOutcome::KeepError),
+                    TaskCompletion::Current => {
+                        self.set_status_note(None);
+                        if let AsyncTaskKind::ApplySubscription { reload_ok, .. } = kind {
+                            self.state_sync.resolve_deferred(generation, reload_ok);
+                        }
+                        match error {
+                            Some(err) => Err(err),
+                            None => Ok(CommandOutcome::KeepError),
+                        }
+                    }
                 }
             }
         }

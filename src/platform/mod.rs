@@ -110,30 +110,6 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     imp::run_elevated_self(args)
 }
 
-/// Checks CLI arguments for internal elevated helper switches before GUI startup.
-pub fn try_run_helper(
-    stop_pid: fn(u32) -> i32,
-    start_from_pid: fn(u32, &[String]) -> i32,
-) -> Option<i32> {
-    let args: Vec<String> = std::env::args().collect();
-    let flag = args.get(1)?.as_str();
-    match flag {
-        ELEVATE_STOP_FLAG => {
-            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
-                return Some(-1);
-            };
-            Some(stop_pid(pid))
-        }
-        ELEVATE_START_FLAG => {
-            let Some(pid) = args.get(2).and_then(|s| s.parse::<u32>().ok()) else {
-                return Some(-1);
-            };
-            Some(start_from_pid(pid, &args[3..]))
-        }
-        _ => None,
-    }
-}
-
 fn can_show_dialog() -> bool {
     #[cfg(any(windows, target_os = "macos"))]
     {

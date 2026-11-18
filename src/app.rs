@@ -384,7 +384,6 @@ impl MihomoTrayApp {
     }
 
     fn shutdown_on_exit(&mut self) {
-        platform::close_subscription_prompt();
         if let Some(mut worker) = self.worker.take() {
             if !self.quitting {
                 self.quitting = true;

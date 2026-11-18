@@ -1,18 +1,19 @@
 //! Platform boundary isolating Windows-specific integrations from cross-platform core logic.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(windows))]
 mod stub;
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
-mod windows_prompt;
 
 #[cfg(not(windows))]
 use stub as imp;
 #[cfg(windows)]
 use windows as imp;
+
+static PROMPT_OPEN: AtomicBool = AtomicBool::new(false);
 
 pub const ELEVATE_START_FLAG: &str = "--elevate-start";
 pub const ELEVATE_STOP_FLAG: &str = "--elevate-stop";
@@ -134,24 +135,94 @@ pub fn try_run_helper(
     }
 }
 
+fn can_show_rfd_dialog() -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        true
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
+            && which::which("zenity").is_ok()
+    }
+}
+
+fn can_show_text_input() -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        true
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
+            && (std::env::var_os("RUSTY_DIALOGS_BACKEND").is_some()
+                || which::which("kdialog").is_ok()
+                || which::which("zenity").is_ok())
+    }
+}
+
+fn show_message_dialog(
+    level: rfd::MessageLevel,
+    title: &str,
+    message: &str,
+    buttons: rfd::MessageButtons,
+) -> Option<rfd::MessageDialogResult> {
+    if !can_show_rfd_dialog() {
+        return None;
+    }
+    Some(
+        rfd::MessageDialog::new()
+            .set_level(level)
+            .set_title(title)
+            .set_description(message)
+            .set_buttons(buttons)
+            .show(),
+    )
+}
+
 /// Displays a blocking modal notice/error box to the user on desktop platforms.
 pub fn notify_error(title: &str, message: &str) {
-    imp::notify_error(title, message);
+    #[cfg(not(windows))]
+    tracing::error!("{title}: {message}");
+
+    let _ = show_message_dialog(
+        rfd::MessageLevel::Error,
+        title,
+        message,
+        rfd::MessageButtons::Ok,
+    );
 }
 
 /// Displays a blocking modal informational box to the user on desktop platforms.
 pub fn notify_info(title: &str, message: &str) {
-    imp::notify_info(title, message);
+    #[cfg(not(windows))]
+    tracing::info!("{title}: {message}");
+
+    let _ = show_message_dialog(
+        rfd::MessageLevel::Info,
+        title,
+        message,
+        rfd::MessageButtons::Ok,
+    );
 }
 
 /// Displays a blocking modal confirmation (Yes/No) returning `true` only on Yes.
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
-    imp::confirm_yes_no(title, message)
+    show_message_dialog(
+        rfd::MessageLevel::Warning,
+        title,
+        message,
+        rfd::MessageButtons::YesNo,
+    ) == Some(rfd::MessageDialogResult::Yes)
 }
 
 /// Writes UTF-8 text to the OS clipboard.
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    imp::copy_to_clipboard(text)
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("failed to access clipboard: {e}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("failed to copy text to clipboard: {e}"))
 }
 
 /// Formats shell commands that configure HTTP/HTTPS/ALL proxy environment variables.
@@ -174,12 +245,35 @@ pub fn is_tray_menu_open() -> bool {
 
 /// Prompts the user with a simple modal text input box for a subscription URL.
 pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
-    imp::prompt_subscription_url(current)
-}
+    if PROMPT_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    struct PromptGuard;
+    impl Drop for PromptGuard {
+        fn drop(&mut self) {
+            PROMPT_OPEN.store(false, Ordering::Release);
+        }
+    }
+    let _guard = PromptGuard;
 
-/// Requests an open subscription prompt window to close cleanly (used during app shutdown).
-pub fn close_subscription_prompt() {
-    imp::close_subscription_prompt();
+    if !can_show_text_input() {
+        tracing::warn!("No native text input backend available on this system");
+        return None;
+    }
+
+    rustydialogs::TextInput {
+        title: crate::text::PROMPT_SUBSCRIPTION_TITLE,
+        message: crate::text::PROMPT_SUBSCRIPTION_HINT,
+        value: current.unwrap_or(""),
+        mode: rustydialogs::TextInputMode::SingleLine,
+        owner: None,
+    }
+    .show()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// Extracts the target executable path from a Scoop `.shim` file (`path = "..."`).

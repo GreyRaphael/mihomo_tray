@@ -50,14 +50,12 @@ fn discover_kernel(portable_root: &Path, path_var: Option<&OsStr>) -> Option<Pat
         }
     }
 
-    if let Some(path_var) = path_var {
-        for dir in std::env::split_paths(path_var) {
-            let candidate = dir.join(exact_name);
-            if candidate.is_file() {
-                let target = platform::resolve_shim_target(&candidate).unwrap_or(candidate);
-                return Some(target);
-            }
-        }
+    if let Some(path_var) = path_var
+        && let Ok(mut matches) = which::which_in_global(exact_name, Some(path_var))
+        && let Some(candidate) = matches.next()
+    {
+        let target = platform::resolve_shim_target(&candidate).unwrap_or(candidate);
+        return Some(target);
     }
 
     None
@@ -450,5 +448,27 @@ mod tests {
         assert_eq!(client_argv.secret, "from_argv");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovers_kernel_on_path_with_which() {
+        let root = temp_dir("path_which_root");
+        let path_dir = temp_dir("path_which_bin");
+        let bin = path_dir.join(platform::kernel_exe_name());
+        std::fs::write(&bin, b"stub").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        let found = discover_kernel(&root, Some(path_dir.as_os_str()))
+            .expect("kernel should be found via PATH");
+        assert_eq!(found, bin);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&path_dir);
     }
 }

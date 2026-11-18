@@ -459,9 +459,15 @@ impl Worker {
         )
         .ok_or_else(|| text::ERR_LOCATE_ELEVATE_PROCESS.to_string())?;
 
-        let kernel_path = target.exe.clone().or_else(|| self.known_kernel_path.clone());
-        let launch_args =
-            discover::build_launch_args(&self.portable_root, &self.settings, kernel_path.as_deref())?;
+        let kernel_path = target
+            .exe
+            .clone()
+            .or_else(|| self.known_kernel_path.clone());
+        let launch_args = discover::build_launch_args(
+            &self.portable_root,
+            &self.settings,
+            kernel_path.as_deref(),
+        )?;
 
         self.set_status_note(Some(text::STATUS_ELEVATING_CORE));
         let mut helper_args = vec![

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use single_instance::SingleInstance;
 use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
@@ -150,31 +151,37 @@ fn acquire_single_instance(
     }
 }
 
-const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 
 fn init_logging(portable_root: &Path) -> PathBuf {
     let logs_dir = portable_root.join("logs");
+    let log_file = logs_dir.join("mihomo-tray.log");
     if let Err(err) = std::fs::create_dir_all(&logs_dir) {
         eprintln!(
             "Failed to create log directory {}: {err}",
             logs_dir.display()
         );
-    }
-    let log_file = logs_dir.join("mihomo-tray.log");
-    if let Ok(meta) = std::fs::metadata(&log_file)
-        && meta.len() > MAX_LOG_BYTES
-    {
-        let backup = logs_dir.join("mihomo-tray.log.old");
-        let _ = std::fs::rename(&log_file, backup);
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .try_init();
+        return log_file;
     }
 
     match OpenOptions::new().create(true).append(true).open(&log_file) {
-        Ok(file) => {
-            let writer = Mutex::new(file);
+        Ok(probe) => {
+            drop(probe);
+            let rotator = FileRotate::new(
+                &log_file,
+                AppendCount::new(1),
+                ContentLimit::Bytes(MAX_LOG_BYTES),
+                Compression::None,
+                None,
+            );
             let _ = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_target(false)
-                .with_writer(writer)
+                .with_writer(Mutex::new(rotator))
                 .try_init();
         }
         Err(err) => {

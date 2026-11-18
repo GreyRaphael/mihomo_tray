@@ -174,7 +174,10 @@ pub enum WorkerCommand {
     SetMode(String),
     ToggleSystemProxy,
     ToggleTun,
-    SelectProxy { group: String, member: String },
+    SelectProxy {
+        group: String,
+        member: String,
+    },
     UnfixGroup(String),
     TestGroupLatency(String),
     RefreshSubscriptions,
@@ -186,7 +189,9 @@ pub enum WorkerCommand {
         error: Option<String>,
         clear_note: bool,
     },
-    Quit { interactive: bool },
+    Quit {
+        interactive: bool,
+    },
 }
 
 #[derive(Debug)]

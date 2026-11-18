@@ -39,7 +39,8 @@ pub const STATUS_STOPPING_CORE: &str = "Stopping mihomo core...";
 pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
 pub const STATUS_UPDATING_SUBSCRIPTION: &str = "Updating subscription...";
 
-pub const ERR_ALREADY_RUNNING: &str = "mihomo-tray is already running.\nCheck the system tray overflow area if the icon is hidden.";
+pub const ERR_ALREADY_RUNNING: &str =
+    "mihomo-tray is already running.\nCheck the system tray overflow area if the icon is hidden.";
 pub const ERR_CORE_NOT_FOUND: &str = "No mihomo binary found beside mihomo-tray, in ./core, ./bin, or on PATH. Place mihomo.exe in ./core or set mihomo.path in tray.yml.";
 pub const ERR_NO_CONTROLLER: &str = "No controller address found. Configure external-controller in config.yaml or controller.address in tray.yml.";
 pub const ERR_CORE_STOPPED_UNEXPECTEDLY: &str = "mihomo exited unexpectedly.";
@@ -71,15 +72,9 @@ pub const TITLE_VERSION: &str = "Version";
 pub const TITLE_CONFIRM_STOP: &str = "Confirm Stop Core";
 pub const TITLE_QUIT_ANYWAY: &str = "Core Still Running";
 
-#[cfg(windows)]
 pub const PROMPT_SUBSCRIPTION_TITLE: &str = "Set Subscription URL";
-#[cfg(windows)]
 pub const PROMPT_SUBSCRIPTION_HINT: &str =
     "Enter your subscription link (auto-updates every 12 hours):";
-#[cfg(windows)]
-pub const PROMPT_BTN_SAVE: &str = "Save";
-#[cfg(windows)]
-pub const PROMPT_BTN_CANCEL: &str = "Cancel";
 
 pub fn format_confirm_quit_anyway(err: &str) -> String {
     format!(

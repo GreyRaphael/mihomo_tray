@@ -3,12 +3,22 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ureq::{Agent, RequestBuilder};
+use url::Url;
 
 use crate::config::mihomo::HEALTH_CHECK_URL;
 use crate::config::tray::{CONTROLLER_TIMEOUT_MAX_MS, CONTROLLER_TIMEOUT_MIN_MS};
 use crate::state::{Group, Provider};
+
+/// RFC 3986 unreserved characters (`A-Za-z0-9-_.~`) left unencoded.
+const UNRESERVED_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 const PROBE_TIMEOUT_MS: u64 = 800;
 const DELAY_QUERY_TIMEOUT_MS: u32 = 3000;
@@ -82,17 +92,46 @@ impl Client {
         if trimmed.is_empty() {
             return Err(ClientError::InvalidAddress);
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("https://") {
+
+        let candidate = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else if let Some(port_part) = trimmed.strip_prefix(':') {
+            format!("http://127.0.0.1:{port_part}")
+        } else {
+            format!("http://{trimmed}")
+        };
+
+        let parsed = Url::parse(&candidate).map_err(|_| ClientError::InvalidAddress)?;
+        if parsed.scheme().eq_ignore_ascii_case("https") {
             return Err(ClientError::TlsUnsupported);
         }
-        let without_scheme = if lower.starts_with("http://") {
-            &trimmed[7..]
-        } else {
-            trimmed
+        if !parsed.scheme().eq_ignore_ascii_case("http") {
+            return Err(ClientError::InvalidAddress);
+        }
+
+        let raw_host = parsed.host_str().ok_or(ClientError::InvalidAddress)?;
+        // `Url::port()` omits the scheme's default `:80`, so inspect the raw authority if explicit `:80` was passed.
+        let authority = candidate
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("");
+        let port = parsed
+            .port()
+            .or_else(|| {
+                authority
+                    .rsplit_once(':')
+                    .is_some_and(|(_, p)| p == "80")
+                    .then_some(80)
+            })
+            .ok_or(ClientError::InvalidAddress)?;
+        if port == 0 {
+            return Err(ClientError::InvalidAddress);
+        }
+
+        let host = match raw_host {
+            "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+            other => other.to_string(),
         };
-        let authority = without_scheme.split('/').next().unwrap_or("").trim();
-        let (host, port) = parse_host_port(authority).ok_or(ClientError::InvalidAddress)?;
         let agent: Agent = Agent::config_builder()
             .http_status_as_error(false)
             .build()
@@ -107,16 +146,8 @@ impl Client {
         })
     }
 
-    fn host_for_url(&self) -> String {
-        if self.host.contains(':') && !self.host.starts_with('[') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        }
-    }
-
     fn base_url(&self) -> String {
-        format!("http://{}:{}", self.host_for_url(), self.port)
+        format!("http://{}:{}", self.host, self.port)
     }
 
     pub fn format_web_ui_url(&self, template: &str) -> String {
@@ -127,9 +158,8 @@ impl Client {
             tpl
         };
         let encoded_secret = percent_encode(&self.secret);
-        let host_for_url = self.host_for_url();
         effective
-            .replace("{host}", &host_for_url)
+            .replace("{host}", &self.host)
             .replace("{port}", &self.port.to_string())
             .replace("{secret}", &encoded_secret)
     }
@@ -405,41 +435,8 @@ fn last_history_delay(entry: &Value) -> Option<u32> {
     last.get("delay").and_then(Value::as_u64).map(|d| d as u32)
 }
 
-fn parse_host_port(authority: &str) -> Option<(String, u16)> {
-    if authority.is_empty() {
-        return None;
-    }
-    let (raw_host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
-        let (h, p) = rest.split_once("]:")?;
-        (h, p)
-    } else if let Some(p) = authority.strip_prefix(':') {
-        ("127.0.0.1", p)
-    } else {
-        authority.rsplit_once(':')?
-    };
-
-    let port: u16 = port_str.parse().ok()?;
-    if port == 0 {
-        return None;
-    }
-    let host = match raw_host.trim() {
-        "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
-        other => other.to_string(),
-    };
-    Some((host, port))
-}
-
 pub fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.as_bytes() {
-        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
-        if keep {
-            out.push(*byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+    utf8_percent_encode(input, UNRESERVED_ENCODE_SET).to_string()
 }
 
 /// Parses an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS...`) into Unix seconds.
@@ -448,74 +445,9 @@ fn parse_rfc3339_unix(raw: &str) -> Option<i64> {
     if raw.starts_with("0001-") {
         return None;
     }
-    let date_part = raw.get(..10)?;
-    let time_part = raw.get(11..19)?;
-    if raw.as_bytes().get(10).copied() != Some(b'T') {
-        return None;
-    }
-    let year: i64 = date_part.get(0..4)?.parse().ok()?;
-    let month: u32 = date_part.get(5..7)?.parse().ok()?;
-    let day: u32 = date_part.get(8..10)?.parse().ok()?;
-    let hour: i64 = time_part.get(0..2)?.parse().ok()?;
-    let min: i64 = time_part.get(3..5)?.parse().ok()?;
-    let sec: i64 = time_part.get(6..8)?.parse().ok()?;
-
-    if !(1..=12).contains(&month)
-        || !(1..=max_days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 60
-    {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day);
-    let mut unix = days * 86_400 + hour * 3600 + min * 60 + sec;
-
-    // Handle optional timezone offset (`Z` or `+HH:MM` / `-HH:MM`) after fractional seconds.
-    let rest = raw.get(19..)?;
-    let tz_start = rest.find(['Z', 'z', '+', '-'])?;
-    let tz = &rest[tz_start..];
-    if !tz.eq_ignore_ascii_case("Z") {
-        let sign = if tz.starts_with('+') { 1i64 } else { -1i64 };
-        let clean_tz = &tz[1..];
-        let (th, tm) = if let Some((h, m)) = clean_tz.split_once(':') {
-            (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
-        } else if let (Some(h), Some(m)) = (clean_tz.get(..2), clean_tz.get(2..4)) {
-            (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
-        } else {
-            return None;
-        };
-        if !(0..=23).contains(&th) || !(0..=59).contains(&tm) {
-            return None;
-        }
-        unix -= sign * (th * 3600 + tm * 60);
-    }
-
-    Some(unix)
-}
-
-fn max_days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-            if leap { 29 } else { 28 }
-        }
-        _ => 0,
-    }
-}
-
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = y - i64::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = i64::from(m);
-    let d = i64::from(d);
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    OffsetDateTime::parse(raw, &Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
 }
 
 #[cfg(test)]
@@ -540,6 +472,25 @@ mod tests {
         assert_eq!(
             Client::new("https://127.0.0.1:9090", "", 1000).unwrap_err(),
             ClientError::TlsUnsupported
+        );
+        assert_eq!(
+            Client::new("127.0.0.1", "", 1000).unwrap_err(),
+            ClientError::InvalidAddress
+        );
+        assert_eq!(
+            Client::new("127.0.0.1:0", "", 1000).unwrap_err(),
+            ClientError::InvalidAddress
+        );
+
+        let c3 = Client::new("http://127.0.0.1:80/api", "", 1000).unwrap();
+        assert_eq!(c3.port, 80);
+
+        let c4 = Client::new("[::1]:9090", "", 1000).unwrap();
+        assert_eq!(c4.host, "[::1]");
+        assert_eq!(c4.port, 9090);
+        assert_eq!(
+            c4.format_web_ui_url(""),
+            "http://[::1]:9090/ui/?hostname=[::1]&port=9090&secret="
         );
     }
 

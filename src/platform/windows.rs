@@ -5,19 +5,14 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use windows_sys::Win32::Foundation::{CloseHandle, GlobalFree};
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
 use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
-use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, GetCurrentThreadId, GetExitCodeProcess, INFINITE, WaitForSingleObject,
 };
@@ -25,13 +20,10 @@ use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GUI_INMENUMODE, GUI_POPUPMENUMODE, GUITHREADINFO, GetGUIThreadInfo, IDYES, MB_DEFBUTTON2,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MessageBoxW, SW_HIDE,
+    GUI_INMENUMODE, GUI_POPUPMENUMODE, GUITHREADINFO, GetGUIThreadInfo, SW_HIDE,
 };
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
-
-pub use super::windows_prompt::{close_subscription_prompt, prompt_subscription_url};
 
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const SCOOP_SHIM_MAX_BYTES: u64 = 64 * 1024;
@@ -213,59 +205,6 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     }
 }
 
-fn message_box(title: &str, message: &str, flags: u32) -> i32 {
-    let title_w = wide(title);
-    let msg_w = wide(message);
-    unsafe { MessageBoxW(std::ptr::null_mut(), msg_w.as_ptr(), title_w.as_ptr(), flags) }
-}
-
-pub fn notify_error(title: &str, message: &str) {
-    message_box(title, message, MB_OK | MB_ICONERROR);
-}
-
-pub fn notify_info(title: &str, message: &str) {
-    message_box(title, message, MB_OK | MB_ICONINFORMATION);
-}
-
-pub fn confirm_yes_no(title: &str, message: &str) -> bool {
-    message_box(title, message, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
-}
-
-pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let utf16 = wide(text);
-    let byte_len = utf16.len() * std::mem::size_of::<u16>();
-
-    unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return Err("failed to open Windows clipboard".to_string());
-        }
-        EmptyClipboard();
-
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
-        if hmem.is_null() {
-            CloseClipboard();
-            return Err("failed to allocate clipboard memory".to_string());
-        }
-
-        let ptr = GlobalLock(hmem) as *mut u16;
-        if ptr.is_null() {
-            GlobalFree(hmem);
-            CloseClipboard();
-            return Err("failed to lock clipboard memory".to_string());
-        }
-        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
-        GlobalUnlock(hmem);
-
-        if SetClipboardData(CF_UNICODETEXT as u32, hmem).is_null() {
-            GlobalFree(hmem);
-            CloseClipboard();
-            return Err("failed to set clipboard text".to_string());
-        }
-        CloseClipboard();
-    }
-    Ok(())
-}
-
 pub fn format_env_vars_command(port: u16) -> String {
     format!(
         "$env:HTTP_PROXY=\"http://127.0.0.1:{port}\"; $env:HTTPS_PROXY=\"http://127.0.0.1:{port}\"; $env:ALL_PROXY=\"socks5://127.0.0.1:{port}\""
@@ -283,7 +222,7 @@ pub fn is_tray_menu_open() -> bool {
     }
 }
 
-pub(super) fn wide(s: &str) -> Vec<u16> {
+fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()
         .chain(std::iter::once(0))

@@ -1,9 +1,10 @@
 //! Lightweight extraction and subscription management for mihomo `config.yaml`.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::Deserialize;
-use serde_yaml_ng::{Mapping, Value};
+use yaml_edit::{Document, Mapping, MappingBuilder, Sequence, SequenceBuilder};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../assets/config.sample.yaml");
 pub(crate) const SUBSCRIPTION_PROVIDER_NAME: &str = "subscription";
@@ -100,20 +101,23 @@ pub fn ensure_default_config(path: &Path) {
 pub fn read_subscription_url(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let clean = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let root: Value = serde_yaml_ng::from_str(clean).ok()?;
-    root.get("proxy-providers")?
-        .get(SUBSCRIPTION_PROVIDER_NAME)?
+    let doc = Document::from_str(clean).ok()?;
+    doc.get_mapping("proxy-providers")?
+        .get_mapping(SUBSCRIPTION_PROVIDER_NAME)?
         .get("url")?
-        .as_str()
-        .map(str::trim)
+        .as_scalar()
+        .map(|s| s.as_string())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
 }
 
-/// Writes/updates `proxy-providers.subscription` (12h update interval) and attaches it to proxy groups.
+/// Writes/updates `proxy-providers.subscription` (12h update interval) and attaches it to proxy groups
+/// while preserving existing YAML comments and formatting via `yaml-edit`.
 pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> {
     let url = raw_url.trim();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    let valid_http =
+        url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host());
+    if !valid_http {
         return Err(crate::text::ERR_INVALID_SUBSCRIPTION_URL.to_string());
     }
 
@@ -125,112 +129,80 @@ pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> 
         }
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let clean = source_text.strip_prefix('\u{feff}').unwrap_or(&source_text);
-    let mut root: Value = serde_yaml_ng::from_str(clean)
+    let (bom, clean) = match source_text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", source_text.as_str()),
+    };
+    let doc = Document::from_str(clean)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
-    let root_map = root
-        .as_mapping_mut()
+    let root_map = doc
+        .as_mapping()
         .ok_or_else(|| format!("{} root must be a YAML mapping", path.display()))?;
 
     // 1. Insert or update `proxy-providers.subscription`
-    let providers_key = Value::String("proxy-providers".to_string());
-    if !root_map.get(&providers_key).is_some_and(Value::is_mapping) {
-        root_map.insert(providers_key.clone(), Value::Mapping(Mapping::new()));
+    let sub_doc = MappingBuilder::new()
+        .pair("type", "http")
+        .pair("url", url)
+        .pair("path", SUBSCRIPTION_LOCAL_PATH)
+        .pair("interval", SUBSCRIPTION_INTERVAL_SECS as i64)
+        .mapping("health-check", |hc| {
+            hc.pair("enable", true)
+                .pair("url", HEALTH_CHECK_URL)
+                .pair("interval", 300)
+        })
+        .build_document();
+    if let Some(providers_map) = root_map.get_mapping("proxy-providers") {
+        providers_map.set(SUBSCRIPTION_PROVIDER_NAME, &sub_doc);
+    } else {
+        let providers_doc = MappingBuilder::new()
+            .pair(SUBSCRIPTION_PROVIDER_NAME, &sub_doc)
+            .build_document();
+        root_map.set("proxy-providers", &providers_doc);
     }
-    let providers_map = root_map
-        .get_mut(&providers_key)
-        .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| "invalid proxy-providers section".to_string())?;
-
-    let mut health = Mapping::new();
-    health.insert(Value::String("enable".to_string()), Value::Bool(true));
-    health.insert(
-        Value::String("url".to_string()),
-        Value::String(HEALTH_CHECK_URL.to_string()),
-    );
-    health.insert(
-        Value::String("interval".to_string()),
-        Value::Number(300.into()),
-    );
-
-    let mut sub_map = Mapping::new();
-    sub_map.insert(
-        Value::String("type".to_string()),
-        Value::String("http".to_string()),
-    );
-    sub_map.insert(
-        Value::String("url".to_string()),
-        Value::String(url.to_string()),
-    );
-    sub_map.insert(
-        Value::String("path".to_string()),
-        Value::String(SUBSCRIPTION_LOCAL_PATH.to_string()),
-    );
-    sub_map.insert(
-        Value::String("interval".to_string()),
-        Value::Number(SUBSCRIPTION_INTERVAL_SECS.into()),
-    );
-    sub_map.insert(
-        Value::String("health-check".to_string()),
-        Value::Mapping(health),
-    );
-
-    providers_map.insert(
-        Value::String(SUBSCRIPTION_PROVIDER_NAME.to_string()),
-        Value::Mapping(sub_map),
-    );
 
     // 2. Wire `use: [subscription]` into proxy groups
-    wire_subscription_into_groups(root_map);
+    wire_subscription_into_groups(&root_map);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    let out_yaml = serde_yaml_ng::to_string(&root)
-        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    let out_yaml = format!("{bom}{doc}");
     std::fs::write(path, out_yaml)
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
 
     Ok(())
 }
 
-fn wire_subscription_into_groups(root_map: &mut Mapping) {
-    let groups_key = Value::String("proxy-groups".to_string());
-    if !root_map.get(&groups_key).is_some_and(Value::is_sequence) {
-        root_map.insert(groups_key.clone(), Value::Sequence(Vec::new()));
-    }
-    let Some(groups) = root_map
-        .get_mut(&groups_key)
-        .and_then(Value::as_sequence_mut)
-    else {
+fn wire_subscription_into_groups(root_map: &Mapping) {
+    let Some(groups) = root_map.get_sequence("proxy-groups") else {
+        let fallback_groups = SequenceBuilder::new()
+            .mapping(|g| {
+                g.pair("name", "Proxy")
+                    .pair("type", "select")
+                    .sequence("use", |u| u.item(SUBSCRIPTION_PROVIDER_NAME))
+            })
+            .build_document();
+        root_map.set("proxy-groups", &fallback_groups);
         return;
     };
 
     let mut wired_any = false;
-    for group_val in groups.iter_mut() {
-        let Some(group_map) = group_val.as_mapping_mut() else {
+    for group_val in groups.values() {
+        let Some(group_map) = group_val.as_mapping() else {
             continue;
         };
-        let name = group_map
-            .get(Value::String("name".to_string()))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let kind = group_map
-            .get(Value::String("type".to_string()))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let name = scalar_str(group_map, "name").unwrap_or_default();
+        let kind = scalar_str(group_map, "type").unwrap_or_default();
 
         let is_standard_group = matches!(
-            name,
+            name.as_str(),
             "Proxy" | "🚀Proxy" | "Auto" | "⚡Auto" | "Fallback" | "🚑Fallback"
         );
-        let strip_direct = matches!(name, "Auto" | "⚡Auto" | "Fallback" | "🚑Fallback")
-            && matches!(kind, "url-test" | "fallback");
-        let already_uses_providers = group_map
-            .get(Value::String("use".to_string()))
-            .is_some_and(Value::is_sequence);
+        let strip_direct = matches!(name.as_str(), "Auto" | "⚡Auto" | "Fallback" | "🚑Fallback")
+            && matches!(kind.as_str(), "url-test" | "fallback");
+        let already_uses_providers = group_map.get_sequence("use").is_some();
 
         if is_standard_group || already_uses_providers {
             ensure_use_contains(group_map, SUBSCRIPTION_PROVIDER_NAME);
@@ -245,12 +217,9 @@ fn wire_subscription_into_groups(root_map: &mut Mapping) {
     if !wired_any {
         // Fallback for custom configs: wire into first `select` group if present, else add `Proxy`.
         let mut attached_to_select = false;
-        for group_val in groups.iter_mut() {
-            if let Some(group_map) = group_val.as_mapping_mut()
-                && group_map
-                    .get(Value::String("type".to_string()))
-                    .and_then(Value::as_str)
-                    == Some("select")
+        for group_val in groups.values() {
+            if let Some(group_map) = group_val.as_mapping()
+                && scalar_str(group_map, "type").as_deref() == Some("select")
             {
                 ensure_use_contains(group_map, SUBSCRIPTION_PROVIDER_NAME);
                 attached_to_select = true;
@@ -258,51 +227,55 @@ fn wire_subscription_into_groups(root_map: &mut Mapping) {
             }
         }
         if !attached_to_select {
-            let mut proxy_group = Mapping::new();
-            proxy_group.insert(
-                Value::String("name".to_string()),
-                Value::String("Proxy".to_string()),
-            );
-            proxy_group.insert(
-                Value::String("type".to_string()),
-                Value::String("select".to_string()),
-            );
-            proxy_group.insert(
-                Value::String("use".to_string()),
-                Value::Sequence(vec![Value::String(SUBSCRIPTION_PROVIDER_NAME.to_string())]),
-            );
-            groups.insert(0, Value::Mapping(proxy_group));
+            let proxy_group = MappingBuilder::new()
+                .pair("name", "Proxy")
+                .pair("type", "select")
+                .sequence("use", |u| u.item(SUBSCRIPTION_PROVIDER_NAME))
+                .build_document();
+            groups.insert(0, &proxy_group);
         }
     }
 }
 
-fn ensure_use_contains(group_map: &mut Mapping, provider_name: &str) {
-    let use_key = Value::String("use".to_string());
-    if !group_map.get(&use_key).is_some_and(Value::is_sequence) {
-        group_map.insert(use_key.clone(), Value::Sequence(Vec::new()));
-    }
-    if let Some(seq) = group_map.get_mut(&use_key).and_then(Value::as_sequence_mut) {
-        let already = seq.iter().any(|v| v.as_str() == Some(provider_name));
+fn scalar_str(map: &Mapping, key: &str) -> Option<String> {
+    map.get(key)?.as_scalar().map(|s| s.as_string())
+}
+
+fn ensure_use_contains(group_map: &Mapping, provider_name: &str) {
+    if let Some(seq) = group_map.get_sequence("use") {
+        let already = seq.values().any(|v| {
+            v.as_scalar()
+                .is_some_and(|s| s.as_string() == provider_name)
+        });
         if !already {
-            seq.push(Value::String(provider_name.to_string()));
+            seq.push(provider_name);
         }
+    } else {
+        let seq_doc = SequenceBuilder::new().item(provider_name).build_document();
+        group_map.set("use", &seq_doc);
     }
 }
 
-fn remove_single_direct_placeholder(group_map: &mut Mapping) {
-    let proxies_key = Value::String("proxies".to_string());
+fn remove_single_direct_placeholder(group_map: &Mapping) {
     let should_remove = group_map
-        .get(&proxies_key)
-        .and_then(Value::as_sequence)
-        .is_some_and(|seq| seq.len() == 1 && seq[0].as_str() == Some("DIRECT"));
+        .get_sequence("proxies")
+        .is_some_and(|seq: Sequence| {
+            seq.len() == 1
+                && seq
+                    .get(0)
+                    .and_then(|v| v.as_scalar().map(|s| s.as_string()))
+                    .as_deref()
+                    == Some("DIRECT")
+        });
     if should_remove {
-        group_map.remove(&proxies_key);
+        group_map.remove("proxies");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml_ng::Value;
 
     #[test]
     fn extracts_controller_secret_and_ui() {
@@ -404,5 +377,44 @@ external-ui: ./ui
     fn try_parse_str_rejects_invalid_yaml_and_accepts_empty() {
         assert_eq!(try_parse_str("   \n").unwrap(), MihomoConfigInfo::default());
         assert!(try_parse_str("external-controller: [unclosed").is_err());
+    }
+
+    #[test]
+    fn preserves_comments_and_formatting_on_subscription_update() {
+        let dir = crate::config::test_temp_dir("yaml_comments");
+        let cfg = dir.join("config.yaml");
+        let initial = "\
+# Custom header comment
+mixed-port: 7890 # keep inline comment
+external-controller: 127.0.0.1:9090
+
+# Group section comment
+proxy-groups:
+  - name: MySelect
+    type: select
+    proxies:
+      - DIRECT
+";
+        std::fs::write(&cfg, initial).unwrap();
+
+        apply_subscription_url(&cfg, "https://example.com/sub?a=1&b=2").unwrap();
+        apply_subscription_url(&cfg, "https://example.com/sub2").unwrap();
+
+        let updated = std::fs::read_to_string(&cfg).unwrap();
+        assert!(updated.contains("# Custom header comment"));
+        assert!(updated.contains("# keep inline comment"));
+        assert!(updated.contains("# Group section comment"));
+        assert_eq!(
+            read_subscription_url(&cfg).as_deref(),
+            Some("https://example.com/sub2")
+        );
+        assert!(apply_subscription_url(&cfg, "https://").is_err());
+
+        let parsed: Value = serde_yaml_ng::from_str(&updated).unwrap();
+        let use_list = parsed["proxy-groups"][0]["use"].as_sequence().unwrap();
+        assert_eq!(use_list.len(), 1);
+        assert_eq!(use_list[0].as_str(), Some("subscription"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

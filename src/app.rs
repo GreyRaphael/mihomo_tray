@@ -16,7 +16,7 @@ use crate::config::mihomo;
 use crate::config::tray::TraySettings;
 use crate::core::worker::{self, WorkerHandle};
 use crate::platform;
-use crate::state::{AppEvent, SharedSnapshot, Snapshot, WorkerCommand};
+use crate::state::{AppEvent, SharedSnapshot, WorkerCommand};
 use crate::tray::icon::{self, IconKey};
 use crate::tray::menu::{self, MenuAction, MenuFingerprint};
 
@@ -357,18 +357,41 @@ impl MihomoTrayApp {
         let Some(tray) = self.tray_icon.as_ref() else {
             return;
         };
-        let snap: Snapshot = self.shared.lock().unwrap().clone();
+        // Never call `set_menu` while TrackPopupMenu is displaying the live HMENU,
+        // otherwise Windows destroys the active popup menu mid-hover.
+        let menu_open = rebuild_menu && platform::is_tray_menu_open();
 
-        let tooltip = snap.tooltip();
+        let (tooltip, icon_key, menu_rebuild) = {
+            let snap = self.shared.lock().unwrap();
+            let tooltip = snap.tooltip();
+            let icon_key = IconKey {
+                state: snap.operational_state(),
+                mode: snap.proxy_mode(),
+            };
+            let menu_rebuild = if rebuild_menu {
+                let now_unix = menu::current_unix_secs();
+                let fp = MenuFingerprint::from_snapshot(&snap, now_unix);
+                if self.last_menu_fingerprint.as_ref() != Some(&fp) {
+                    if menu_open {
+                        self.pending_menu_rebuild = true;
+                        None
+                    } else {
+                        Some((now_unix, fp, snap.clone()))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (tooltip, icon_key, menu_rebuild)
+        };
+
         if tooltip != self.last_tooltip {
             let _ = tray.set_tooltip(Some(&tooltip));
             self.last_tooltip = tooltip;
         }
 
-        let icon_key = IconKey {
-            state: snap.operational_state(),
-            mode: snap.proxy_mode(),
-        };
         if self.last_icon != Some(icon_key)
             && let Ok(icon) = icon::render_icon(icon_key)
             && tray.set_icon(Some(icon)).is_ok()
@@ -376,24 +399,14 @@ impl MihomoTrayApp {
             self.last_icon = Some(icon_key);
         }
 
-        if rebuild_menu {
-            let now_unix = menu::current_unix_secs();
-            let fp = MenuFingerprint::from_snapshot(&snap, now_unix);
-            if self.last_menu_fingerprint.as_ref() != Some(&fp) {
-                // Never call `set_menu` while TrackPopupMenu is displaying the live HMENU,
-                // otherwise Windows destroys the active popup menu mid-hover.
-                if platform::is_tray_menu_open() {
-                    self.pending_menu_rebuild = true;
-                } else {
-                    let next_gen = self.menu_generation.wrapping_add(1).max(1);
-                    let built = menu::build(&snap, next_gen, now_unix);
-                    self.actions = built.actions;
-                    self.menu_generation = next_gen;
-                    tray.set_menu(Some(Box::new(built.menu)));
-                    self.last_menu_fingerprint = Some(fp);
-                    self.pending_menu_rebuild = false;
-                }
-            }
+        if let Some((now_unix, fp, snap)) = menu_rebuild {
+            let next_gen = self.menu_generation.wrapping_add(1).max(1);
+            let built = menu::build(&snap, next_gen, now_unix);
+            self.actions = built.actions;
+            self.menu_generation = next_gen;
+            tray.set_menu(Some(Box::new(built.menu)));
+            self.last_menu_fingerprint = Some(fp);
+            self.pending_menu_rebuild = false;
         }
     }
 

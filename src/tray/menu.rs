@@ -1,6 +1,5 @@
 //! Cross-platform native tray menu builder built on `tray_icon::menu` (`muda 0.21`).
 
-use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -44,7 +43,7 @@ pub struct MenuFingerprint {
     tun: bool,
     autostart: bool,
     groups: Vec<Group>,
-    node_latency: BTreeMap<String, Option<u32>>,
+    visible_latencies: Vec<Option<u32>>,
     update_subscription_label: String,
     has_resolved_config: bool,
     page_size: usize,
@@ -52,6 +51,15 @@ pub struct MenuFingerprint {
 
 impl MenuFingerprint {
     pub fn from_snapshot(snap: &Snapshot, now_unix: i64) -> Self {
+        let visible_latencies = if snap.controller_ok {
+            snap.groups
+                .iter()
+                .flat_map(|g| g.members.iter())
+                .map(|m| snap.latency_for(m))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             status_line: snap.status_line(),
             error: snap.error().map(ToString::to_string),
@@ -63,7 +71,7 @@ impl MenuFingerprint {
             tun: snap.tun,
             autostart: snap.autostart,
             groups: snap.groups.clone(),
-            node_latency: snap.node_latency.clone(),
+            visible_latencies,
             update_subscription_label: text::format_update_subscription_label(
                 snap.subscription_updated_at(),
                 now_unix,
@@ -679,22 +687,40 @@ mod tests {
     }
 
     #[test]
-    fn menu_fingerprint_is_stable_across_latency_insertion_order() {
+    fn menu_fingerprint_tracks_visible_node_latencies_only() {
+        let group = Group {
+            name: "Proxy".to_string(),
+            kind: "Selector".to_string(),
+            switchable: true,
+            now: "Node-A".to_string(),
+            fixed: String::new(),
+            members: vec!["Node-A".to_string(), "Node-B".to_string()],
+        };
         let mut s1 = Snapshot {
             controller_ok: true,
+            groups: vec![group.clone()],
             ..Default::default()
         };
         s1.node_latency.insert("Node-B".to_string(), Some(120));
         s1.node_latency.insert("Node-A".to_string(), Some(45));
+        s1.node_latency.insert("Hidden-Node".to_string(), Some(30));
 
         let mut s2 = Snapshot {
             controller_ok: true,
+            groups: vec![group],
             ..Default::default()
         };
         s2.node_latency.insert("Node-A".to_string(), Some(45));
         s2.node_latency.insert("Node-B".to_string(), Some(120));
+        s2.node_latency.insert("Hidden-Node".to_string(), Some(999));
 
         assert_eq!(
+            MenuFingerprint::from_snapshot(&s1, 1_700_000_000),
+            MenuFingerprint::from_snapshot(&s2, 1_700_000_000)
+        );
+
+        s2.node_latency.insert("Node-A".to_string(), Some(25));
+        assert_ne!(
             MenuFingerprint::from_snapshot(&s1, 1_700_000_000),
             MenuFingerprint::from_snapshot(&s2, 1_700_000_000)
         );

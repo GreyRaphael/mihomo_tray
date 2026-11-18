@@ -945,42 +945,6 @@ impl Worker {
         }
     }
 
-    fn publish_phase2_proxies(&self, client: &Client) {
-        let proxies_res = client.get_proxies();
-        let providers_res = client.get_providers();
-
-        let mut snap = self.shared.lock().unwrap();
-        if let Ok(proxies) = proxies_res {
-            snap.groups = state::order_and_filter_groups(
-                proxies.groups,
-                &self.settings.groups.include,
-                &self.settings.groups.exclude,
-                &self.settings.groups.order,
-            );
-            let mut latencies = proxies.latency;
-            if let Ok(prov) = providers_res {
-                snap.providers = prov.providers;
-                for (name, delay) in prov.latency {
-                    latencies
-                        .entry(name)
-                        .and_modify(|existing| {
-                            if existing.is_none() {
-                                *existing = delay;
-                            }
-                        })
-                        .or_insert(delay);
-                }
-            }
-            snap.node_latency = latencies;
-        } else if let Ok(prov) = providers_res {
-            snap.providers = prov.providers;
-        }
-        drop(snap);
-        let _ = self
-            .proxy
-            .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
-    }
-
     fn refresh(&mut self) {
         let kernel_running = self.resolve_live_controller();
         let client_opt = self.client.clone();
@@ -996,7 +960,12 @@ impl Worker {
             self.sync_live_persisted_state(sysproxy, &mode, tun);
         }
 
-        // Phase 1 snapshot: immediate state + controls update.
+        let (proxies_res, providers_res) = if controller_ok && let Some(client) = &client_opt {
+            (Some(client.get_proxies()), Some(client.get_providers()))
+        } else {
+            (None, None)
+        };
+
         {
             let mut snap = self.shared.lock().unwrap();
             snap.controller_ok = controller_ok;
@@ -1015,20 +984,53 @@ impl Worker {
             snap.web_ui_url = web_ui_url;
             snap.resolved_config = Some(self.config_file.clone());
             snap.page_size = self.settings.groups.page_size;
+
             if !controller_ok {
                 snap.groups.clear();
                 snap.providers.clear();
                 snap.node_latency.clear();
+            } else {
+                match (proxies_res, providers_res) {
+                    (Some(Ok(proxies)), Some(Ok(prov))) => {
+                        snap.groups = state::order_and_filter_groups(
+                            proxies.groups,
+                            &self.settings.groups.include,
+                            &self.settings.groups.exclude,
+                            &self.settings.groups.order,
+                        );
+                        snap.providers = prov.providers;
+                        let mut latencies = proxies.latency;
+                        for (name, delay) in prov.latency {
+                            latencies
+                                .entry(name)
+                                .and_modify(|existing| {
+                                    if existing.is_none() {
+                                        *existing = delay;
+                                    }
+                                })
+                                .or_insert(delay);
+                        }
+                        snap.node_latency = latencies;
+                    }
+                    (Some(Ok(proxies)), _) => {
+                        snap.groups = state::order_and_filter_groups(
+                            proxies.groups,
+                            &self.settings.groups.include,
+                            &self.settings.groups.exclude,
+                            &self.settings.groups.order,
+                        );
+                        snap.node_latency = proxies.latency;
+                    }
+                    (_, Some(Ok(prov))) => {
+                        snap.providers = prov.providers;
+                    }
+                    _ => {}
+                }
             }
         }
         let _ = self
             .proxy
             .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
-
-        // Phase 2 snapshot: fetch proxy groups & providers.
-        if controller_ok && let Some(client) = &client_opt {
-            self.publish_phase2_proxies(client);
-        }
     }
 
     fn set_status_note(&self, note: Option<&str>) {

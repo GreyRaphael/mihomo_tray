@@ -177,11 +177,6 @@ pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
     imp::prompt_subscription_url(current)
 }
 
-/// Focuses an already-open subscription prompt window if one exists.
-pub fn focus_subscription_prompt() {
-    imp::focus_subscription_prompt();
-}
-
 /// Requests an open subscription prompt window to close cleanly (used during app shutdown).
 pub fn close_subscription_prompt() {
     imp::close_subscription_prompt();

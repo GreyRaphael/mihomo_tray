@@ -179,8 +179,13 @@ pub enum WorkerCommand {
     TestGroupLatency(String),
     RefreshSubscriptions,
     SetSubscriptionUrl(String),
+    CopyEnvVars,
     RestartCore,
     ToggleAutostart,
+    AsyncDone {
+        error: Option<String>,
+        clear_note: bool,
+    },
     Quit { interactive: bool },
 }
 

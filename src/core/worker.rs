@@ -52,11 +52,10 @@ pub fn spawn(
     proxy: EventLoopProxy<AppEvent>,
     startup_error: Option<String>,
 ) -> WorkerHandle {
-    let (tx, rx) = mpsc::channel::<WorkerCommand>();
     let stop_requested = Arc::new(AtomicBool::new(false));
     // Initialize Worker (and initial Snapshot fields) synchronously before returning
     // so the GUI thread's first menu build observes resolved paths and startup errors.
-    let mut worker = Worker::new(
+    let (mut worker, rx) = Worker::new(
         portable_root,
         settings_path,
         initial_settings,
@@ -65,6 +64,7 @@ pub fn spawn(
         startup_error,
         Arc::clone(&stop_requested),
     );
+    let tx = worker.tx.clone();
 
     let join = std::thread::Builder::new()
         .name("mihomo-worker".to_string())
@@ -93,6 +93,9 @@ struct Worker {
     shared: SharedSnapshot,
     proxy: EventLoopProxy<AppEvent>,
     stop_requested: Arc<AtomicBool>,
+    tx: Sender<WorkerCommand>,
+    testing_latency: Arc<AtomicBool>,
+    refreshing_subs: Arc<AtomicBool>,
     process_inspector: ProcessInspector,
     managed: Option<ManagedChild>,
     known_kernel_path: Option<PathBuf>,
@@ -117,7 +120,8 @@ impl Worker {
         proxy: EventLoopProxy<AppEvent>,
         startup_error: Option<String>,
         stop_requested: Arc<AtomicBool>,
-    ) -> Self {
+    ) -> (Self, mpsc::Receiver<WorkerCommand>) {
+        let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let (home_dir, config_file) =
             discover::resolve_home_and_config(&portable_root, &settings, None);
         let last_settings_mtime = file_mtime(&settings_path);
@@ -128,7 +132,7 @@ impl Worker {
             snap.resolved_config = Some(config_file.clone());
             snap.config_error = startup_error.clone();
         }
-        Self {
+        let worker = Self {
             portable_root,
             settings_path,
             settings,
@@ -141,6 +145,9 @@ impl Worker {
             shared,
             proxy,
             stop_requested,
+            tx,
+            testing_latency: Arc::new(AtomicBool::new(false)),
+            refreshing_subs: Arc::new(AtomicBool::new(false)),
             process_inspector: ProcessInspector::new(),
             managed: None,
             known_kernel_path: None,
@@ -154,7 +161,8 @@ impl Worker {
             persisted_state: PersistedState::default(),
             has_persisted_state: false,
             pending_restore: None,
-        }
+        };
+        (worker, rx)
     }
 
     fn run(&mut self, rx: mpsc::Receiver<WorkerCommand>) {
@@ -354,17 +362,25 @@ impl Worker {
                 self.with_client(|c| c.select_proxy(&group, &member))
             }
             WorkerCommand::UnfixGroup(group) => self.with_client(|c| c.unfix_group(&group)),
-            WorkerCommand::TestGroupLatency(group) => {
-                self.with_client(|c| c.test_group_delay(&group))
-            }
-            WorkerCommand::RefreshSubscriptions => self.refresh_subscriptions(),
+            WorkerCommand::TestGroupLatency(group) => self.start_test_group_latency(group),
+            WorkerCommand::RefreshSubscriptions => self.start_refresh_subscriptions(),
             WorkerCommand::SetSubscriptionUrl(url) => self.set_subscription_url(&url),
+            WorkerCommand::CopyEnvVars => self.copy_env_vars(),
             WorkerCommand::RestartCore => self.force_restart_core(),
             WorkerCommand::ToggleAutostart => {
                 let enabled = platform::autostart_is_enabled();
                 let res = platform::autostart_set(!enabled);
                 self.refresh_autostart_cache();
                 res
+            }
+            WorkerCommand::AsyncDone { error, clear_note } => {
+                if clear_note {
+                    self.set_status_note(None);
+                }
+                match error {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
             }
             WorkerCommand::Quit { .. } => Ok(()),
         }
@@ -705,29 +721,101 @@ impl Worker {
         Err(timeout_msg.to_string())
     }
 
-    fn refresh_subscriptions(&mut self) -> Result<(), String> {
+    fn copy_env_vars(&self) -> Result<(), String> {
+        let snap_port = self.shared.lock().unwrap().mixed_port;
+        let port = if snap_port > 0 {
+            snap_port
+        } else {
+            mihomo::read_file(&self.config_file)
+                .map(|info| info.mixed_port)
+                .unwrap_or(0)
+        };
+        if port == 0 {
+            return Err(text::ERR_NO_MIXED_PORT_FOR_ENV.to_string());
+        }
+        let cmd = platform::format_env_vars_command(port);
+        platform::copy_to_clipboard(&cmd)?;
+        tracing::info!("Copied proxy environment variables for port {port}");
+        Ok(())
+    }
+
+    fn start_test_group_latency(&self, group: String) -> Result<(), String> {
         let client = self
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
+        if self
+            .testing_latency
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let flag = Arc::clone(&self.testing_latency);
+        let tx = self.tx.clone();
+        if std::thread::Builder::new()
+            .name("mihomo-latency".to_string())
+            .spawn(move || {
+                let error = client.test_group_delay(&group).err();
+                flag.store(false, Ordering::Release);
+                let _ = tx.send(WorkerCommand::AsyncDone {
+                    error,
+                    clear_note: false,
+                });
+            })
+            .is_err()
+        {
+            self.testing_latency.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn start_refresh_subscriptions(&self) -> Result<(), String> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
+        if self
+            .refreshing_subs
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
         self.set_status_note(Some(text::STATUS_REFRESHING_SUBSCRIPTION));
-        let res = (|| {
-            let providers = client.get_providers()?.providers;
-            let refreshable: Vec<String> = providers
-                .into_iter()
-                .filter(Provider::refreshable)
-                .map(|p| p.name)
-                .collect();
-            if refreshable.is_empty() {
-                return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
-            }
-            for name in refreshable {
-                client.refresh_provider(&name)?;
-            }
-            Ok(())
-        })();
-        self.set_status_note(None);
-        res
+        let flag = Arc::clone(&self.refreshing_subs);
+        let tx = self.tx.clone();
+        if std::thread::Builder::new()
+            .name("mihomo-sub-refresh".to_string())
+            .spawn(move || {
+                let error = (|| -> Result<(), String> {
+                    let providers = client.get_providers()?.providers;
+                    let refreshable: Vec<String> = providers
+                        .into_iter()
+                        .filter(Provider::refreshable)
+                        .map(|p| p.name)
+                        .collect();
+                    if refreshable.is_empty() {
+                        return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
+                    }
+                    for name in refreshable {
+                        client.refresh_provider(&name)?;
+                    }
+                    Ok(())
+                })()
+                .err();
+                flag.store(false, Ordering::Release);
+                let _ = tx.send(WorkerCommand::AsyncDone {
+                    error,
+                    clear_note: true,
+                });
+            })
+            .is_err()
+        {
+            self.refreshing_subs.store(false, Ordering::Release);
+            self.set_status_note(None);
+        }
+        Ok(())
     }
 
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {

@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -39,7 +38,6 @@ pub struct MihomoTrayApp {
     last_menu_fingerprint: Option<MenuFingerprint>,
     pending_menu_rebuild: bool,
     last_click: Instant,
-    prompt_thread: Option<JoinHandle<()>>,
     version_dialog_open: Arc<AtomicBool>,
     quitting: bool,
     restart_on_exit: bool,
@@ -72,7 +70,6 @@ impl MihomoTrayApp {
             last_menu_fingerprint: None,
             pending_menu_rebuild: false,
             last_click: Instant::now() - CLICK_DEBOUNCE,
-            prompt_thread: None,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
             restart_on_exit: false,
@@ -215,7 +212,7 @@ impl MihomoTrayApp {
             MenuAction::RefreshSubscription => {
                 self.send_worker(WorkerCommand::RefreshSubscriptions);
             }
-            MenuAction::CopyEnvVars => self.copy_env_vars(),
+            MenuAction::CopyEnvVars => self.send_worker(WorkerCommand::CopyEnvVars),
             MenuAction::RestartCore => self.send_worker(WorkerCommand::RestartCore),
             MenuAction::RestartApp => {
                 if !self.quitting {
@@ -232,46 +229,6 @@ impl MihomoTrayApp {
                     self.restart_on_exit = false;
                     self.send_worker(WorkerCommand::Quit { interactive: true });
                 }
-            }
-        }
-    }
-
-    fn copy_env_vars(&self) {
-        let (snap_port, cfg_path) = {
-            let snap = self.shared.lock().unwrap();
-            (snap.mixed_port, snap.resolved_config.clone())
-        };
-        let port = if snap_port > 0 {
-            snap_port
-        } else if let Some(cfg_path) = cfg_path {
-            mihomo::read_file(&cfg_path)
-                .map(|info| info.mixed_port)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        if port == 0 {
-            let mut snap = self.shared.lock().unwrap();
-            snap.action_error = Some(crate::text::ERR_NO_MIXED_PORT_FOR_ENV.to_string());
-            drop(snap);
-            let _ = self
-                .proxy
-                .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
-            return;
-        }
-
-        let cmd = platform::format_env_vars_command(port);
-        match platform::copy_to_clipboard(&cmd) {
-            Ok(()) => {
-                tracing::info!("Copied proxy environment variables for port {port}");
-            }
-            Err(err) => {
-                let mut snap = self.shared.lock().unwrap();
-                snap.action_error = Some(err);
-                drop(snap);
-                let _ = self
-                    .proxy
-                    .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
             }
         }
     }
@@ -310,16 +267,7 @@ impl MihomoTrayApp {
         }
     }
 
-    fn prompt_and_set_subscription(&mut self) {
-        if let Some(handle) = self.prompt_thread.take() {
-            if !handle.is_finished() {
-                self.prompt_thread = Some(handle);
-                platform::focus_subscription_prompt();
-                return;
-            }
-            let _ = handle.join();
-        }
-
+    fn prompt_and_set_subscription(&self) {
         let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;
         };
@@ -331,17 +279,14 @@ impl MihomoTrayApp {
             .clone()
             .unwrap_or_else(|| self.portable_root.join("config").join("config.yaml"));
 
-        if let Ok(handle) = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("sub-prompt".to_string())
             .spawn(move || {
                 let current = mihomo::read_subscription_url(&cfg_path);
                 if let Some(url) = platform::prompt_subscription_url(current.as_deref()) {
                     let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
                 }
-            })
-        {
-            self.prompt_thread = Some(handle);
-        }
+            });
     }
 
     fn apply_snapshot(&mut self, rebuild_menu: bool) {
@@ -411,22 +356,25 @@ impl MihomoTrayApp {
         self.apply_snapshot(true);
     }
 
-    fn open_web_ui(&self) {
+    fn open_web_ui(&mut self) {
         let url = self.shared.lock().unwrap().web_ui_url.clone();
         if let Some(url) = url {
             self.open_target(&url);
         }
     }
 
-    fn open_target(&self, target: &str) {
+    fn open_target(&mut self, target: &str) {
         if let Err(err) = open::that_detached(target) {
-            let mut snap = self.shared.lock().unwrap();
-            snap.action_error = Some(crate::text::format_open_target_failed(target, &err));
-            drop(snap);
-            let _ = self
-                .proxy
-                .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+            self.set_action_error(crate::text::format_open_target_failed(target, &err));
         }
+    }
+
+    fn set_action_error(&mut self, err: String) {
+        {
+            let mut snap = self.shared.lock().unwrap();
+            snap.action_error = Some(err);
+        }
+        self.apply_snapshot(true);
     }
 
     fn send_worker(&self, cmd: WorkerCommand) {
@@ -437,11 +385,6 @@ impl MihomoTrayApp {
 
     fn shutdown_on_exit(&mut self) {
         platform::close_subscription_prompt();
-        if let Some(handle) = self.prompt_thread.take()
-            && handle.is_finished()
-        {
-            let _ = handle.join();
-        }
         if let Some(mut worker) = self.worker.take() {
             if !self.quitting {
                 self.quitting = true;
@@ -486,11 +429,7 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::QuitCancelled(err) => {
                 self.quitting = false;
                 self.restart_on_exit = false;
-                {
-                    let mut snap = self.shared.lock().unwrap();
-                    snap.action_error = Some(err);
-                }
-                self.apply_snapshot(true);
+                self.set_action_error(err);
             }
         }
     }

@@ -31,9 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 
-pub use super::windows_prompt::{
-    close_subscription_prompt, focus_subscription_prompt, prompt_subscription_url,
-};
+pub use super::windows_prompt::{close_subscription_prompt, prompt_subscription_url};
 
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const SCOOP_SHIM_MAX_BYTES: u64 = 64 * 1024;

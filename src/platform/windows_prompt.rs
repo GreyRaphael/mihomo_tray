@@ -62,7 +62,7 @@ impl Drop for OwnedFont {
     }
 }
 
-pub fn focus_subscription_prompt() {
+fn focus_subscription_prompt() {
     let existing = PROMPT_HWND.load(Ordering::Acquire);
     if existing != 0 {
         unsafe { SetForegroundWindow(existing as HWND) };

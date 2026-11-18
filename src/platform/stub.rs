@@ -78,6 +78,4 @@ pub fn prompt_subscription_url(_current: Option<&str>) -> Option<String> {
     None
 }
 
-pub fn focus_subscription_prompt() {}
-
 pub fn close_subscription_prompt() {}

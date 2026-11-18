@@ -171,9 +171,9 @@ pub type SharedSnapshot = Arc<Mutex<Snapshot>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncTaskKind {
-    LatencyTest { generation: u64 },
-    RefreshSubscriptions { generation: u64 },
-    ApplySubscription { generation: u64, reload_ok: bool },
+    LatencyTest { id: u64 },
+    RefreshSubscriptions { id: u64 },
+    ApplySubscription { id: u64, reload_ok: bool },
 }
 
 #[derive(Debug, Clone)]

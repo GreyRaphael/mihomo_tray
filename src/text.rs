@@ -64,6 +64,8 @@ pub const ERR_MULTIPLE_EXTERNAL_CORES: &str =
     "Multiple external mihomo processes are running; stop them before restarting.";
 pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
     "No subscription provider configured. Use Set Subscription URL first.";
+pub const ERR_SUBSCRIPTION_TASK_BUSY: &str =
+    "A subscription update is already in progress; try again shortly.";
 pub const ERR_INVALID_SUBSCRIPTION_URL: &str =
     "Subscription URL must start with http:// or https://";
 pub const ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN: &str =

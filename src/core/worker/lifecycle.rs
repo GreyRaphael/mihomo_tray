@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn force_restart_declining_external_stop_preserves_deferred_restore_and_tasks() {
+    fn force_restart_declining_external_stop_preserves_restore_and_tasks() {
         let root = crate::config::test_temp_dir("worker_restart_preserve");
         let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
         let saved = crate::config::state_store::PersistedState {
@@ -675,12 +675,12 @@ mod tests {
             mode: Some("global".to_string()),
             tun: Some(false),
         };
-        worker.state_sync.defer_restore(7, saved);
-        worker.sub_tasks.invalidate();
-        worker.latency_tasks.begin();
+        worker.state_sync.wait_sub_reload(saved.clone());
+        worker.sub_task.begin();
+        worker.latency_task.begin();
 
-        // Declining external stop in force_restart_with_running must preserve deferred restore,
-        // active latency task, and current config paths.
+        // Declining external stop in force_restart_with_running must preserve pending restore,
+        // active tasks, and current config paths.
         worker
             .force_restart_with_running(vec![RunningProcess {
                 pid: 999_991,
@@ -688,8 +688,9 @@ mod tests {
                 cmd: Vec::new(),
             }])
             .unwrap();
-        assert!(worker.state_sync.has_deferred_restore());
-        assert!(worker.latency_tasks.is_active());
+        assert_eq!(worker.capture_live_or_persisted_state(), saved);
+        assert!(worker.latency_task.is_active());
+        assert!(worker.sub_task.is_active());
         assert_eq!(worker.cfg.home_dir, root.join("config"));
 
         let _ = std::fs::remove_dir_all(&root);

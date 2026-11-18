@@ -2,7 +2,6 @@
 
 mod lifecycle;
 mod state_sync;
-mod tasks;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,7 +15,6 @@ use winit::event_loop::EventLoopProxy;
 
 use self::lifecycle::KernelRuntime;
 use self::state_sync::StateSync;
-use self::tasks::{SubscriptionTaskState, TaskSlot};
 use crate::config::mihomo;
 use crate::config::state_store::PersistedState;
 use crate::config::tray::{self, GroupsSettings, TraySettings};
@@ -24,7 +22,9 @@ use crate::core::api::{Client, CoreConfigs, ProvidersData, ProxiesData};
 use crate::core::discover;
 use crate::core::process::RunningProcess;
 use crate::platform;
-use crate::state::{self, AppEvent, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand};
+use crate::state::{
+    self, AppEvent, AsyncTaskKind, Provider, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand,
+};
 use crate::text;
 
 const AUTOSTART_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -159,6 +159,37 @@ impl std::fmt::Display for ActionError {
     }
 }
 
+#[derive(Default)]
+pub(super) struct TaskGuard {
+    active: Option<u64>,
+    next_id: u64,
+}
+
+impl TaskGuard {
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn begin(&mut self) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1);
+        self.active = Some(self.next_id);
+        self.next_id
+    }
+
+    pub fn invalidate(&mut self) {
+        self.next_id = self.next_id.wrapping_add(1);
+        self.active = None;
+    }
+
+    pub fn finish(&mut self, id: u64) -> bool {
+        if self.active != Some(id) {
+            return false;
+        }
+        self.active = None;
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandOutcome {
     ClearError,
@@ -271,8 +302,8 @@ struct Worker {
     proxy: UiNotifier,
     stop_requested: Arc<AtomicBool>,
     tx: Sender<WorkerCommand>,
-    latency_tasks: TaskSlot,
-    sub_tasks: SubscriptionTaskState,
+    latency_task: TaskGuard,
+    sub_task: TaskGuard,
     client: Option<Client>,
     last_controller_error: Option<String>,
     action_error: Option<ActionError>,
@@ -306,8 +337,8 @@ impl Worker {
             proxy,
             stop_requested,
             tx,
-            latency_tasks: TaskSlot::default(),
-            sub_tasks: SubscriptionTaskState::default(),
+            latency_task: TaskGuard::default(),
+            sub_task: TaskGuard::default(),
             client: None,
             last_controller_error: None,
             action_error: None,
@@ -407,8 +438,216 @@ impl Worker {
     }
 
     pub(super) fn invalidate_async_tasks(&mut self) {
-        self.sub_tasks.invalidate();
-        self.latency_tasks.invalidate();
+        self.sub_task.invalidate();
+        self.latency_task.invalidate();
+    }
+
+    fn spawn_background_task<F>(
+        &self,
+        name: &str,
+        fallback_kind: AsyncTaskKind,
+        status_note: Option<&'static str>,
+        task: F,
+    ) -> bool
+    where
+        F: FnOnce() -> (AsyncTaskKind, Option<String>) + Send + 'static,
+    {
+        if let Some(note) = status_note {
+            self.set_status_note(Some(note));
+        }
+        let tx = self.tx.clone();
+        if std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                struct PanicGuard {
+                    tx: Sender<WorkerCommand>,
+                    kind: AsyncTaskKind,
+                    sent: bool,
+                }
+                impl Drop for PanicGuard {
+                    fn drop(&mut self) {
+                        if !self.sent {
+                            let _ = self.tx.send(WorkerCommand::AsyncDone {
+                                kind: self.kind,
+                                error: Some("background task panicked".to_string()),
+                            });
+                        }
+                    }
+                }
+                let mut guard = PanicGuard {
+                    tx: tx.clone(),
+                    kind: fallback_kind,
+                    sent: false,
+                };
+                let (kind, error) = task();
+                guard.sent = true;
+                let _ = tx.send(WorkerCommand::AsyncDone { kind, error });
+            })
+            .is_err()
+        {
+            if status_note.is_some() {
+                self.set_status_note(None);
+            }
+            return false;
+        }
+        true
+    }
+
+    fn start_test_group_latency(&mut self, group: String) -> Result<CommandOutcome, ActionError> {
+        let client = self.require_client()?.clone();
+        if self.latency_task.is_active() {
+            return Ok(CommandOutcome::KeepError);
+        }
+        let id = self.latency_task.begin();
+        if self.spawn_background_task(
+            "mihomo-latency",
+            AsyncTaskKind::LatencyTest { id },
+            None,
+            move || {
+                (
+                    AsyncTaskKind::LatencyTest { id },
+                    client.test_group_delay(&group).err(),
+                )
+            },
+        ) {
+            Ok(CommandOutcome::ClearError)
+        } else {
+            self.latency_task.finish(id);
+            Ok(CommandOutcome::KeepError)
+        }
+    }
+
+    fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, ActionError> {
+        let client = self.require_client()?.clone();
+        if self.sub_task.is_active() {
+            return Ok(CommandOutcome::KeepError);
+        }
+        let id = self.sub_task.begin();
+        if self.spawn_background_task(
+            "mihomo-sub-refresh",
+            AsyncTaskKind::RefreshSubscriptions { id },
+            Some(text::STATUS_REFRESHING_SUBSCRIPTION),
+            move || {
+                let err = (|| -> Result<(), String> {
+                    let providers = client.get_providers()?.providers;
+                    let refreshable: Vec<String> = providers
+                        .into_iter()
+                        .filter(Provider::refreshable)
+                        .map(|p| p.name)
+                        .collect();
+                    if refreshable.is_empty() {
+                        return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
+                    }
+                    for name in refreshable {
+                        client.refresh_provider(&name)?;
+                    }
+                    Ok(())
+                })()
+                .err();
+                (AsyncTaskKind::RefreshSubscriptions { id }, err)
+            },
+        ) {
+            Ok(CommandOutcome::ClearError)
+        } else {
+            self.sub_task.finish(id);
+            Ok(CommandOutcome::KeepError)
+        }
+    }
+
+    fn set_subscription_url(&mut self, url: &str) -> Result<(), ActionError> {
+        if self.sub_task.is_active() {
+            return Err(ActionError::general(text::ERR_SUBSCRIPTION_TASK_BUSY));
+        }
+        let saved = self.capture_live_or_persisted_state();
+        mihomo::apply_subscription_url(&self.cfg.config_file, url)?;
+        if let Some(client) = self.client.clone().filter(|c| c.probe().is_ok()) {
+            let id = self.sub_task.begin();
+            self.state_sync.wait_sub_reload(saved);
+            let sub_cache = self
+                .cfg
+                .home_dir
+                .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
+            if !self.spawn_background_task(
+                "mihomo-sub-apply",
+                AsyncTaskKind::ApplySubscription {
+                    id,
+                    reload_ok: false,
+                },
+                Some(text::STATUS_UPDATING_SUBSCRIPTION),
+                move || {
+                    let had_cached_sub = sub_cache.is_file();
+                    if let Err(err) = client.reload_configs() {
+                        return (
+                            AsyncTaskKind::ApplySubscription {
+                                id,
+                                reload_ok: false,
+                            },
+                            Some(err),
+                        );
+                    }
+                    let err = if had_cached_sub || !sub_cache.is_file() {
+                        client
+                            .refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)
+                            .err()
+                    } else {
+                        None
+                    };
+                    (
+                        AsyncTaskKind::ApplySubscription {
+                            id,
+                            reload_ok: true,
+                        },
+                        err,
+                    )
+                },
+            ) {
+                self.sub_task.finish(id);
+                self.state_sync.finish_sub_reload(false);
+            }
+            return Ok(());
+        }
+        self.sub_task.invalidate();
+        self.set_status_note(None);
+        self.state_sync.arm_ready_restore(saved);
+        self.start_core_internal()
+    }
+
+    fn handle_async_done(
+        &mut self,
+        kind: AsyncTaskKind,
+        error: Option<String>,
+    ) -> Result<CommandOutcome, ActionError> {
+        match kind {
+            AsyncTaskKind::LatencyTest { id } => {
+                if !self.latency_task.finish(id) {
+                    if let Some(err) = error {
+                        tracing::debug!("Ignoring stale latency task error: {err}");
+                    }
+                    return Ok(CommandOutcome::KeepError);
+                }
+                match error {
+                    Some(err) => Err(ActionError::general(err)),
+                    None => Ok(CommandOutcome::KeepError),
+                }
+            }
+            AsyncTaskKind::RefreshSubscriptions { id }
+            | AsyncTaskKind::ApplySubscription { id, .. } => {
+                if !self.sub_task.finish(id) {
+                    if let Some(err) = error {
+                        tracing::debug!("Ignoring stale subscription task error: {err}");
+                    }
+                    return Ok(CommandOutcome::KeepError);
+                }
+                self.set_status_note(None);
+                if let AsyncTaskKind::ApplySubscription { reload_ok, .. } = kind {
+                    self.state_sync.finish_sub_reload(reload_ok);
+                }
+                match error {
+                    Some(err) => Err(ActionError::general(err)),
+                    None => Ok(CommandOutcome::KeepError),
+                }
+            }
+        }
     }
 
     fn handle_command(&mut self, cmd: WorkerCommand) -> Result<CommandOutcome, ActionError> {
@@ -979,21 +1218,202 @@ mod tests {
         let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
 
         worker.set_action_error(Some(ActionError::general("subscription refresh failed")));
-        let gen0 = worker.latency_tasks.begin();
+        let id = worker.latency_task.begin();
 
         let outcome = worker
             .handle_command(WorkerCommand::AsyncDone {
-                kind: AsyncTaskKind::LatencyTest { generation: gen0 },
+                kind: AsyncTaskKind::LatencyTest { id },
                 error: None,
             })
             .unwrap();
         assert_eq!(outcome, CommandOutcome::KeepError);
-        assert!(!worker.latency_tasks.is_active());
+        assert!(!worker.latency_task.is_active());
         assert_eq!(
             shared.lock().unwrap().action_error.as_deref(),
             Some("subscription refresh failed")
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalidated_and_concurrent_async_tasks_behave_safely() {
+        let root = crate::config::test_temp_dir("worker_async_guard");
+        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+
+        let old_latency = worker.latency_task.begin();
+        worker.latency_task.invalidate();
+        assert!(!worker.latency_task.is_active());
+        let new_latency = worker.latency_task.begin();
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::AsyncDone {
+                    kind: AsyncTaskKind::LatencyTest { id: old_latency },
+                    error: Some("stale latency timeout".to_string()),
+                })
+                .unwrap(),
+            CommandOutcome::KeepError
+        );
+        assert!(worker.latency_task.is_active());
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::AsyncDone {
+                    kind: AsyncTaskKind::LatencyTest { id: new_latency },
+                    error: Some("real latency error".to_string()),
+                })
+                .unwrap_err()
+                .message,
+            "real latency error"
+        );
+        assert!(!worker.latency_task.is_active());
+
+        // Active subscription task blocks concurrent SetSubscriptionUrl and ignores stale errors.
+        let old_sub = worker.sub_task.begin();
+        worker.sub_task.invalidate();
+        let active_sub = worker.sub_task.begin();
+        worker.set_status_note(Some(text::STATUS_REFRESHING_SUBSCRIPTION));
+        let busy_err = worker
+            .handle_command(WorkerCommand::SetSubscriptionUrl(
+                "https://example.com/sub".to_string(),
+            ))
+            .unwrap_err();
+        assert_eq!(busy_err.message, text::ERR_SUBSCRIPTION_TASK_BUSY);
+        assert_eq!(
+            worker
+                .handle_command(WorkerCommand::AsyncDone {
+                    kind: AsyncTaskKind::RefreshSubscriptions { id: old_sub },
+                    error: Some("stale sub err".to_string()),
+                })
+                .unwrap(),
+            CommandOutcome::KeepError
+        );
+        assert!(worker.sub_task.is_active());
+        worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::RefreshSubscriptions { id: active_sub },
+                error: None,
+            })
+            .unwrap();
+        assert!(!worker.sub_task.is_active());
+        assert_eq!(shared.lock().unwrap().status_note, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subscription_async_reload_preserves_pending_restore_until_async_done() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let root = crate::config::test_temp_dir("worker_sub_restore");
+        let cfg_dir = root.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            cfg_dir.join("config.yaml"),
+            format!("mixed-port: 7890\nmode: rule\nexternal-controller: 127.0.0.1:{port}\n"),
+        )
+        .unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut mode = "rule".to_string();
+            let mut tun_on = false;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                let (status, body) = if req.starts_with("GET /version ") {
+                    ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
+                } else if req.starts_with("GET /configs ") {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"mode":"{mode}","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                        ),
+                    )
+                } else if req.starts_with("PUT /configs?force=true ") {
+                    mode = "rule".to_string();
+                    tun_on = false;
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PUT /providers/proxies/subscription ") {
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PATCH /configs ") {
+                    let (_, payload) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    if let Some(m) = json.get("mode").and_then(|v| v.as_str()) {
+                        mode = m.to_string();
+                    }
+                    if let Some(t) = json
+                        .get("tun")
+                        .and_then(|v| v.get("enable"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        tun_on = t;
+                    }
+                    ("204 No Content", String::new())
+                } else if req.starts_with("POST /__stop ") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    break;
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                if req.starts_with("PATCH /configs ") && mode == "direct" && !tun_on {
+                    let _ = done_tx.send(());
+                }
+            }
+        });
+
+        let (mut worker, rx, _shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        worker.live.controller_ok = true;
+        worker.live.mode = "global".to_string();
+        worker.live.tun = false;
+
+        worker
+            .handle_command(WorkerCommand::SetSubscriptionUrl(
+                "https://example.com/sub".to_string(),
+            ))
+            .unwrap();
+        // Live poll before AsyncDone must not revert saved mode; user SetMode during reload wins.
+        let mut mid_cfg = CoreConfigs {
+            mode: "rule".to_string(),
+            mixed_port: 7890,
+            tun_enable: false,
+        };
+        worker.apply_pending_restore_if_needed(&mut mid_cfg);
+        worker
+            .state_sync
+            .sync_live_if_idle(&worker.cfg.home_dir, false, "rule", false);
+        worker
+            .handle_command(WorkerCommand::SetMode(ProxyMode::Direct))
+            .unwrap();
+        assert_eq!(
+            worker.capture_live_or_persisted_state().mode.as_deref(),
+            Some("direct")
+        );
+
+        let async_cmd = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(async_cmd).unwrap();
+        let polled = worker.poll_controller_configs();
+        assert!(polled.controller_ok);
+        assert_eq!(polled.mode, "direct");
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .unwrap()
+            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1041,7 +1461,7 @@ mod tests {
             mode: Some("global".to_string()),
             tun: Some(true),
         };
-        worker.state_sync.arm_ready_restore(saved);
+        worker.state_sync.arm_ready_restore(saved.clone());
         worker.stop_requested.store(true, Ordering::Release);
 
         let mut cfg = CoreConfigs {
@@ -1051,14 +1471,10 @@ mod tests {
         };
         worker.apply_pending_restore_if_needed(&mut cfg);
 
-        assert!(worker.state_sync.has_ready_restore());
-        assert_eq!(
-            worker.state_sync.persisted().and_then(|s| s.tun),
-            Some(true)
-        );
         worker.live.controller_ok = true;
         worker.live.tun = false;
-        assert_eq!(worker.capture_live_or_persisted_state().tun, Some(true));
+        assert_eq!(worker.capture_live_or_persisted_state(), saved);
+        assert_eq!(worker.state_sync.take_ready_restore(), Some(saved));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1259,7 +1675,6 @@ mod tests {
         settings.mihomo.auto_start = false;
         let (mut worker, _rx, _shared) = test_worker(&root, settings, None);
         worker.state_sync.load_initial(&cfg_dir);
-        assert!(worker.state_sync.has_ready_restore());
 
         // Existing external process whose controller isn't reachable yet must clear pending restore.
         let running = [RunningProcess {
@@ -1268,7 +1683,7 @@ mod tests {
             cmd: Vec::new(),
         }];
         worker.startup_with_running(&running);
-        assert!(!worker.state_sync.has_ready_restore());
+        assert_eq!(worker.state_sync.take_ready_restore(), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

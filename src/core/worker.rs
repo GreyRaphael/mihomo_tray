@@ -16,7 +16,7 @@ use crate::core::api::{Client, CoreConfigs};
 use crate::core::discover;
 use crate::core::process::{self, ManagedChild, ProcessInspector, RunningProcess, RuntimeRecord};
 use crate::platform;
-use crate::state::{self, AppEvent, Provider, SharedSnapshot, WorkerCommand};
+use crate::state::{self, AppEvent, AsyncTaskKind, Provider, SharedSnapshot, WorkerCommand};
 use crate::text;
 
 const KERNEL_STARTUP_BUDGET: Duration = Duration::from_secs(6);
@@ -44,6 +44,27 @@ impl WorkerHandle {
     }
 }
 
+#[derive(Clone)]
+enum UiNotifier {
+    Loop(EventLoopProxy<AppEvent>),
+    #[cfg(test)]
+    Channel(Sender<AppEvent>),
+}
+
+impl UiNotifier {
+    fn send(&self, event: AppEvent) {
+        match self {
+            Self::Loop(proxy) => {
+                let _ = proxy.send_event(event);
+            }
+            #[cfg(test)]
+            Self::Channel(tx) => {
+                let _ = tx.send(event);
+            }
+        }
+    }
+}
+
 pub fn spawn(
     portable_root: PathBuf,
     settings_path: PathBuf,
@@ -60,7 +81,7 @@ pub fn spawn(
         settings_path,
         initial_settings,
         shared,
-        proxy,
+        UiNotifier::Loop(proxy),
         startup_error,
         Arc::clone(&stop_requested),
     );
@@ -90,12 +111,12 @@ struct Worker {
     kernel_path_error: Option<String>,
     last_controller_ok: bool,
     shared: SharedSnapshot,
-    proxy: EventLoopProxy<AppEvent>,
+    proxy: UiNotifier,
     stop_requested: Arc<AtomicBool>,
     tx: Sender<WorkerCommand>,
-    testing_latency: Arc<AtomicBool>,
-    refreshing_subs: Arc<AtomicBool>,
-    updating_sub: Arc<AtomicBool>,
+    testing_latency: bool,
+    sub_task_active: bool,
+    pending_sub_reload: bool,
     process_inspector: ProcessInspector,
     managed: Option<ManagedChild>,
     known_kernel_path: Option<PathBuf>,
@@ -108,6 +129,12 @@ struct Worker {
     config_file: PathBuf,
     persisted_state: Option<PersistedState>,
     pending_restore: Option<PersistedState>,
+    pending_reload_restore: Option<PersistedState>,
+}
+
+struct SettingsReload {
+    changed: bool,
+    controller_changed: bool,
 }
 
 impl Worker {
@@ -116,7 +143,7 @@ impl Worker {
         settings_path: PathBuf,
         settings: TraySettings,
         shared: SharedSnapshot,
-        proxy: EventLoopProxy<AppEvent>,
+        proxy: UiNotifier,
         startup_error: Option<String>,
         stop_requested: Arc<AtomicBool>,
     ) -> (Self, mpsc::Receiver<WorkerCommand>) {
@@ -144,9 +171,9 @@ impl Worker {
             proxy,
             stop_requested,
             tx,
-            testing_latency: Arc::new(AtomicBool::new(false)),
-            refreshing_subs: Arc::new(AtomicBool::new(false)),
-            updating_sub: Arc::new(AtomicBool::new(false)),
+            testing_latency: false,
+            sub_task_active: false,
+            pending_sub_reload: false,
             process_inspector: ProcessInspector::new(),
             managed: None,
             known_kernel_path: None,
@@ -159,6 +186,7 @@ impl Worker {
             config_file,
             persisted_state: None,
             pending_restore: None,
+            pending_reload_restore: None,
         };
         (worker, rx)
     }
@@ -176,20 +204,41 @@ impl Worker {
                     self.refresh();
                 }
                 Ok(cmd) => {
-                    let mut burst_error = self.handle_command(cmd).err();
+                    let mut clear_error = false;
+                    let mut burst_error = None;
+                    let mut handle_or_quit =
+                        |worker: &mut Self, c: WorkerCommand| -> Option<bool> {
+                            if let WorkerCommand::Quit { interactive } = c {
+                                return Some(worker.handle_quit(interactive));
+                            }
+                            match worker.handle_command(c) {
+                                Ok(clears) => clear_error |= clears,
+                                Err(err) => burst_error = Some(err),
+                            }
+                            None
+                        };
+
+                    if let Some(should_exit) = handle_or_quit(self, cmd) {
+                        if should_exit {
+                            break;
+                        }
+                        self.refresh();
+                        continue;
+                    }
                     // Coalesce burst commands before doing a single refresh poll.
                     while let Ok(extra) = rx.try_recv() {
-                        if let WorkerCommand::Quit { interactive } = extra {
-                            if self.handle_quit(interactive) {
+                        if let Some(should_exit) = handle_or_quit(self, extra) {
+                            if should_exit {
                                 return;
                             }
                             break;
                         }
-                        if let Err(err) = self.handle_command(extra) {
-                            burst_error = Some(err);
-                        }
                     }
-                    self.set_action_error(burst_error);
+                    if let Some(err) = burst_error {
+                        self.set_action_error(Some(err));
+                    } else if clear_error {
+                        self.set_action_error(None);
+                    }
                     self.refresh();
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -227,7 +276,9 @@ impl Worker {
                 self.set_action_error(Some(err));
             }
         }
-        self.refresh();
+        if !self.stop_requested.load(Ordering::Acquire) {
+            self.refresh();
+        }
     }
 
     fn load_initial_persisted_state(&mut self) {
@@ -243,20 +294,30 @@ impl Worker {
         state_store::save(&self.home_dir, state);
     }
 
-    fn load_settings_from_disk(&mut self) -> bool {
+    fn load_settings_from_disk(&mut self) -> SettingsReload {
         self.last_settings_mtime = file_mtime(&self.settings_path);
+        let prev_settings = self.settings.clone();
         let prev_controller = self.settings.controller.clone();
+        let had_error = self.settings_error.is_some();
         match tray::load(&self.settings_path) {
             Ok(reloaded) => {
+                let changed = had_error || reloaded != prev_settings;
+                let controller_changed = had_error || reloaded.controller != prev_controller;
                 self.settings = reloaded;
                 self.settings_error = None;
                 self.sync_config_error();
-                self.settings.controller != prev_controller
+                SettingsReload {
+                    changed,
+                    controller_changed,
+                }
             }
             Err(err) => {
                 self.settings_error = Some(err);
                 self.sync_config_error();
-                false
+                SettingsReload {
+                    changed: false,
+                    controller_changed: false,
+                }
             }
         }
     }
@@ -283,9 +344,12 @@ impl Worker {
         self.sync_config_error();
     }
 
-    fn reload_settings_if_changed(&mut self) -> bool {
+    fn reload_settings_if_changed(&mut self) -> SettingsReload {
         if file_mtime(&self.settings_path) == self.last_settings_mtime {
-            return false;
+            return SettingsReload {
+                changed: false,
+                controller_changed: false,
+            };
         }
         self.load_settings_from_disk()
     }
@@ -342,36 +406,95 @@ impl Worker {
         }
     }
 
-    fn handle_command(&mut self, cmd: WorkerCommand) -> Result<(), String> {
+    fn handle_command(&mut self, cmd: WorkerCommand) -> Result<bool, String> {
         match cmd {
-            WorkerCommand::SetMode(mode) => self.set_mode(&mode),
-            WorkerCommand::ToggleSystemProxy => self.toggle_system_proxy(),
-            WorkerCommand::ToggleTun => self.toggle_tun(),
-            WorkerCommand::SelectProxy { group, member } => {
-                self.with_client(|c| c.select_proxy(&group, &member))
+            WorkerCommand::SetMode(mode) => self.set_mode(&mode).map(|()| true),
+            WorkerCommand::ToggleSystemProxy => self.toggle_system_proxy().map(|()| true),
+            WorkerCommand::ToggleTun => self.toggle_tun().map(|()| true),
+            WorkerCommand::SelectProxy { group, member } => self
+                .with_client(|c| c.select_proxy(&group, &member))
+                .map(|()| true),
+            WorkerCommand::UnfixGroup(group) => {
+                self.with_client(|c| c.unfix_group(&group)).map(|()| true)
             }
-            WorkerCommand::UnfixGroup(group) => self.with_client(|c| c.unfix_group(&group)),
             WorkerCommand::TestGroupLatency(group) => self.start_test_group_latency(group),
             WorkerCommand::RefreshSubscriptions => self.start_refresh_subscriptions(),
-            WorkerCommand::SetSubscriptionUrl(url) => self.set_subscription_url(&url),
-            WorkerCommand::CopyEnvVars => self.copy_env_vars(),
-            WorkerCommand::RestartCore => self.force_restart_core(),
+            WorkerCommand::SetSubscriptionUrl(url) => {
+                self.set_subscription_url(&url).map(|()| true)
+            }
+            WorkerCommand::CopyEnvVars => self.copy_env_vars().map(|()| true),
+            WorkerCommand::RestartCore => self.force_restart_core().map(|()| true),
             WorkerCommand::ToggleAutostart => {
                 let enabled = platform::autostart_is_enabled();
                 let res = platform::autostart_set(!enabled);
                 self.refresh_autostart_cache();
-                res
+                res.map(|()| true)
             }
-            WorkerCommand::AsyncDone { error, clear_note } => {
-                if clear_note {
+            WorkerCommand::AsyncDone { kind, error } => self.handle_async_done(kind, error),
+            WorkerCommand::Quit { .. } => Ok(false),
+        }
+    }
+
+    fn handle_async_done(
+        &mut self,
+        kind: AsyncTaskKind,
+        error: Option<String>,
+    ) -> Result<bool, String> {
+        match kind {
+            AsyncTaskKind::LatencyTest => {
+                self.testing_latency = false;
+                match error {
+                    Some(err) => Err(err),
+                    None => Ok(false),
+                }
+            }
+            AsyncTaskKind::RefreshSubscriptions => {
+                self.sub_task_active = false;
+                if self.pending_sub_reload {
+                    self.pending_sub_reload = false;
+                    if let Some(err) = error {
+                        tracing::warn!("Superseded subscription refresh failed: {err}");
+                    }
+                    if let Some(client) = self.client.clone()
+                        && client.probe().is_ok()
+                    {
+                        self.spawn_apply_subscription_reload(client);
+                        return Ok(false);
+                    }
                     self.set_status_note(None);
+                    if let Some(restore) = self.pending_reload_restore.take() {
+                        self.pending_restore = Some(restore);
+                    }
+                    return Ok(false);
+                }
+                self.set_status_note(None);
+                match error {
+                    Some(err) => Err(err),
+                    None => Ok(false),
+                }
+            }
+            AsyncTaskKind::ApplySubscription { reload_ok } => {
+                self.sub_task_active = false;
+                if self.pending_sub_reload {
+                    self.pending_sub_reload = false;
+                    if let Some(client) = self.client.clone() {
+                        if let Some(err) = error {
+                            tracing::warn!("Superseded subscription apply failed: {err}");
+                        }
+                        self.spawn_apply_subscription_reload(client);
+                        return Ok(false);
+                    }
+                }
+                self.set_status_note(None);
+                let restore = self.pending_reload_restore.take();
+                if reload_ok && restore.is_some() {
+                    self.pending_restore = restore;
                 }
                 match error {
                     Some(err) => Err(err),
-                    None => Ok(()),
+                    None => Ok(false),
                 }
             }
-            WorkerCommand::Quit { .. } => Ok(()),
         }
     }
 
@@ -736,85 +859,147 @@ impl Worker {
     fn spawn_background_task<F>(
         &self,
         name: &str,
-        flag: &Arc<AtomicBool>,
+        fallback_kind: AsyncTaskKind,
         status_note: Option<&'static str>,
         task: F,
-    ) where
-        F: FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> bool
+    where
+        F: FnOnce() -> (AsyncTaskKind, Option<String>) + Send + 'static,
     {
-        if flag
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
         if let Some(note) = status_note {
             self.set_status_note(Some(note));
         }
-        let flag_clone = Arc::clone(flag);
         let tx = self.tx.clone();
-        let clear_note = status_note.is_some();
         if std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
-                struct ResetFlag(Arc<AtomicBool>);
-                impl Drop for ResetFlag {
+                struct PanicGuard {
+                    tx: Sender<WorkerCommand>,
+                    kind: AsyncTaskKind,
+                    sent: bool,
+                }
+                impl Drop for PanicGuard {
                     fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
+                        if !self.sent {
+                            let _ = self.tx.send(WorkerCommand::AsyncDone {
+                                kind: self.kind,
+                                error: Some("background task panicked".to_string()),
+                            });
+                        }
                     }
                 }
-                let error = {
-                    let _reset = ResetFlag(flag_clone);
-                    task().err()
+                let mut guard = PanicGuard {
+                    tx: tx.clone(),
+                    kind: fallback_kind,
+                    sent: false,
                 };
-                let _ = tx.send(WorkerCommand::AsyncDone { error, clear_note });
+                let (kind, error) = task();
+                guard.sent = true;
+                let _ = tx.send(WorkerCommand::AsyncDone { kind, error });
             })
             .is_err()
         {
-            flag.store(false, Ordering::Release);
-            if clear_note {
+            if status_note.is_some() {
                 self.set_status_note(None);
             }
+            return false;
         }
+        true
     }
 
-    fn start_test_group_latency(&self, group: String) -> Result<(), String> {
+    fn start_test_group_latency(&mut self, group: String) -> Result<bool, String> {
         let client = self
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        self.spawn_background_task("mihomo-latency", &self.testing_latency, None, move || {
-            client.test_group_delay(&group)
-        });
-        Ok(())
+        if self.testing_latency {
+            return Ok(false);
+        }
+        if self.spawn_background_task(
+            "mihomo-latency",
+            AsyncTaskKind::LatencyTest,
+            None,
+            move || {
+                (
+                    AsyncTaskKind::LatencyTest,
+                    client.test_group_delay(&group).err(),
+                )
+            },
+        ) {
+            self.testing_latency = true;
+        }
+        Ok(true)
     }
 
-    fn start_refresh_subscriptions(&self) -> Result<(), String> {
+    fn start_refresh_subscriptions(&mut self) -> Result<bool, String> {
         let client = self
             .client
             .clone()
             .ok_or_else(|| text::ERR_NO_CONTROLLER.to_string())?;
-        self.spawn_background_task(
+        if self.sub_task_active {
+            return Ok(false);
+        }
+        if self.spawn_background_task(
             "mihomo-sub-refresh",
-            &self.refreshing_subs,
+            AsyncTaskKind::RefreshSubscriptions,
             Some(text::STATUS_REFRESHING_SUBSCRIPTION),
             move || {
-                let providers = client.get_providers()?.providers;
-                let refreshable: Vec<String> = providers
-                    .into_iter()
-                    .filter(Provider::refreshable)
-                    .map(|p| p.name)
-                    .collect();
-                if refreshable.is_empty() {
-                    return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
-                }
-                for name in refreshable {
-                    client.refresh_provider(&name)?;
-                }
-                Ok(())
+                let err = (|| -> Result<(), String> {
+                    let providers = client.get_providers()?.providers;
+                    let refreshable: Vec<String> = providers
+                        .into_iter()
+                        .filter(Provider::refreshable)
+                        .map(|p| p.name)
+                        .collect();
+                    if refreshable.is_empty() {
+                        return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
+                    }
+                    for name in refreshable {
+                        client.refresh_provider(&name)?;
+                    }
+                    Ok(())
+                })()
+                .err();
+                (AsyncTaskKind::RefreshSubscriptions, err)
             },
-        );
-        Ok(())
+        ) {
+            self.sub_task_active = true;
+        }
+        Ok(true)
+    }
+
+    fn spawn_apply_subscription_reload(&mut self, client: Client) {
+        let sub_cache = self
+            .home_dir
+            .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
+        if self.spawn_background_task(
+            "mihomo-sub-apply",
+            AsyncTaskKind::ApplySubscription { reload_ok: false },
+            Some(text::STATUS_UPDATING_SUBSCRIPTION),
+            move || {
+                let had_cached_sub = sub_cache.is_file();
+                if let Err(err) = client.reload_configs() {
+                    return (
+                        AsyncTaskKind::ApplySubscription { reload_ok: false },
+                        Some(err),
+                    );
+                }
+                // When no cache existed before, `reload_configs` already fetched the new provider;
+                // only force a provider refresh if replacing an existing cache or if reload didn't create it.
+                let err = if had_cached_sub || !sub_cache.is_file() {
+                    client
+                        .refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)
+                        .err()
+                } else {
+                    None
+                };
+                (AsyncTaskKind::ApplySubscription { reload_ok: true }, err)
+            },
+        ) {
+            self.sub_task_active = true;
+        } else if let Some(restore) = self.pending_reload_restore.take() {
+            self.pending_restore = Some(restore);
+        }
     }
 
     fn set_subscription_url(&mut self, url: &str) -> Result<(), String> {
@@ -823,25 +1008,13 @@ impl Worker {
         if let Some(client) = self.client.clone()
             && client.probe().is_ok()
         {
-            self.pending_restore = Some(saved);
-            let sub_cache = self
-                .home_dir
-                .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
-            self.spawn_background_task(
-                "mihomo-sub-apply",
-                &self.updating_sub,
-                Some(text::STATUS_UPDATING_SUBSCRIPTION),
-                move || {
-                    let had_cached_sub = sub_cache.is_file();
-                    client.reload_configs()?;
-                    // When no cache existed before, `reload_configs` already fetched the new provider;
-                    // only force a provider refresh if replacing an existing cache or if reload didn't create it.
-                    if had_cached_sub || !sub_cache.is_file() {
-                        client.refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)?;
-                    }
-                    Ok(())
-                },
-            );
+            self.pending_reload_restore = Some(saved);
+            if self.sub_task_active {
+                self.pending_sub_reload = true;
+                self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
+            } else {
+                self.spawn_apply_subscription_reload(client);
+            }
             return Ok(());
         }
         self.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
@@ -852,7 +1025,11 @@ impl Worker {
     }
 
     fn capture_live_or_persisted_state(&self) -> PersistedState {
-        if let Some(pending) = &self.pending_restore {
+        if let Some(pending) = self
+            .pending_restore
+            .as_ref()
+            .or(self.pending_reload_restore.as_ref())
+        {
             return pending.clone();
         }
         let snap = self.shared.lock().unwrap();
@@ -917,12 +1094,12 @@ impl Worker {
         self.update_persisted_state(|s| *s = final_state);
         match self.stop_core_internal(interactive) {
             Ok(()) => {
-                let _ = self.proxy.send_event(AppEvent::QuitCompleted);
+                self.proxy.send(AppEvent::QuitCompleted);
                 true
             }
             Err(err) => {
                 self.stop_requested.store(false, Ordering::Release);
-                let _ = self.proxy.send_event(AppEvent::QuitCancelled(err));
+                self.proxy.send(AppEvent::QuitCancelled(err));
                 false
             }
         }
@@ -949,9 +1126,9 @@ impl Worker {
     }
 
     fn resolve_live_controller(&mut self) -> bool {
-        let settings_changed = self.reload_settings_if_changed();
+        let reload = self.reload_settings_if_changed();
         let tracked_alive = self.active_pid().is_some();
-        let mut running = if !tracked_alive || self.client.is_none() || settings_changed {
+        let mut running = if !tracked_alive || self.client.is_none() || reload.changed {
             self.process_inspector
                 .list_running_mihomo(self.known_kernel_path.as_deref())
         } else {
@@ -959,7 +1136,7 @@ impl Worker {
         };
         let kernel_running = tracked_alive || !running.is_empty();
 
-        if settings_changed && !kernel_running {
+        if reload.changed && !kernel_running {
             self.refresh_paths();
         }
 
@@ -969,7 +1146,8 @@ impl Worker {
             self.last_config_mtime = config_mtime;
         }
 
-        let need_resolve = settings_changed
+        let need_resolve = reload.controller_changed
+            || (reload.changed && !kernel_running)
             || config_changed
             || (kernel_running && (self.client.is_none() || !self.last_controller_ok));
         if need_resolve {
@@ -1013,7 +1191,7 @@ impl Worker {
     }
 
     fn sync_live_persisted_state(&mut self, sysproxy: bool, mode: &str, tun: bool) {
-        if self.pending_restore.is_some() {
+        if self.pending_restore.is_some() || self.pending_reload_restore.is_some() {
             return;
         }
         let live = PersistedState {
@@ -1062,7 +1240,11 @@ impl Worker {
             snap.autostart = autostart;
             snap.kernel_running = kernel_running;
             if client_opt.is_some() {
-                snap.controller_error = controller_error;
+                snap.controller_error = if !controller_ok && !kernel_running {
+                    None
+                } else {
+                    controller_error
+                };
             } else if snap.controller_error.is_none() {
                 snap.controller_error = Some(text::ERR_NO_CONTROLLER.to_string());
             }
@@ -1113,9 +1295,8 @@ impl Worker {
                 }
             }
         }
-        let _ = self
-            .proxy
-            .send_event(AppEvent::SnapshotUpdated { rebuild_menu: true });
+        self.proxy
+            .send(AppEvent::SnapshotUpdated { rebuild_menu: true });
     }
 
     fn set_status_note(&self, note: Option<&str>) {
@@ -1123,7 +1304,7 @@ impl Worker {
             let mut snap = self.shared.lock().unwrap();
             snap.status_note = note.map(ToString::to_string);
         }
-        let _ = self.proxy.send_event(AppEvent::SnapshotUpdated {
+        self.proxy.send(AppEvent::SnapshotUpdated {
             rebuild_menu: false,
         });
     }
@@ -1280,5 +1461,255 @@ mod tests {
         let err = verify_or_enable_tun_after_elevation(&client).unwrap_err();
         assert_eq!(err, text::ERR_TUN_FAILED_AFTER_ELEVATION);
         handle.join().unwrap();
+    }
+
+    fn test_worker(
+        root: &std::path::Path,
+        settings: TraySettings,
+        startup_error: Option<String>,
+    ) -> (Worker, mpsc::Receiver<WorkerCommand>, SharedSnapshot) {
+        let settings_path = tray::settings_path(root);
+        let shared = Arc::new(std::sync::Mutex::new(crate::state::Snapshot::default()));
+        let (ui_tx, _ui_rx) = mpsc::channel();
+        let (worker, rx) = Worker::new(
+            root.to_path_buf(),
+            settings_path,
+            settings,
+            Arc::clone(&shared),
+            UiNotifier::Channel(ui_tx),
+            startup_error,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (worker, rx, shared)
+    }
+
+    #[test]
+    fn settings_reload_tracks_non_controller_changes_and_refreshes_paths() {
+        let root = crate::config::test_temp_dir("worker_reload_paths");
+        let core_dir = root.join("custom");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let exe = core_dir.join("my-core");
+        std::fs::write(&exe, b"bin").unwrap();
+
+        let settings_path = tray::settings_path(&root);
+        std::fs::write(&settings_path, "mihomo:\n  path: ./custom/missing\n").unwrap();
+        let initial = tray::load(&settings_path).unwrap();
+        let (mut worker, _rx, shared) = test_worker(&root, initial, None);
+
+        worker.refresh_paths();
+        assert!(shared.lock().unwrap().config_error.is_some());
+
+        std::fs::write(
+            &settings_path,
+            "mihomo:\n  path: ./custom/my-core\n  config: ./alt/config.yaml\n",
+        )
+        .unwrap();
+        // Force mtime check to observe edit deterministically across fast filesystems.
+        worker.last_settings_mtime = None;
+        worker.resolve_live_controller();
+
+        assert_eq!(worker.known_kernel_path.as_deref(), Some(exe.as_path()));
+        assert_eq!(worker.config_file, root.join("alt").join("config.yaml"));
+        assert_eq!(shared.lock().unwrap().config_error, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stopped_core_suppresses_http_controller_error_and_surfaces_startup_errors() {
+        let root = crate::config::test_temp_dir("worker_error_mask");
+        let cfg_dir = root.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // Unbound loopback port -> GET /configs would fail with connection refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::fs::write(
+            cfg_dir.join("config.yaml"),
+            format!("external-controller: 127.0.0.1:{dead_port}\n"),
+        )
+        .unwrap();
+
+        let mut settings = TraySettings::default();
+        settings.mihomo.auto_start = false;
+        let (mut worker, _rx, shared) = test_worker(&root, settings, None);
+        worker.set_action_error(Some(text::ERR_CORE_NOT_FOUND.to_string()));
+        worker.startup();
+
+        let snap = shared.lock().unwrap();
+        assert!(!snap.controller_ok);
+        assert_eq!(snap.controller_error, None);
+        assert_eq!(snap.error(), Some(text::ERR_CORE_NOT_FOUND));
+        drop(snap);
+
+        // Even with no action_error, intentionally stopped core has no spurious HTTP error.
+        worker.set_action_error(None);
+        worker.refresh();
+        assert_eq!(shared.lock().unwrap().error(), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_done_success_does_not_clobber_existing_action_error() {
+        let root = crate::config::test_temp_dir("worker_async_err");
+        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+
+        worker.set_action_error(Some("subscription refresh failed".to_string()));
+        worker.testing_latency = true;
+
+        // Simulate `Worker::run` processing a clean `LatencyTest` completion while an error is active.
+        let clears = worker
+            .handle_command(WorkerCommand::AsyncDone {
+                kind: AsyncTaskKind::LatencyTest,
+                error: None,
+            })
+            .unwrap();
+        assert!(!clears);
+        assert!(!worker.testing_latency);
+        assert_eq!(
+            shared.lock().unwrap().action_error.as_deref(),
+            Some("subscription refresh failed")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subscription_async_reload_preserves_pending_restore_until_async_done() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let root = crate::config::test_temp_dir("worker_sub_restore");
+        let cfg_dir = root.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            cfg_dir.join("config.yaml"),
+            format!("mixed-port: 7890\nmode: rule\nexternal-controller: 127.0.0.1:{port}\n"),
+        )
+        .unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut mode = "rule".to_string();
+            let mut tun_on = false;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                let (status, body) = if req.starts_with("GET /version ") {
+                    ("200 OK", r#"{"version":"v1.19.0"}"#.to_string())
+                } else if req.starts_with("GET /configs ") {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"mode":"{mode}","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                        ),
+                    )
+                } else if req.starts_with("PUT /configs?force=true ") {
+                    // Reloading config.yaml resets live mode/tun before restore runs.
+                    mode = "rule".to_string();
+                    tun_on = false;
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PUT /providers/proxies/subscription ") {
+                    ("204 No Content", String::new())
+                } else if req.starts_with("PATCH /configs ") {
+                    let (_, payload) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    if let Some(m) = json.get("mode").and_then(|v| v.as_str()) {
+                        mode = m.to_string();
+                    }
+                    if let Some(t) = json
+                        .get("tun")
+                        .and_then(|v| v.get("enable"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        tun_on = t;
+                    }
+                    ("204 No Content", String::new())
+                } else if req.starts_with("GET /proxies ") {
+                    ("200 OK", r#"{"proxies":{}}"#.to_string())
+                } else if req.starts_with("GET /providers/proxies ") {
+                    ("200 OK", r#"{"providers":{}}"#.to_string())
+                } else if req.starts_with("POST /__stop ") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    break;
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                if req.starts_with("PATCH /configs ") && mode == "global" && !tun_on {
+                    let _ = done_tx.send(());
+                }
+            }
+        });
+
+        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker.client = Some(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        {
+            let mut snap = shared.lock().unwrap();
+            snap.controller_ok = true;
+            snap.mode = "global".to_string();
+            snap.tun = false;
+        }
+        worker.persisted_state = Some(PersistedState {
+            system_proxy: false,
+            mode: Some("global".to_string()),
+            tun: Some(false),
+        });
+
+        // Start async subscription reload.
+        assert!(
+            worker
+                .handle_command(WorkerCommand::SetSubscriptionUrl(
+                    "https://example.com/sub".to_string()
+                ))
+                .unwrap()
+        );
+        assert!(worker.pending_restore.is_none());
+        assert!(worker.pending_reload_restore.is_some());
+
+        // An intermediate poll before `AsyncDone` must NOT consume `pending_reload_restore` or overwrite mode!
+        let mut mid_cfg = CoreConfigs {
+            mode: "rule".to_string(),
+            mixed_port: 7890,
+            tun_enable: false,
+        };
+        worker.apply_pending_restore_if_needed(&mut mid_cfg);
+        worker.sync_live_persisted_state(false, "rule", false);
+        assert_eq!(
+            worker
+                .persisted_state
+                .as_ref()
+                .and_then(|s| s.mode.as_deref()),
+            Some("global")
+        );
+
+        // Wait for the background reload thread to finish and send `AsyncDone`.
+        let async_cmd = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(async_cmd).unwrap();
+        assert!(worker.pending_restore.is_some());
+
+        // Next `poll_controller_configs` applies `pending_restore`, switching mode back to `global`.
+        let (ok, mode, _, _, _, _) = worker.poll_controller_configs(worker.client.clone().as_ref());
+        assert!(ok);
+        assert_eq!(mode, "global");
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .unwrap()
+            .write_all(b"POST /__stop HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

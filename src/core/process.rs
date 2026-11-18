@@ -88,8 +88,12 @@ impl ProcessInspector {
                 .with_cmd(UpdateKind::Always),
         );
 
+        let self_pid = std::process::id();
         let mut out = Vec::new();
         for (pid, proc_info) in sys.processes() {
+            if pid.as_u32() == self_pid || proc_info.thread_kind().is_some() {
+                continue;
+            }
             let name = proc_info.name().to_string_lossy();
             let exe = proc_info.exe().map(Path::to_path_buf);
 
@@ -129,6 +133,9 @@ impl ProcessInspector {
         let Some(proc_info) = sys.process(sys_pid) else {
             return false;
         };
+        if proc_info.thread_kind().is_some() {
+            return false;
+        }
         let name = proc_info.name().to_string_lossy();
         matches_recorded_kernel(&name, proc_info.exe(), expected_kernel)
     }

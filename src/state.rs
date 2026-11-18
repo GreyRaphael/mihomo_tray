@@ -114,10 +114,10 @@ impl Snapshot {
     }
 
     pub fn error(&self) -> Option<&str> {
-        self.controller_error
+        self.config_error
             .as_deref()
-            .or(self.config_error.as_deref())
             .or(self.action_error.as_deref())
+            .or(self.controller_error.as_deref())
     }
 
     pub fn latency_for(&self, node: &str) -> Option<u32> {
@@ -169,6 +169,13 @@ impl Snapshot {
 /// Shared snapshot protected by a mutex so UI renders never block on HTTP calls.
 pub type SharedSnapshot = Arc<Mutex<Snapshot>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncTaskKind {
+    LatencyTest,
+    RefreshSubscriptions,
+    ApplySubscription { reload_ok: bool },
+}
+
 #[derive(Debug, Clone)]
 pub enum WorkerCommand {
     SetMode(String),
@@ -186,8 +193,8 @@ pub enum WorkerCommand {
     RestartCore,
     ToggleAutostart,
     AsyncDone {
+        kind: AsyncTaskKind,
         error: Option<String>,
-        clear_note: bool,
     },
     Quit {
         interactive: bool,
@@ -277,17 +284,17 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_error_follows_controller_then_config_then_action_priority() {
+    fn snapshot_error_follows_config_then_action_then_controller_priority() {
         let mut snap = Snapshot {
-            action_error: Some("action failed".to_string()),
+            controller_error: Some("controller unreachable".to_string()),
             ..Default::default()
         };
+        assert_eq!(snap.error(), Some("controller unreachable"));
+
+        snap.action_error = Some("action failed".to_string());
         assert_eq!(snap.error(), Some("action failed"));
 
         snap.config_error = Some("invalid tray.yml".to_string());
         assert_eq!(snap.error(), Some("invalid tray.yml"));
-
-        snap.controller_error = Some("controller unreachable".to_string());
-        assert_eq!(snap.error(), Some("controller unreachable"));
     }
 }

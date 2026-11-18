@@ -10,7 +10,7 @@ use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
 use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -183,11 +183,21 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     let file_w = wide(&exe.to_string_lossy());
     let params_w = wide(&params);
 
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
     unsafe {
-        CoInitializeEx(
+        let com_hr = CoInitializeEx(
             std::ptr::null(),
             (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
         );
+        let _com = ComGuard(com_hr >= 0);
 
         let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
         sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;

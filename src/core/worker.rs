@@ -422,7 +422,7 @@ impl Worker {
         Ok(())
     }
 
-    fn apply_tun_state(&mut self, want_enable: bool) -> Result<bool, String> {
+    fn apply_tun_state(&mut self, want_enable: bool) -> Result<(), String> {
         let client = self
             .client
             .clone()
@@ -432,9 +432,16 @@ impl Worker {
             Ok(cfg) => cfg,
             Err(cfg_err) => return Err(set_res.err().unwrap_or(cfg_err)),
         };
-        if !want_enable || after.tun_enable {
+        if !want_enable {
             set_res?;
-            return Ok(after.tun_enable);
+            if after.tun_enable {
+                return Err("TUN mode remained enabled after disabling.".to_string());
+            }
+            return Ok(());
+        }
+        if after.tun_enable {
+            set_res?;
+            return Ok(());
         }
         if let Err(err) = &set_res {
             tracing::info!("Non-elevated set_tun(true) failed ({err}); attempting UAC elevation");
@@ -451,18 +458,16 @@ impl Worker {
         )
         .ok_or_else(|| text::ERR_LOCATE_ELEVATE_PROCESS.to_string())?;
 
-        let launch_args = discover::build_launch_args(
-            &self.portable_root,
-            &self.settings,
-            target.exe.as_deref().or(self.known_kernel_path.as_deref()),
-        )?;
+        let kernel_path = target.exe.clone().or_else(|| self.known_kernel_path.clone());
+        let launch_args =
+            discover::build_launch_args(&self.portable_root, &self.settings, kernel_path.as_deref())?;
 
         self.set_status_note(Some(text::STATUS_ELEVATING_CORE));
         let mut helper_args = vec![
             platform::ELEVATE_START_FLAG.to_string(),
             target.pid.to_string(),
         ];
-        helper_args.extend(launch_args);
+        helper_args.extend(launch_args.iter().cloned());
 
         let code = platform::run_elevated_self(&helper_args);
         self.set_status_note(None);
@@ -475,21 +480,23 @@ impl Worker {
 
         self.managed = None;
         self.recorded_pid = Some(new_pid);
-        if let Some(kernel) = target
-            .exe
-            .clone()
-            .or_else(|| self.known_kernel_path.clone())
-        {
+        self.cached_version.clear();
+        if let Some(ref kernel) = kernel_path {
             process::save_runtime_record(
                 &self.home_dir,
                 &RuntimeRecord {
                     pid: new_pid,
-                    kernel_path: kernel,
+                    kernel_path: kernel.clone(),
                 },
             );
         }
 
-        self.re_resolve_controller(&[]);
+        let elevated = [RunningProcess {
+            pid: new_pid,
+            exe: kernel_path,
+            cmd: launch_args,
+        }];
+        self.re_resolve_controller(&elevated);
         self.wait_for_controller(KERNEL_RESTART_BUDGET, text::ERR_CORE_RESTART_TIMEOUT)?;
         let elevated_client = self
             .client
@@ -776,13 +783,13 @@ impl Worker {
             && want_tun != cfg.tun_enable
         {
             match self.apply_tun_state(want_tun) {
-                Ok(actual) => {
+                Ok(()) => {
                     if let Some(client) = &self.client
                         && let Ok(updated) = client.get_configs()
                     {
                         *cfg = updated;
                     } else {
-                        cfg.tun_enable = actual;
+                        cfg.tun_enable = want_tun;
                     }
                 }
                 Err(err) => {
@@ -1062,7 +1069,7 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<bool, String> {
+fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<(), String> {
     client
         .set_tun(true)
         .map_err(|err| text::format_tun_enable_after_elevation_failed(&err))?;
@@ -1070,7 +1077,7 @@ fn verify_or_enable_tun_after_elevation(client: &Client) -> Result<bool, String>
     if !verify.tun_enable {
         return Err(text::ERR_TUN_FAILED_AFTER_ELEVATION.to_string());
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1151,7 +1158,7 @@ mod tests {
         });
 
         let client = Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap();
-        assert!(verify_or_enable_tun_after_elevation(&client).unwrap());
+        verify_or_enable_tun_after_elevation(&client).unwrap();
         handle.join().unwrap();
     }
 

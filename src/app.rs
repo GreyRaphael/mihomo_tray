@@ -430,7 +430,9 @@ impl MihomoTrayApp {
 
     fn shutdown_on_exit(&mut self) {
         platform::close_subscription_prompt();
-        if let Some(handle) = self.prompt_thread.take() {
+        if let Some(handle) = self.prompt_thread.take()
+            && handle.is_finished()
+        {
             let _ = handle.join();
         }
         if let Some(mut worker) = self.worker.take() {
@@ -472,7 +474,6 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::Menu(ev) => self.handle_menu_event(ev.id.as_ref()),
             AppEvent::SnapshotUpdated { rebuild_menu } => self.apply_snapshot(rebuild_menu),
             AppEvent::QuitCompleted => {
-                self.shutdown_on_exit();
                 event_loop.exit();
             }
             AppEvent::QuitCancelled(err) => {

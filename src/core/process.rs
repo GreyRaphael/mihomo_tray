@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use crate::config::tray;
+use crate::core::discover;
 use crate::platform;
 use crate::text::RUNTIME_LOCK_NAME;
 
@@ -291,7 +293,24 @@ fn process_exe_for_pid(pid: u32) -> Option<PathBuf> {
     let proc_info = sys.process(sys_pid)?;
     let name = proc_info.name().to_string_lossy();
     let exe = proc_info.exe()?.to_path_buf();
-    platform::is_kernel_candidate_name(&name).then_some(exe)
+    is_authorized_helper_exe(&name, &exe, &platform::portable_root()).then_some(exe)
+}
+
+fn is_authorized_helper_exe(name: &str, exe: &Path, portable_root: &Path) -> bool {
+    if platform::is_kernel_candidate_name(name) {
+        return true;
+    }
+    let settings = tray::load(&tray::settings_path(portable_root)).unwrap_or_default();
+    let declared = tray::resolve_portable_path(portable_root, &settings.mihomo.path);
+    if declared
+        .as_deref()
+        .is_some_and(|path| paths_match(exe, path))
+    {
+        return true;
+    }
+    let (home_dir, _) =
+        discover::resolve_home_and_config(portable_root, &settings, declared.as_deref());
+    load_runtime_record(&home_dir).is_some_and(|rec| paths_match(exe, &rec.kernel_path))
 }
 
 #[cfg(test)]
@@ -326,5 +345,42 @@ mod tests {
         let rec: RuntimeRecord = serde_json::from_str(json).expect("legacy record should parse");
         assert_eq!(rec.pid, 1234);
         assert_eq!(rec.kernel_path, PathBuf::from("/opt/mihomo"));
+    }
+
+    #[test]
+    fn authorizes_custom_declared_and_recorded_helper_executables() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mihomo_tray_helper_auth_{nanos}"));
+        std::fs::create_dir_all(root.join("custom")).unwrap();
+        let custom_exe = root.join("custom").join("my-core.exe");
+        std::fs::write(&custom_exe, b"core").unwrap();
+
+        std::fs::write(
+            tray::settings_path(&root),
+            "mihomo:\n  path: ./custom/my-core.exe\n",
+        )
+        .unwrap();
+        assert!(is_authorized_helper_exe("my-core.exe", &custom_exe, &root));
+        assert!(!is_authorized_helper_exe(
+            "notepad.exe",
+            Path::new("/Windows/System32/notepad.exe"),
+            &root,
+        ));
+
+        // Also authorize via .runtime.json when tray.yml has no explicit mihomo.path.
+        std::fs::remove_file(tray::settings_path(&root)).unwrap();
+        let home_dir = root.join("config");
+        save_runtime_record(
+            &home_dir,
+            &RuntimeRecord {
+                pid: 99,
+                kernel_path: custom_exe.clone(),
+            },
+        );
+        assert!(is_authorized_helper_exe("my-core.exe", &custom_exe, &root));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

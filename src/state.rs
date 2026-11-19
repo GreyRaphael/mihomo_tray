@@ -159,7 +159,7 @@ impl Snapshot {
 
     pub fn status_line(&self) -> String {
         if self.controller_ok {
-            crate::text::format_status_running(&self.mode, &self.version)
+            crate::text::format_status_running(&self.version, self.mixed_port)
         } else {
             crate::text::format_status_unreachable(self.kernel_running).to_string()
         }

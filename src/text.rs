@@ -28,7 +28,7 @@ pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
 const MENU_REFRESH_SUBSCRIPTION: &str = "Update Subscription";
 pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
 pub const MENU_RESTART_APP: &str = "Restart Application";
-pub const MENU_AUTOSTART: &str = "Start with Windows";
+pub const MENU_AUTOSTART: &str = "Auto Start";
 pub const MENU_QUIT: &str = "Quit";
 
 pub const STATUS_STARTING_CORE: &str = "Starting mihomo core...";
@@ -155,12 +155,17 @@ pub fn format_single_instance_failed(err: &dyn std::fmt::Display) -> String {
     format!("Single-instance check failed: {err}")
 }
 
-pub fn format_status_running(mode: &str, version: &str) -> String {
-    let mode_label = if mode.is_empty() { "unknown" } else { mode };
-    if version.is_empty() {
-        format!("Mihomo: Running ({mode_label})")
+pub fn format_status_running(version: &str, mixed_port: u16) -> String {
+    let version = version.trim();
+    let prefix = if version.is_empty() {
+        "Mihomo".to_string()
     } else {
-        format!("Mihomo {version}: Running ({mode_label})")
+        format!("Mihomo {version}")
+    };
+    if mixed_port > 0 {
+        format!("{prefix} Running({mixed_port})")
+    } else {
+        format!("{prefix} Running")
     }
 }
 
@@ -238,6 +243,20 @@ pub fn format_update_subscription_label(updated_at: Option<i64>, now_unix: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_status_running_with_version_and_port() {
+        assert_eq!(
+            format_status_running("v1.19.34", 7890),
+            "Mihomo v1.19.34 Running(7890)"
+        );
+        assert_eq!(
+            format_status_running(" v1.19.34 ", 0),
+            "Mihomo v1.19.34 Running"
+        );
+        assert_eq!(format_status_running("", 7890), "Mihomo Running(7890)");
+        assert_eq!(format_status_running("", 0), "Mihomo Running");
+    }
 
     #[test]
     fn formats_update_subscription_label_buckets() {

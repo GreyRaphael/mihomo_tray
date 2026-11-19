@@ -63,7 +63,7 @@ mihomo-tray/
 
 ## 托盘菜单概览
 
-- **状态行**：显示 `Mihomo <version>: Running (<mode>)` / `Mihomo: Stopped` / `Mihomo: Controller Unreachable` 及最近错误。
+- **状态行**：显示 `Mihomo <version> Running(<port>)` / `Mihomo: Stopped` / `Mihomo: Controller Unreachable` 及最近错误。
 - **Open WebUI**：用默认浏览器打开面板（左键单击托盘图标同样触发）。
 - **Set Subscription URL**：弹出居中原生输入框保存订阅地址到 `config/config.yaml`（默认 12 小时更新），并立即触发加载与刷新节点。
 - **模式切换**：`Rule` / `Global` / `Direct`。
@@ -75,7 +75,7 @@ mihomo-tray/
   - `Update Subscription`：立即刷新订阅/代理提供者（并在旁侧显示距上次更新的相对时间）；
   - `Restart Mihomo Core`：重新扫描并重启 mihomo 内核；
   - `Restart Application`：重启 `mihomo-tray` 应用（无单实例冲突并自动恢复运行状态）；
-  - `Start with Windows`：注册/取消开机自启（基于当前便携 exe 路径）；
+  - `Auto Start`：注册/取消开机自启（基于当前便携 exe 路径）；
   - `Version: v...`：显示应用与核心版本信息弹窗。
 - **Quit**：保存运行状态、停止受管内核、清理系统代理并退出托盘。
 

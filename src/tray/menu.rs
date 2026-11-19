@@ -474,6 +474,7 @@ mod tests {
     fn builds_requested_hierarchy_without_id_collisions() {
         let snap = Snapshot {
             controller_ok: true,
+            version: "v1.19.34".to_string(),
             mode: "rule".to_string(),
             mixed_port: 7890,
             web_ui_url: Some("http://127.0.0.1:9090/ui/".to_string()),
@@ -527,7 +528,7 @@ mod tests {
         assert_eq!(
             root_texts,
             vec![
-                "Mihomo: Running (rule)",
+                "Mihomo v1.19.34 Running(7890)",
                 "Open WebUI",
                 "Set Subscription URL",
                 "---",
@@ -642,6 +643,7 @@ mod tests {
                 .iter()
                 .any(|t| t == "Update Subscription (2m ago)")
         );
+        assert!(more_texts.iter().any(|t| t == "Auto Start"));
 
         // Non-refreshable Compatible groups and offline controller states fall back cleanly.
         assert_eq!(

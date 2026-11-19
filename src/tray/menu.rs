@@ -15,6 +15,7 @@ pub enum MenuAction {
     SetSubscription,
     SwitchProfile(String),
     UpdateSubscription(String),
+    CopyProfileUrl { name: String, url: String },
     DeleteProfile(String),
     SetMode(ProxyMode),
     ToggleSystemProxy,
@@ -46,8 +47,8 @@ impl MenuFingerprint {
         snap.web_ui_url.is_some().hash(&mut hasher);
         snap.profiles.hash(&mut hasher);
         snap.active_profile.hash(&mut hasher);
-        for name in &snap.profiles {
-            text::subscription_age_bucket(snap.provider_updated_at(name), now_unix)
+        for profile in &snap.profiles {
+            text::subscription_age_bucket(snap.provider_updated_at(&profile.name), now_unix)
                 .hash(&mut hasher);
         }
         snap.proxy_mode().hash(&mut hasher);
@@ -159,7 +160,7 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
     // 1. Mihomo status + optional error line (transient `status_note` is shown in tray tooltip).
     append_menu_item(&menu, &mut recorder, &snapshot.status_line(), false, None);
     if let Some(err) = snapshot.error() {
-        let short = truncate_label(err, 90);
+        let short = text::truncate_text(err, 90);
         append_menu_item(&menu, &mut recorder, &format!("! {short}"), false, None);
     }
 
@@ -393,15 +394,15 @@ fn append_profiles_items(
     recorder: &mut ActionRecorder,
 ) {
     if !snapshot.profiles.is_empty() {
-        for name in &snapshot.profiles {
-            let active = snapshot.active_profile.as_deref() == Some(name.as_str());
+        for profile in &snapshot.profiles {
+            let active = snapshot.active_profile.as_deref() == Some(profile.name.as_str());
             append_check_item(
                 sub,
                 recorder,
-                name,
+                &profile.name,
                 true,
                 active,
-                MenuAction::SwitchProfile(name.clone()),
+                MenuAction::SwitchProfile(profile.name.clone()),
             );
         }
         let _ = sub.append(&PredefinedMenuItem::separator());
@@ -417,27 +418,46 @@ fn append_profiles_items(
 
     if !snapshot.profiles.is_empty() {
         let update_sub = Submenu::new(text::MENU_UPDATE_SUBSCRIPTION, snapshot.controller_ok);
-        for name in &snapshot.profiles {
-            let label =
-                text::format_profile_age_label(name, snapshot.provider_updated_at(name), now_unix);
+        for profile in &snapshot.profiles {
+            let label = text::format_profile_age_label(
+                &profile.name,
+                snapshot.provider_updated_at(&profile.name),
+                now_unix,
+            );
             append_menu_item(
                 &update_sub,
                 recorder,
                 &label,
                 snapshot.controller_ok,
-                Some(MenuAction::UpdateSubscription(name.clone())),
+                Some(MenuAction::UpdateSubscription(profile.name.clone())),
             );
         }
         let _ = sub.append(&update_sub);
 
+        let copy_url_sub = Submenu::new(text::MENU_COPY_PROFILE_URL, true);
+        for profile in &snapshot.profiles {
+            let label = text::format_profile_url_label(&profile.name, &profile.url);
+            append_menu_item(
+                &copy_url_sub,
+                recorder,
+                &label,
+                true,
+                Some(MenuAction::CopyProfileUrl {
+                    name: profile.name.clone(),
+                    url: profile.url.clone(),
+                }),
+            );
+        }
+        let _ = sub.append(&copy_url_sub);
+
         let delete_sub = Submenu::new(text::MENU_DELETE_PROFILE, true);
-        for name in &snapshot.profiles {
+        for profile in &snapshot.profiles {
             append_menu_item(
                 &delete_sub,
                 recorder,
-                name,
+                &profile.name,
                 true,
-                Some(MenuAction::DeleteProfile(name.clone())),
+                Some(MenuAction::DeleteProfile(profile.name.clone())),
             );
         }
         let _ = sub.append(&delete_sub);
@@ -483,23 +503,6 @@ fn append_more_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRe
     );
 }
 
-fn truncate_label(raw: &str, max_chars: usize) -> String {
-    let first_line = raw
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_else(|| raw.trim());
-    let mut out = String::new();
-    for (idx, ch) in first_line.chars().enumerate() {
-        if idx >= max_chars {
-            out.push_str("...");
-            break;
-        }
-        out.push(ch);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,12 +535,23 @@ mod tests {
 
     #[test]
     fn builds_requested_hierarchy_without_id_collisions() {
+        use crate::state::ProfileInfo;
+
         let snap = Snapshot {
             controller_ok: true,
             version: "v1.19.34".to_string(),
             mode: "rule".to_string(),
             mixed_port: 7890,
-            profiles: vec!["AirportA".to_string(), "AirportB".to_string()],
+            profiles: vec![
+                ProfileInfo {
+                    name: "AirportA".to_string(),
+                    url: "https://a.example/sub".to_string(),
+                },
+                ProfileInfo {
+                    name: "AirportB".to_string(),
+                    url: "https://b.example/sub".to_string(),
+                },
+            ],
             active_profile: Some("AirportA".to_string()),
             web_ui_url: Some("http://127.0.0.1:9090/ui/".to_string()),
             groups: vec![Group {
@@ -571,6 +585,10 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, MenuAction::UpdateSubscription(n) if n == "AirportA"))
         );
+        assert!(built.actions.iter().any(|a| matches!(
+            a,
+            MenuAction::CopyProfileUrl { name, url } if name == "AirportB" && url == "https://b.example/sub"
+        )));
         assert!(
             built
                 .actions
@@ -635,7 +653,16 @@ mod tests {
                 "---",
                 "Set Subscription",
                 "Update Subscription",
+                "Copy URL",
                 "Delete Profile",
+            ]
+        );
+        let copy_url_sub = find_submenu(profiles_sub.items(), text::MENU_COPY_PROFILE_URL);
+        assert_eq!(
+            item_texts(copy_url_sub.items()),
+            vec![
+                "AirportA (https://a.example/sub)",
+                "AirportB (https://b.example/sub)",
             ]
         );
         let delete_sub = find_submenu(profiles_sub.items(), text::MENU_DELETE_PROFILE);
@@ -694,14 +721,31 @@ mod tests {
             MenuFingerprint::from_snapshot(&s1, now),
             MenuFingerprint::from_snapshot(&s2, now)
         );
+
+        let mut s4 = s1.clone();
+        s4.profiles.push(crate::state::ProfileInfo {
+            name: "Alpha".to_string(),
+            url: "https://a.example/sub".to_string(),
+        });
+        let mut s5 = s4.clone();
+        s5.profiles[0].url = "https://a.example/sub-v2".to_string();
+        assert_ne!(
+            MenuFingerprint::from_snapshot(&s4, now),
+            MenuFingerprint::from_snapshot(&s5, now)
+        );
     }
 
     #[test]
     fn update_subscription_menu_tracks_age_buckets_without_churn() {
+        use crate::state::ProfileInfo;
+
         let now = 1_700_000_000;
         let make_snap = |controller_ok: bool, vehicle: &str, updated_at: Option<i64>| Snapshot {
             controller_ok,
-            profiles: vec!["AirportA".to_string()],
+            profiles: vec![ProfileInfo {
+                name: "AirportA".to_string(),
+                url: "https://a.example/sub".to_string(),
+            }],
             active_profile: Some("AirportA".to_string()),
             providers: vec![crate::state::Provider {
                 name: "AirportA".to_string(),

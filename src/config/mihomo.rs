@@ -14,6 +14,7 @@ const HEALTH_CHECK_INTERVAL_SECS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileEntry {
     pub name: String,
+    pub url: String,
     pub path: String,
 }
 
@@ -359,15 +360,20 @@ fn extract_profiles(root_map: &Mapping) -> ProfilesOverview {
             let is_http = scalar_str(entry, "type")
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case("http"));
-            let has_url = scalar_str(entry, "url").is_some_and(|s| !s.trim().is_empty());
-            if !is_http || !has_url {
+            let Some(url) = scalar_str(entry, "url")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if !is_http {
                 continue;
             }
             let path = scalar_str(entry, "path")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| profile_local_path(&name));
-            profiles.push(ProfileEntry { name, path });
+            profiles.push(ProfileEntry { name, url, path });
         }
     }
 

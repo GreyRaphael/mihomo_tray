@@ -23,7 +23,7 @@ use crate::core::discover;
 use crate::core::process::RunningProcess;
 use crate::platform;
 use crate::state::{
-    self, AppEvent, AsyncTaskKind, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand,
+    self, AppEvent, AsyncTaskKind, ProfileInfo, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand,
 };
 use crate::text;
 
@@ -301,7 +301,7 @@ struct Worker {
     state_sync: StateSync,
     core: CoreLifecycle,
     live: LiveState,
-    profiles: Vec<String>,
+    profiles: Vec<ProfileInfo>,
     active_profile: Option<String>,
     shared: SharedSnapshot,
     proxy: UiNotifier,
@@ -324,9 +324,7 @@ impl Worker {
     ) -> (Self, mpsc::Receiver<WorkerCommand>) {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let cfg = RuntimeConfig::new(portable_root, settings_path, settings, startup_error);
-        let overview = mihomo::read_profiles(&cfg.config_file);
-        let profiles: Vec<String> = overview.profiles.into_iter().map(|p| p.name).collect();
-        let active_profile = overview.active;
+        let (profiles, active_profile) = load_profiles_snapshot(&cfg.config_file);
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = cfg.settings.groups.page_size;
@@ -446,9 +444,9 @@ impl Worker {
     }
 
     fn refresh_profiles_from_disk(&mut self) {
-        let overview = mihomo::read_profiles(&self.cfg.config_file);
-        self.profiles = overview.profiles.into_iter().map(|p| p.name).collect();
-        self.active_profile = overview.active;
+        let (profiles, active_profile) = load_profiles_snapshot(&self.cfg.config_file);
+        self.profiles = profiles;
+        self.active_profile = active_profile;
         let mut snap = self.shared.lock().unwrap();
         snap.profiles = self.profiles.clone();
         snap.active_profile = self.active_profile.clone();
@@ -1214,6 +1212,19 @@ impl Worker {
         let mut snap = self.shared.lock().unwrap();
         snap.action_error = msg;
     }
+}
+
+fn load_profiles_snapshot(config_file: &Path) -> (Vec<ProfileInfo>, Option<String>) {
+    let overview = mihomo::read_profiles(config_file);
+    let profiles = overview
+        .profiles
+        .into_iter()
+        .map(|p| ProfileInfo {
+            name: p.name,
+            url: p.url,
+        })
+        .collect();
+    (profiles, overview.active)
 }
 
 fn resolve_provider_file(home_dir: &Path, raw_path: &str) -> PathBuf {
@@ -2197,7 +2208,8 @@ mod tests {
         worker.handle_command(done).unwrap();
         assert!(!alpha_cache.exists());
         assert!(beta_cache.exists());
-        assert_eq!(worker.profiles, vec!["Beta".to_string()]);
+        let names: Vec<&str> = worker.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"]);
         assert_eq!(worker.active_profile.as_deref(), Some("Beta"));
         assert_eq!(reload_hits.load(Ordering::Acquire), 2);
         assert_eq!(refresh_hits.load(Ordering::Acquire), 0);

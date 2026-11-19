@@ -180,6 +180,7 @@ impl MihomoTrayApp {
             MenuAction::UpdateSubscription(name) => {
                 self.send_worker(WorkerCommand::UpdateSubscription(name));
             }
+            MenuAction::CopyProfileUrl { name, url } => self.copy_profile_url(&name, &url),
             MenuAction::DeleteProfile(name) => self.confirm_and_delete_profile(name),
             MenuAction::OpenTrayConfig => {
                 crate::config::tray::ensure_sample_file(&self.settings_path);
@@ -309,6 +310,14 @@ impl MihomoTrayApp {
                 let _ = tx.send(WorkerCommand::DeleteProfile(name));
             }
         });
+    }
+
+    fn copy_profile_url(&self, name: &str, url: &str) {
+        if let Err(err) = platform::copy_to_clipboard(url) {
+            self.spawn_notice_dialog(crate::text::MENU_COPY_PROFILE_URL.to_string(), err, true);
+        } else {
+            tracing::info!("Copied subscription URL for profile '{name}'");
+        }
     }
 
     fn spawn_notice_dialog(&self, title: String, message: String, is_error: bool) {

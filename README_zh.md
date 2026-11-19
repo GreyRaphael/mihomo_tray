@@ -69,6 +69,7 @@ mihomo-tray/
   - 平铺列出所有已配置订阅，左勾选互斥单选，点击直接利用本地缓存秒切（共用 `config/config.yaml` 模板，缓存独立存放在 `./config/providers/<name>.yaml`）；
   - `Set Subscription`：弹出原生居中双输入框（Name + Subscription URL，默认留空），新增订阅或同名更新 URL 并立即拉取；
   - `Update Subscription`：二级菜单按订阅单独刷新（旁侧显示相对更新时间），更新成功或失败均弹窗提示；
+  - `Copy URL`：二级菜单预览各订阅 URL，点击即可复制完整订阅地址到剪贴板；
   - `Delete Profile`：二级菜单选择后经二次确认弹窗删除配置条目与本地缓存文件。
 - **模式切换**：`Rule` / `Global` / `Direct`。
 - **接管开关**：`System Proxy` / `TUN Mode`（互斥切换，状态跨重启记忆）。

@@ -70,6 +70,12 @@ impl Provider {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub controller_ok: bool,
@@ -80,7 +86,7 @@ pub struct Snapshot {
     pub sysproxy: bool,
     pub autostart: bool,
     pub kernel_running: bool,
-    pub profiles: Vec<String>,
+    pub profiles: Vec<ProfileInfo>,
     pub active_profile: Option<String>,
     pub groups: Vec<Group>,
     pub node_latency: BTreeMap<String, Option<u32>>,

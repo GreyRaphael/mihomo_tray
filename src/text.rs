@@ -11,6 +11,7 @@ pub const MENU_OPEN_WEB_UI: &str = "Open WebUI";
 pub const MENU_PROFILES: &str = "Profiles";
 pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription";
 pub const MENU_UPDATE_SUBSCRIPTION: &str = "Update Subscription";
+pub const MENU_COPY_PROFILE_URL: &str = "Copy URL";
 pub const MENU_DELETE_PROFILE: &str = "Delete Profile";
 pub const MENU_MODE_RULE: &str = "Rule";
 pub const MENU_MODE_GLOBAL: &str = "Global";
@@ -258,6 +259,29 @@ pub fn format_profile_age_label(name: &str, updated_at: Option<i64>, now_unix: i
     }
 }
 
+/// Truncates `raw` to its first non-empty line and at most `max_chars` characters.
+pub fn truncate_text(raw: &str, max_chars: usize) -> String {
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| raw.trim());
+    let mut out = String::new();
+    for (idx, ch) in first_line.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub fn format_profile_url_label(name: &str, url: &str) -> String {
+    let preview = truncate_text(url, 48);
+    format!("{name} ({preview})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +332,19 @@ mod tests {
         assert_eq!(
             format_profile_age_label("Alpha", Some(now - 86_400), now),
             "Alpha (1d ago)"
+        );
+    }
+
+    #[test]
+    fn formats_profile_url_label_with_truncation() {
+        assert_eq!(
+            format_profile_url_label("AirportA", "https://example.com/sub"),
+            "AirportA (https://example.com/sub)"
+        );
+        let long = "https://sub.example.com/api/v1/client/subscribe?token=1234567890abcdef";
+        assert_eq!(
+            format_profile_url_label("AirportA", long),
+            "AirportA (https://sub.example.com/api/v1/client/subscribe?...)"
         );
     }
 }

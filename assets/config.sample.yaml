@@ -1,6 +1,6 @@
 # Default portable configuration for mihomo (generated for mihomo-tray).
-# Use "Set Subscription URL" in the tray menu to configure your subscription;
-# it updates every 12 hours automatically once set.
+# Use "Profiles -> Set Subscription" in the tray menu to configure subscriptions;
+# active subscriptions update every 12 hours automatically once set.
 
 mixed-port: 7890
 allow-lan: true
@@ -96,7 +96,7 @@ proxy-groups:
     max-failed-times: 3
   - name: 🤖AI
     type: select
-    include-all: true
+    include-all-proxies: true
     exclude-filter: "HK|MO|CN"
 
 rule-providers:

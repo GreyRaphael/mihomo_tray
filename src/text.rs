@@ -66,6 +66,8 @@ pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
     "No subscription provider configured. Use Set Subscription URL first.";
 pub const ERR_SUBSCRIPTION_TASK_BUSY: &str =
     "A subscription update is already in progress; try again shortly.";
+pub const ERR_INVALID_PROFILE_NAME: &str =
+    "Profile name cannot be empty or contain invalid filename characters.";
 pub const ERR_INVALID_SUBSCRIPTION_URL: &str =
     "Subscription URL must start with http:// or https://";
 pub const ERR_WAIT_INTERRUPTED_FOR_SHUTDOWN: &str =

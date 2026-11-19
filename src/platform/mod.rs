@@ -205,14 +205,16 @@ pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
         return None;
     }
 
-    rustydialogs::TextInput {
-        title: crate::text::PROMPT_SUBSCRIPTION_TITLE,
-        message: crate::text::PROMPT_SUBSCRIPTION_HINT,
-        value: current.unwrap_or(""),
-        mode: rustydialogs::TextInputMode::SingleLine,
-        owner: None,
-    }
-    .show()
+    imp::with_dialog_icon(|| {
+        rustydialogs::TextInput {
+            title: crate::text::PROMPT_SUBSCRIPTION_TITLE,
+            message: crate::text::PROMPT_SUBSCRIPTION_HINT,
+            value: current.unwrap_or(""),
+            mode: rustydialogs::TextInputMode::SingleLine,
+            owner: None,
+        }
+        .show()
+    })
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty())
 }

@@ -76,3 +76,7 @@ pub fn can_show_dialog() -> bool {
         which::which("kdialog").is_ok() || which::which("zenity").is_ok()
     }
 }
+
+pub fn with_dialog_icon<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}

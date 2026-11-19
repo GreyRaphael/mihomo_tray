@@ -30,7 +30,7 @@ pub const MENU_MORE: &str = "More";
 pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
 pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
 pub const MENU_RESTART_APP: &str = "Restart Application";
-pub const MENU_AUTOSTART: &str = "Auto Start";
+pub const MENU_AUTOSTART: &str = "Auto Launch";
 pub const MENU_QUIT: &str = "Quit";
 
 pub const STATUS_STARTING_CORE: &str = "Starting mihomo core...";

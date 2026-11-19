@@ -78,7 +78,7 @@ mihomo-tray/
   - `Copy Environment Variables`：复制终端代理环境变量命令到剪贴板；
   - `Restart Mihomo Core`：重新扫描并重启 mihomo 内核；
   - `Restart Application`：重启 `mihomo-tray` 应用（无单实例冲突并自动恢复运行状态）；
-  - `Auto Start`：注册/取消开机自启（基于当前便携 exe 路径）；
+  - `Auto Launch`：注册/取消开机自启（基于当前便携 exe 路径）；
   - `Version: v...`：显示应用与核心版本信息弹窗。
 - **Quit**：保存运行状态、停止受管内核、清理系统代理并退出托盘。
 

@@ -643,7 +643,7 @@ mod tests {
 
         let more_sub = find_submenu(built.menu.items(), text::MENU_MORE);
         let more_texts = item_texts(more_sub.items());
-        assert!(more_texts.iter().any(|t| t == "Auto Start"));
+        assert!(more_texts.iter().any(|t| t == "Auto Launch"));
         assert!(!more_texts.iter().any(|t| t.contains("Update Subscription")));
     }
 

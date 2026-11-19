@@ -21,7 +21,7 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
   - 使用 `MessageBoxW` 与内存 `DLGTEMPLATE`（`DialogBoxIndirectParamW`）原生实现提示框、确认框与居中 `Name + Subscription URL` 双输入框，并自带标题栏/任务栏图标，零额外第三方弹窗依赖。
 - **系统代理与 TUN 互斥切换及菜单细节打磨**：
   - `System Proxy` 与 `TUN Mode` 调整为互斥切换（开启其一自动关闭另一项，兼容旧版双开状态恢复，取消 UAC 提权时保留原有系统代理）；
-  - 状态首行改为 `Mihomo <version> Running(<port>)` 格式；`Start with Windows` 精简更名为 `Auto Start`。
+  - 状态首行改为 `Mihomo <version> Running(<port>)` 格式；`Start with Windows` 精简更名为 `Auto Launch`。
 
 ---
 

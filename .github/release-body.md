@@ -13,15 +13,15 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 
 ### 本次更新（{{TAG}}）
 
-- **无损配置与单实例 / 日志轮转加固**：
-  - 引入 `yaml-edit` 无损更新 `config.yaml` 订阅配置，保留用户原有注释与缩进格式，并防止误覆盖非 UTF-8 或暂时不可读配置文件；
-  - 改为全局单实例互斥锁并在持锁后初始化 `2 MB` 自动轮转日志（`file-rotate`），支持 `Restart Application` 平滑重拉与外部核心 `-f` 配置自动识别。
-- **TUN UAC 自提权链路与系统代理稳定性提升**：
-  - 完善按需 UAC 自提权（`--elevate-start` / `--elevate-stop`）：支持自定义内核路径与 `CommandLineToArgvW` 安全引号转义、提权目标白名单校验、提权后二次下发校验 TUN 并自动恢复路由模式；
-  - 合并写入 Windows `ProxyOverride`（保留用户已有规则与 `<local>`），控制器 HTTP 客户端禁用系统代理防止自环，修复核心异常退出/控制器未配置时的状态污染与空等。
-- **托盘菜单交互稳定化与内部架构精简**：
-  - 通过 `BTreeMap` 稳定化 + `MenuFingerprint` 哈希指纹 + 代际菜单 ID（`act_{generation}_{index}`）与弹出菜单防打断延迟重建，消除菜单闪烁与跨代误触；
-  - 异步化慢速测速与订阅重载并简化 `worker` / `CoreLifecycle` 架构边界，统一使用 `rustydialogs` / `arboard` / `which` / `url` / `time` 等成熟生态组件。
+- **多订阅管理（共享单份 `config.yaml` 模板）**：
+  - 托盘一级菜单新增 **`Profiles`** 子菜单，平铺互斥单选所有订阅，无需额外清单文件（直接以 `config.yaml` 的 `proxy-providers` 为唯一数据源，各订阅缓存独立保存在 `./config/providers/<name>.yaml`）；
+  - 切回已有本地缓存的订阅时直接基于缓存秒切；`🤖AI` 组自动改用 `include-all-proxies: true` + 单激活 `use:`，避免未激活订阅节点串入；
+  - `Profiles` 下集成 **`Set Subscription`**（新增或同名更新订阅 URL）、**`Update Subscription`**（按订阅单独刷新并显示相对更新时间，成功/失败均弹窗反馈）与 **`Delete Profile`**（二次确认删除配置条目及本地缓存文件），`More` 中不再保留重复项。
+- **彻底移除 `rustydialogs`，手写精简 Win32 原生弹窗**：
+  - 使用 `MessageBoxW` 与内存 `DLGTEMPLATE`（`DialogBoxIndirectParamW`）原生实现提示框、确认框与居中 `Name + Subscription URL` 双输入框，并自带标题栏/任务栏图标，零额外第三方弹窗依赖。
+- **系统代理与 TUN 互斥切换及菜单细节打磨**：
+  - `System Proxy` 与 `TUN Mode` 调整为互斥切换（开启其一自动关闭另一项，兼容旧版双开状态恢复，取消 UAC 提权时保留原有系统代理）；
+  - 状态首行改为 `Mihomo <version> Running(<port>)` 格式；`Start with Windows` 精简更名为 `Auto Start`。
 
 ---
 
@@ -29,5 +29,5 @@ Windows 10/11 平台下**开箱即用、100% 绿色便携（Portable）** 的 [m
 
 1. 下载 **`mihomo-tray-windows-amd64.zip`** 并解压到任意文件夹。
 2. 双击运行 **`mihomo-tray.exe`**。
-3. 右键点击托盘图标，选择 **`Set Subscription URL`** 填入你的订阅地址并保存，即可开始使用（左键单击托盘图标或点击 `Open WebUI` 打开控制面板）。
-4. 日后如需升级或替换内核/WebUI，先通过 `Quit` 退出托盘（停止内核），直接替换 `core/` 或 `ui/` 目录文件后再重新打开 `mihomo-tray.exe` 即可（上次的 `System Proxy` 等开关会自动恢复）。
+3. 右键点击托盘图标，选择 **`Profiles -> Set Subscription`** 填入订阅名称与链接并保存，即可开始使用（左键单击托盘图标或点击 `Open WebUI` 打开控制面板）。
+4. 日后如需升级或替换内核/WebUI，先通过 `Quit` 退出托盘（停止内核），直接替换 `core/` 或 `ui/` 目录文件后再重新打开 `mihomo-tray.exe` 即可（上次的 `System Proxy` / `TUN Mode` 等状态会自动恢复）。

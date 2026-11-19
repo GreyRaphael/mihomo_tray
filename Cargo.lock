@@ -1297,7 +1297,6 @@ dependencies = [
  "file-rotate",
  "open",
  "percent-encoding",
- "rustydialogs",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -2206,16 +2205,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rustydialogs"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ffb3f2ab660465ceedc7cc4dc4f3a94b205aedd084c44093b17e0f1b4a1b21"
-dependencies = [
- "raw-window-handle",
- "windows",
-]
 
 [[package]]
 name = "ryu"

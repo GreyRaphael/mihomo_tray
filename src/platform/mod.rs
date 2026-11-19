@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(not(windows))]
 mod stub;
+#[cfg(windows)]
+mod win_dialog;
 #[cfg(any(windows, test))]
 mod win_helpers;
 #[cfg(windows)]
@@ -110,65 +112,28 @@ pub fn run_elevated_self(args: &[String]) -> Result<i32, String> {
     imp::run_elevated_self(args)
 }
 
-fn can_show_dialog() -> bool {
-    !cfg!(test) && imp::can_show_dialog()
-}
-
-fn show_message_dialog(
-    icon: rustydialogs::MessageIcon,
-    title: &str,
-    message: &str,
-    buttons: rustydialogs::MessageButtons,
-) -> Option<rustydialogs::MessageResult> {
-    if !can_show_dialog() {
-        return None;
-    }
-    rustydialogs::MessageBox {
-        title,
-        message,
-        icon,
-        buttons,
-        owner: None,
-    }
-    .show()
-}
-
 /// Displays a blocking modal notice/error box to the user on desktop platforms.
 pub fn notify_error(title: &str, message: &str) {
     tracing::error!("{title}: {message}");
-
-    let _ = show_message_dialog(
-        rustydialogs::MessageIcon::Error,
-        title,
-        message,
-        rustydialogs::MessageButtons::Ok,
-    );
+    if !cfg!(test) {
+        imp::notify_error(title, message);
+    }
 }
 
 /// Displays a blocking modal informational box to the user on desktop platforms.
 pub fn notify_info(title: &str, message: &str) {
     tracing::info!("{title}: {message}");
-
-    let _ = show_message_dialog(
-        rustydialogs::MessageIcon::Info,
-        title,
-        message,
-        rustydialogs::MessageButtons::Ok,
-    );
+    if !cfg!(test) {
+        imp::notify_info(title, message);
+    }
 }
 
 /// Displays a blocking modal confirmation (Yes/No) returning `true` only on Yes.
 pub fn confirm_yes_no(title: &str, message: &str) -> bool {
-    if !can_show_dialog() {
-        tracing::warn!("Confirmation dialog skipped (no native backend): {title}: {message}");
+    if cfg!(test) {
         return false;
     }
-    show_message_dialog(
-        rustydialogs::MessageIcon::Warning,
-        title,
-        message,
-        rustydialogs::MessageButtons::YesNo,
-    ) == Some(rustydialogs::MessageResult::Yes)
+    imp::confirm_yes_no(title, message)
 }
 
 /// Writes UTF-8 text to the OS clipboard.
@@ -200,21 +165,15 @@ pub fn is_tray_menu_open() -> bool {
 
 /// Prompts the user with a simple modal text input box for a subscription URL.
 pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
-    if !can_show_dialog() {
-        tracing::warn!("No native text input backend available on this system");
+    if cfg!(test) {
         return None;
     }
 
-    imp::with_dialog_icon(|| {
-        rustydialogs::TextInput {
-            title: crate::text::PROMPT_SUBSCRIPTION_TITLE,
-            message: crate::text::PROMPT_SUBSCRIPTION_HINT,
-            value: current.unwrap_or(""),
-            mode: rustydialogs::TextInputMode::SingleLine,
-            owner: None,
-        }
-        .show()
-    })
+    imp::prompt_inputs(
+        crate::text::PROMPT_SUBSCRIPTION_TITLE,
+        &[(crate::text::PROMPT_SUBSCRIPTION_HINT, current.unwrap_or(""))],
+    )
+    .and_then(|mut values| values.pop())
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty())
 }

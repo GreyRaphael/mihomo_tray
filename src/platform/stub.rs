@@ -57,26 +57,16 @@ pub fn is_tray_menu_open() -> bool {
     false
 }
 
-/// Guards `rustydialogs`'s Linux backend `LazyLock`, which panics if no
-/// `kdialog`/`zenity` executable is available or when running headless.
-pub fn can_show_dialog() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return false;
-        }
-        if let Ok(backend) = std::env::var("RUSTY_DIALOGS_BACKEND") {
-            return matches!(backend.as_str(), "kdialog" | "zenity")
-                && which::which(&backend).is_ok();
-        }
-        which::which("kdialog").is_ok() || which::which("zenity").is_ok()
-    }
+pub fn notify_error(_title: &str, _message: &str) {}
+
+pub fn notify_info(_title: &str, _message: &str) {}
+
+pub fn confirm_yes_no(title: &str, message: &str) -> bool {
+    tracing::warn!("Confirmation dialog skipped on non-Windows host: {title}: {message}");
+    false
 }
 
-pub fn with_dialog_icon<T>(f: impl FnOnce() -> T) -> T {
-    f()
+pub fn prompt_inputs(_title: &str, _fields: &[(&str, &str)]) -> Option<Vec<String>> {
+    tracing::warn!("Native input dialog is Windows-only");
+    None
 }

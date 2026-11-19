@@ -5,7 +5,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
@@ -20,12 +20,12 @@ use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GUI_INMENUMODE, GUI_POPUPMENUMODE, GUITHREADINFO, GetClassNameW,
-    GetGUIThreadInfo, HCBT_ACTIVATE, HHOOK, ICON_BIG, ICON_SMALL, IDI_INFORMATION, LoadIconW,
-    SW_HIDE, SendMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT, WM_SETICON,
+    GUI_INMENUMODE, GUI_POPUPMENUMODE, GUITHREADINFO, GetGUIThreadInfo, SW_HIDE,
 };
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+
+pub use super::win_dialog::{confirm_yes_no, notify_error, notify_info, prompt_inputs};
 
 const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const SCOOP_SHIM_MAX_BYTES: u64 = 64 * 1024;
@@ -221,68 +221,6 @@ pub fn is_tray_menu_open() -> bool {
         }
         (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0
     }
-}
-
-pub fn can_show_dialog() -> bool {
-    true
-}
-
-/// Attaches the Windows information icon to `rustydialogs::TextInput` (`#32770`)
-/// while it runs on the calling thread.
-pub fn with_dialog_icon<T>(f: impl FnOnce() -> T) -> T {
-    struct HookGuard(HHOOK);
-    impl Drop for HookGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { UnhookWindowsHookEx(self.0) };
-            }
-        }
-    }
-
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_CBT,
-            Some(dialog_icon_cbt_proc),
-            std::ptr::null_mut(),
-            GetCurrentThreadId(),
-        )
-    };
-    let _guard = HookGuard(hook);
-    f()
-}
-
-unsafe extern "system" fn dialog_icon_cbt_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if code == HCBT_ACTIVATE as i32 {
-        let hwnd = wparam as HWND;
-        if !hwnd.is_null() && is_dialog_class(hwnd) {
-            let icon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_INFORMATION) };
-            if !icon.is_null() {
-                unsafe {
-                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
-                    SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
-                }
-            }
-        }
-    }
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
-}
-
-fn is_dialog_class(hwnd: HWND) -> bool {
-    const DIALOG_CLASS: [u16; 6] = [
-        b'#' as u16,
-        b'3' as u16,
-        b'2' as u16,
-        b'7' as u16,
-        b'7' as u16,
-        b'0' as u16,
-    ];
-    let mut class_name = [0u16; 16];
-    let len = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
-    len == DIALOG_CLASS.len() as i32 && class_name[..DIALOG_CLASS.len()] == DIALOG_CLASS
 }
 
 fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {

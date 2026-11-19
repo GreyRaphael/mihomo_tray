@@ -35,7 +35,7 @@ pub const STATUS_STARTING_CORE: &str = "Starting mihomo core...";
 pub const STATUS_WAITING_CONTROLLER: &str = "Waiting for mihomo controller...";
 pub const STATUS_RESTARTING_CORE: &str = "Restarting mihomo core...";
 pub const STATUS_ELEVATING_CORE: &str = "Waiting for elevation prompt...";
-pub const STATUS_REFRESHING_SUBSCRIPTION: &str = "Refreshing subscription...";
+pub const STATUS_SWITCHING_PROFILE: &str = "Switching profile...";
 pub const STATUS_UPDATING_SUBSCRIPTION: &str = "Updating subscription...";
 
 pub const ERR_ALREADY_RUNNING: &str =
@@ -63,7 +63,7 @@ pub const ERR_LOCATE_ELEVATE_PROCESS: &str =
 pub const ERR_MULTIPLE_EXTERNAL_CORES: &str =
     "Multiple external mihomo processes are running; stop them before restarting.";
 pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
-    "No subscription provider configured. Use Set Subscription URL first.";
+    "No subscription profile configured. Use Profiles -> Set Subscription first.";
 pub const ERR_SUBSCRIPTION_TASK_BUSY: &str =
     "A subscription update is already in progress; try again shortly.";
 pub const ERR_INVALID_PROFILE_NAME: &str =
@@ -80,10 +80,26 @@ pub const ERR_CONFLICTING_EXT_UI_ARG: &str =
 pub const TITLE_VERSION: &str = "Version";
 pub const TITLE_CONFIRM_STOP: &str = "Confirm Stop Core";
 pub const TITLE_QUIT_ANYWAY: &str = "Core Still Running";
+pub const TITLE_UPDATE_SUBSCRIPTION: &str = "Update Subscription";
+pub const TITLE_DELETE_PROFILE: &str = "Delete Profile";
 
-pub const PROMPT_SUBSCRIPTION_TITLE: &str = "Set Subscription URL";
-pub const PROMPT_SUBSCRIPTION_HINT: &str =
-    "Enter your subscription link (auto-updates every 12 hours):";
+pub const PROMPT_SUBSCRIPTION_TITLE: &str = "Set Subscription";
+pub const PROMPT_PROFILE_NAME_LABEL: &str = "Name:";
+pub const PROMPT_SUBSCRIPTION_URL_LABEL: &str = "Subscription URL:";
+
+pub fn format_confirm_delete_profile(name: &str) -> String {
+    format!(
+        "Delete profile '{name}'?\n\nThis removes the subscription from config.yaml and deletes its cached provider file."
+    )
+}
+
+pub fn format_subscription_updated(name: &str) -> String {
+    format!("Subscription '{name}' updated successfully.")
+}
+
+pub fn format_subscription_update_failed(name: &str, err: &str) -> String {
+    format!("Failed to update subscription '{name}':\n\n{err}")
+}
 
 pub fn format_confirm_quit_anyway(err: &str) -> String {
     format!(

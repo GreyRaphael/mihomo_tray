@@ -7,32 +7,29 @@ use serde::Deserialize;
 use yaml_edit::{Document, Mapping, MappingBuilder, Sequence, SequenceBuilder};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../assets/config.sample.yaml");
-pub(crate) const SUBSCRIPTION_PROVIDER_NAME: &str = "subscription";
 const SUBSCRIPTION_INTERVAL_SECS: u64 = 43_200; // 12 hours
-pub(crate) const SUBSCRIPTION_LOCAL_PATH: &str = "./providers/subscription.yaml";
 pub(crate) const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 const HEALTH_CHECK_INTERVAL_SECS: i64 = 300;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileEntry {
     pub name: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub url: String,
     pub path: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProfilesOverview {
     pub profiles: Vec<ProfileEntry>,
     pub active: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteProfileOutcome {
     pub deleted_path: Option<String>,
     pub next_active: Option<String>,
+    pub next_active_path: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -141,22 +138,7 @@ pub fn ensure_default_config(path: &Path) {
     crate::config::ensure_template_file(path, DEFAULT_CONFIG_TEMPLATE);
 }
 
-/// Reads the currently configured legacy subscription URL (`proxy-providers.subscription.url`) if present.
-pub fn read_subscription_url(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let clean = crate::config::strip_utf8_bom(&text);
-    let doc = Document::from_str(clean).ok()?;
-    doc.get_mapping("proxy-providers")?
-        .get_mapping(SUBSCRIPTION_PROVIDER_NAME)?
-        .get("url")?
-        .as_scalar()
-        .map(|s| s.as_string())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Reads all HTTP subscription profiles and the active profile directly from `config.yaml`.
-#[allow(dead_code)]
 pub fn read_profiles(path: &Path) -> ProfilesOverview {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ProfilesOverview::default();
@@ -169,11 +151,6 @@ pub fn read_profiles(path: &Path) -> ProfilesOverview {
         return ProfilesOverview::default();
     };
     extract_profiles(&root_map)
-}
-
-/// Legacy single-subscription entrypoint (replaced in Phase 3 by `upsert_profile`).
-pub fn apply_subscription_url(path: &Path, raw_url: &str) -> Result<(), String> {
-    upsert_profile(path, SUBSCRIPTION_PROVIDER_NAME, raw_url).map(|_| ())
 }
 
 /// Inserts or updates a named HTTP subscription profile under `proxy-providers.<name>`,
@@ -216,7 +193,6 @@ pub fn upsert_profile(
 }
 
 /// Activates an existing profile exclusively in `config.yaml` and returns its local cache path.
-#[allow(dead_code)]
 pub fn switch_profile(path: &Path, name: &str) -> Result<String, String> {
     edit_config_yaml(path, false, |root_map| {
         let overview = extract_profiles(root_map);
@@ -235,7 +211,6 @@ pub fn switch_profile(path: &Path, name: &str) -> Result<String, String> {
 
 /// Removes a profile from `config.yaml`, rewires groups to the next remaining profile if it was
 /// active (or clears managed `use:` entries if it was the last), and returns cleanup metadata.
-#[allow(dead_code)]
 pub fn delete_profile(path: &Path, name: &str) -> Result<DeleteProfileOutcome, String> {
     edit_config_yaml(path, false, |root_map| {
         let overview = extract_profiles(root_map);
@@ -247,17 +222,21 @@ pub fn delete_profile(path: &Path, name: &str) -> Result<DeleteProfileOutcome, S
         let deleted_path = Some(entry.path.clone());
         let managed: Vec<String> = overview.profiles.iter().map(|p| p.name.clone()).collect();
 
-        let remaining: Vec<String> = overview
+        let remaining: Vec<&ProfileEntry> = overview
             .profiles
             .iter()
             .filter(|p| p.name != name)
-            .map(|p| p.name.clone())
             .collect();
-        let next_active = if overview.active.as_deref() == Some(name) {
-            remaining.first().cloned()
+        let next_entry = if overview.active.as_deref() == Some(name) {
+            remaining.first().copied()
         } else {
-            overview.active.filter(|a| remaining.iter().any(|r| r == a))
+            overview
+                .active
+                .as_deref()
+                .and_then(|a| remaining.iter().copied().find(|r| r.name == a))
         };
+        let next_active = next_entry.map(|e| e.name.clone());
+        let next_active_path = next_entry.map(|e| e.path.clone());
 
         if let Some(providers_map) = root_map.get_mapping("proxy-providers") {
             providers_map.remove(name);
@@ -270,6 +249,7 @@ pub fn delete_profile(path: &Path, name: &str) -> Result<DeleteProfileOutcome, S
         Ok(DeleteProfileOutcome {
             deleted_path,
             next_active,
+            next_active_path,
         })
     })
 }
@@ -632,11 +612,10 @@ external-ui: ./ui
         let dir = crate::config::test_temp_dir("sub_test");
         let cfg = dir.join("config.yaml");
 
-        apply_subscription_url(&cfg, "https://example.com/sub?token=abc").unwrap();
-        assert_eq!(
-            read_subscription_url(&cfg).as_deref(),
-            Some("https://example.com/sub?token=abc")
-        );
+        upsert_profile(&cfg, "subscription", "https://example.com/sub?token=abc").unwrap();
+        let ov = read_profiles(&cfg);
+        assert_eq!(ov.profiles.len(), 1);
+        assert_eq!(ov.profiles[0].url, "https://example.com/sub?token=abc");
 
         let text = std::fs::read_to_string(&cfg).unwrap();
         let root: Value = serde_yaml_ng::from_str(&text).unwrap();
@@ -645,13 +624,13 @@ external-ui: ./ui
         assert_eq!(sub["path"].as_str(), Some("./providers/subscription.yaml"));
 
         let groups = root["proxy-groups"].as_sequence().unwrap();
-        for name in ["🚀Proxy", "⚡Auto", "🚑Fallback"] {
+        for name in ["🚀Proxy", "⚡Auto", "🚑Fallback", "🤖AI"] {
             let group = groups
                 .iter()
                 .find(|g| g["name"].as_str() == Some(name))
                 .unwrap();
             assert_eq!(group["use"][0].as_str(), Some("subscription"));
-            if name != "🚀Proxy" {
+            if matches!(name, "⚡Auto" | "🚑Fallback") {
                 assert!(group.get("proxies").is_none());
             }
         }
@@ -675,7 +654,7 @@ external-ui: ./ui
             Some("mrs")
         );
 
-        assert!(apply_subscription_url(&cfg, "ftp://invalid").is_err());
+        assert!(upsert_profile(&cfg, "subscription", "ftp://invalid").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -689,7 +668,7 @@ external-ui: ./ui
         ensure_default_config(&cfg);
         assert_eq!(std::fs::read(&cfg).unwrap(), raw_gbk);
 
-        let err = apply_subscription_url(&cfg, "https://example.com/sub").unwrap_err();
+        let err = upsert_profile(&cfg, "subscription", "https://example.com/sub").unwrap_err();
         assert!(err.contains("failed to read"));
         assert_eq!(std::fs::read(&cfg).unwrap(), raw_gbk);
 
@@ -720,18 +699,18 @@ proxy-groups:
 ";
         std::fs::write(&cfg, initial).unwrap();
 
-        apply_subscription_url(&cfg, "https://example.com/sub?a=1&b=2").unwrap();
-        apply_subscription_url(&cfg, "https://example.com/sub2").unwrap();
+        upsert_profile(&cfg, "subscription", "https://example.com/sub?a=1&b=2").unwrap();
+        upsert_profile(&cfg, "subscription", "https://example.com/sub2").unwrap();
 
         let updated = std::fs::read_to_string(&cfg).unwrap();
         assert!(updated.contains("# Custom header comment"));
         assert!(updated.contains("# keep inline comment"));
         assert!(updated.contains("# Group section comment"));
         assert_eq!(
-            read_subscription_url(&cfg).as_deref(),
-            Some("https://example.com/sub2")
+            read_profiles(&cfg).profiles[0].url,
+            "https://example.com/sub2"
         );
-        assert!(apply_subscription_url(&cfg, "https://").is_err());
+        assert!(upsert_profile(&cfg, "subscription", "https://").is_err());
 
         // Custom keys inside `proxy-providers.subscription` must survive URL updates.
         let with_custom = "\
@@ -744,13 +723,13 @@ proxy-providers:
       udp: true
 ";
         std::fs::write(&cfg, with_custom).unwrap();
-        apply_subscription_url(&cfg, "https://example.com/new").unwrap();
+        upsert_profile(&cfg, "subscription", "https://example.com/new").unwrap();
         let after_custom = std::fs::read_to_string(&cfg).unwrap();
         assert!(after_custom.contains("filter: \"HK|SG\""));
         assert!(after_custom.contains("udp: true"));
         assert_eq!(
-            read_subscription_url(&cfg).as_deref(),
-            Some("https://example.com/new")
+            read_profiles(&cfg).profiles[0].url,
+            "https://example.com/new"
         );
 
         let parsed: Value = serde_yaml_ng::from_str(&updated).unwrap();

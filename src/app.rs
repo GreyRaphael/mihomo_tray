@@ -40,6 +40,7 @@ pub struct MihomoTrayApp {
     last_click: Option<Instant>,
     version_dialog_open: Arc<AtomicBool>,
     prompt_dialog_open: Arc<AtomicBool>,
+    delete_dialog_open: Arc<AtomicBool>,
     open_error_dialog_open: Arc<AtomicBool>,
     quitting: bool,
     restart_on_exit: bool,
@@ -74,6 +75,7 @@ impl MihomoTrayApp {
             last_click: None,
             version_dialog_open: Arc::new(AtomicBool::new(false)),
             prompt_dialog_open: Arc::new(AtomicBool::new(false)),
+            delete_dialog_open: Arc::new(AtomicBool::new(false)),
             open_error_dialog_open: Arc::new(AtomicBool::new(false)),
             quitting: false,
             restart_on_exit: false,
@@ -210,7 +212,21 @@ impl MihomoTrayApp {
                 self.send_worker(WorkerCommand::TestGroupLatency(group));
             }
             MenuAction::RefreshSubscription => {
-                self.send_worker(WorkerCommand::RefreshSubscriptions);
+                let target = {
+                    let snap = self.shared.lock().unwrap();
+                    snap.active_profile
+                        .clone()
+                        .or_else(|| snap.profiles.first().cloned())
+                };
+                if let Some(name) = target {
+                    self.send_worker(WorkerCommand::UpdateSubscription(name));
+                } else {
+                    self.spawn_notice_dialog(
+                        crate::text::TITLE_UPDATE_SUBSCRIPTION.to_string(),
+                        crate::text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string(),
+                        true,
+                    );
+                }
             }
             MenuAction::CopyEnvVars => self.send_worker(WorkerCommand::CopyEnvVars),
             MenuAction::RestartCore => self.send_worker(WorkerCommand::RestartCore),
@@ -288,13 +304,36 @@ impl MihomoTrayApp {
         let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;
         };
-        let cfg_path = self.resolved_config_or_default();
         Self::spawn_singleton_dialog(&self.prompt_dialog_open, "sub-prompt", move || {
-            let current = mihomo::read_subscription_url(&cfg_path);
-            if let Some(url) = platform::prompt_subscription_url(current.as_deref()) {
-                let _ = tx.send(WorkerCommand::SetSubscriptionUrl(url));
+            if let Some((name, url)) = platform::prompt_subscription() {
+                let _ = tx.send(WorkerCommand::SetSubscription { name, url });
             }
         });
+    }
+
+    #[allow(dead_code)]
+    fn confirm_and_delete_profile(&self, name: String) {
+        let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
+            return;
+        };
+        Self::spawn_singleton_dialog(&self.delete_dialog_open, "delete-profile", move || {
+            let msg = crate::text::format_confirm_delete_profile(&name);
+            if platform::confirm_yes_no(crate::text::TITLE_DELETE_PROFILE, &msg) {
+                let _ = tx.send(WorkerCommand::DeleteProfile(name));
+            }
+        });
+    }
+
+    fn spawn_notice_dialog(&self, title: String, message: String, is_error: bool) {
+        let _ = std::thread::Builder::new()
+            .name("notice-dialog".to_string())
+            .spawn(move || {
+                if is_error {
+                    platform::notify_error(&title, &message);
+                } else {
+                    platform::notify_info(&title, &message);
+                }
+            });
     }
 
     fn apply_snapshot(&mut self, rebuild_menu: bool) {
@@ -436,6 +475,11 @@ impl ApplicationHandler<AppEvent> for MihomoTrayApp {
             AppEvent::TrayIcon(ev) => self.handle_tray_event(&ev),
             AppEvent::Menu(ev) => self.handle_menu_event(ev.id.as_ref()),
             AppEvent::SnapshotUpdated { rebuild_menu } => self.apply_snapshot(rebuild_menu),
+            AppEvent::ShowNotice {
+                title,
+                message,
+                is_error,
+            } => self.spawn_notice_dialog(title, message, is_error),
             AppEvent::QuitCompleted => {
                 event_loop.exit();
             }

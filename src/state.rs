@@ -80,6 +80,8 @@ pub struct Snapshot {
     pub sysproxy: bool,
     pub autostart: bool,
     pub kernel_running: bool,
+    pub profiles: Vec<String>,
+    pub active_profile: Option<String>,
     pub groups: Vec<Group>,
     pub node_latency: BTreeMap<String, Option<u32>>,
     pub providers: Vec<Provider>,
@@ -135,6 +137,17 @@ impl Snapshot {
             .max()
     }
 
+    #[allow(dead_code)]
+    pub fn provider_updated_at(&self, name: &str) -> Option<i64> {
+        if !self.controller_ok {
+            return None;
+        }
+        self.providers
+            .iter()
+            .find(|p| p.refreshable() && p.name == name)
+            .and_then(|p| p.updated_at)
+    }
+
     pub fn tooltip(&self) -> String {
         let mut lines = vec![self.status_line()];
         if let Some(note) = &self.status_note {
@@ -169,11 +182,11 @@ impl Snapshot {
 /// Shared snapshot protected by a mutex so UI renders never block on HTTP calls.
 pub type SharedSnapshot = Arc<Mutex<Snapshot>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsyncTaskKind {
     LatencyTest { id: u64 },
-    RefreshSubscriptions { id: u64 },
-    ApplySubscription { id: u64, reload_ok: bool },
+    UpdateSubscription { id: u64, name: String },
+    ApplyProfile { id: u64, reload_ok: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -187,8 +200,15 @@ pub enum WorkerCommand {
     },
     UnfixGroup(String),
     TestGroupLatency(String),
-    RefreshSubscriptions,
-    SetSubscriptionUrl(String),
+    UpdateSubscription(String),
+    SetSubscription {
+        name: String,
+        url: String,
+    },
+    #[allow(dead_code)]
+    SwitchProfile(String),
+    #[allow(dead_code)]
+    DeleteProfile(String),
     CopyEnvVars,
     RestartCore,
     ToggleAutostart,
@@ -205,7 +225,14 @@ pub enum WorkerCommand {
 pub enum AppEvent {
     TrayIcon(TrayIconEvent),
     Menu(MenuEvent),
-    SnapshotUpdated { rebuild_menu: bool },
+    SnapshotUpdated {
+        rebuild_menu: bool,
+    },
+    ShowNotice {
+        title: String,
+        message: String,
+        is_error: bool,
+    },
     QuitCompleted,
     QuitCancelled,
 }

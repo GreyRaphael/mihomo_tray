@@ -163,17 +163,24 @@ pub fn is_tray_menu_open() -> bool {
     imp::is_tray_menu_open()
 }
 
-/// Prompts the user with a simple modal text input box for a subscription URL.
-pub fn prompt_subscription_url(current: Option<&str>) -> Option<String> {
+/// Prompts the user with a centered native modal containing empty `Name` and `Subscription URL`
+/// inputs. Returns `None` if cancelled or if either field is empty.
+pub fn prompt_subscription() -> Option<(String, String)> {
     if cfg!(test) {
         return None;
     }
 
-    imp::prompt_inputs(
+    let values = imp::prompt_inputs(
         crate::text::PROMPT_SUBSCRIPTION_TITLE,
-        &[(crate::text::PROMPT_SUBSCRIPTION_HINT, current.unwrap_or(""))],
-    )
-    .and_then(|mut values| values.pop())
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
+        &[
+            (crate::text::PROMPT_PROFILE_NAME_LABEL, ""),
+            (crate::text::PROMPT_SUBSCRIPTION_URL_LABEL, ""),
+        ],
+    )?;
+    if values.len() < 2 {
+        return None;
+    }
+    let name = values[0].trim().to_string();
+    let url = values[1].trim().to_string();
+    (!name.is_empty() && !url.is_empty()).then_some((name, url))
 }

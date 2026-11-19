@@ -4,7 +4,7 @@ mod lifecycle;
 mod state_sync;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -23,7 +23,7 @@ use crate::core::discover;
 use crate::core::process::RunningProcess;
 use crate::platform;
 use crate::state::{
-    self, AppEvent, AsyncTaskKind, Provider, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand,
+    self, AppEvent, AsyncTaskKind, ProxyMode, SharedSnapshot, Snapshot, WorkerCommand,
 };
 use crate::text;
 
@@ -203,6 +203,12 @@ enum RestoreStep {
     AbortOffline,
 }
 
+enum ProfileRefresh {
+    None,
+    UseCache { name: String, cache_path: PathBuf },
+    Force { name: String, cache_path: PathBuf },
+}
+
 #[derive(Default)]
 struct LiveState {
     controller_ok: bool,
@@ -295,6 +301,8 @@ struct Worker {
     state_sync: StateSync,
     core: CoreLifecycle,
     live: LiveState,
+    profiles: Vec<String>,
+    active_profile: Option<String>,
     shared: SharedSnapshot,
     proxy: UiNotifier,
     stop_requested: Arc<AtomicBool>,
@@ -316,11 +324,16 @@ impl Worker {
     ) -> (Self, mpsc::Receiver<WorkerCommand>) {
         let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let cfg = RuntimeConfig::new(portable_root, settings_path, settings, startup_error);
+        let overview = mihomo::read_profiles(&cfg.config_file);
+        let profiles: Vec<String> = overview.profiles.into_iter().map(|p| p.name).collect();
+        let active_profile = overview.active;
         {
             let mut snap = shared.lock().unwrap();
             snap.page_size = cfg.settings.groups.page_size;
             snap.resolved_config = Some(cfg.config_file.clone());
             snap.config_error = cfg.current_config_error();
+            snap.profiles = profiles.clone();
+            snap.active_profile = active_profile.clone();
         }
         let core = CoreLifecycle::new(Arc::clone(&stop_requested));
         let worker = Self {
@@ -328,6 +341,8 @@ impl Worker {
             state_sync: StateSync::default(),
             core,
             live: LiveState::default(),
+            profiles,
+            active_profile,
             shared,
             proxy,
             stop_requested,
@@ -388,6 +403,7 @@ impl Worker {
     fn startup(&mut self) {
         self.cfg.refresh_paths();
         self.sync_runtime_record_and_errors();
+        self.refresh_profiles_from_disk();
         self.state_sync.load_initial(&self.cfg.home_dir);
         self.cfg.refresh_autostart_cache();
         let running = self.core.list_running(&self.cfg);
@@ -426,6 +442,16 @@ impl Worker {
     fn reload_paths_and_runtime(&mut self) {
         self.cfg.reload_from_disk();
         self.sync_runtime_record_and_errors();
+        self.refresh_profiles_from_disk();
+    }
+
+    fn refresh_profiles_from_disk(&mut self) {
+        let overview = mihomo::read_profiles(&self.cfg.config_file);
+        self.profiles = overview.profiles.into_iter().map(|p| p.name).collect();
+        self.active_profile = overview.active;
+        let mut snap = self.shared.lock().unwrap();
+        snap.profiles = self.profiles.clone();
+        snap.active_profile = self.active_profile.clone();
     }
 
     fn sync_runtime_record_and_errors(&mut self) {
@@ -484,14 +510,13 @@ impl Worker {
             .spawn(move || {
                 struct PanicGuard {
                     tx: Sender<WorkerCommand>,
-                    kind: AsyncTaskKind,
-                    sent: bool,
+                    kind: Option<AsyncTaskKind>,
                 }
                 impl Drop for PanicGuard {
                     fn drop(&mut self) {
-                        if !self.sent {
+                        if let Some(kind) = self.kind.take() {
                             let _ = self.tx.send(WorkerCommand::AsyncDone {
-                                kind: self.kind,
+                                kind,
                                 error: Some("background task panicked".to_string()),
                             });
                         }
@@ -499,11 +524,10 @@ impl Worker {
                 }
                 let mut guard = PanicGuard {
                     tx: tx.clone(),
-                    kind: fallback_kind,
-                    sent: false,
+                    kind: Some(fallback_kind),
                 };
                 let (kind, error) = task();
-                guard.sent = true;
+                guard.kind = None;
                 let _ = tx.send(WorkerCommand::AsyncDone { kind, error });
             })
             .is_err()
@@ -540,83 +564,164 @@ impl Worker {
         }
     }
 
-    fn start_refresh_subscriptions(&mut self) -> Result<CommandOutcome, ActionError> {
-        let client = self.core.require_client()?.clone();
+    fn show_notice(&self, title: &str, message: String, is_error: bool) {
+        self.proxy.send(AppEvent::ShowNotice {
+            title: title.to_string(),
+            message,
+            is_error,
+        });
+    }
+
+    fn start_update_subscription(&mut self, name: String) -> Result<CommandOutcome, ActionError> {
+        let client = match self.core.require_client() {
+            Ok(client) => client.clone(),
+            Err(err) => {
+                self.show_notice(
+                    text::TITLE_UPDATE_SUBSCRIPTION,
+                    text::format_subscription_update_failed(&name, &err),
+                    true,
+                );
+                return Err(err.into());
+            }
+        };
         if self.sub_task.is_active() {
+            self.show_notice(
+                text::TITLE_UPDATE_SUBSCRIPTION,
+                text::ERR_SUBSCRIPTION_TASK_BUSY.to_string(),
+                true,
+            );
             return Ok(CommandOutcome::KeepError);
         }
         let id = self.sub_task.begin();
+        let fallback_name = name.clone();
+        let err_name = name.clone();
         if self.spawn_background_task(
-            "mihomo-sub-refresh",
-            AsyncTaskKind::RefreshSubscriptions { id },
-            Some(text::STATUS_REFRESHING_SUBSCRIPTION),
+            "mihomo-sub-update",
+            AsyncTaskKind::UpdateSubscription {
+                id,
+                name: fallback_name,
+            },
+            Some(text::STATUS_UPDATING_SUBSCRIPTION),
             move || {
-                let err = (|| -> Result<(), String> {
-                    let providers = client.get_providers()?.providers;
-                    let refreshable: Vec<String> = providers
-                        .into_iter()
-                        .filter(Provider::refreshable)
-                        .map(|p| p.name)
-                        .collect();
-                    if refreshable.is_empty() {
-                        return Err(text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string());
-                    }
-                    for name in refreshable {
-                        client.refresh_provider(&name)?;
-                    }
-                    Ok(())
-                })()
-                .err();
-                (AsyncTaskKind::RefreshSubscriptions { id }, err)
+                let err = client.refresh_provider(&name).err();
+                (AsyncTaskKind::UpdateSubscription { id, name }, err)
             },
         ) {
             Ok(CommandOutcome::ClearError)
         } else {
             self.sub_task.finish(id);
+            self.show_notice(
+                text::TITLE_UPDATE_SUBSCRIPTION,
+                text::format_subscription_update_failed(&err_name, "failed to spawn update worker"),
+                true,
+            );
             Ok(CommandOutcome::KeepError)
         }
     }
 
-    fn set_subscription_url(&mut self, url: &str) -> Result<(), ActionError> {
+    fn set_subscription(&mut self, name: &str, url: &str) -> Result<(), ActionError> {
         if self.sub_task.is_active() {
             return Err(ActionError::general(text::ERR_SUBSCRIPTION_TASK_BUSY));
         }
         let saved = self.capture_live_or_persisted_state();
-        mihomo::apply_subscription_url(&self.cfg.config_file, url)?;
+        let (name, local_path) = mihomo::upsert_profile(&self.cfg.config_file, name, url)?;
+        self.refresh_profiles_from_disk();
+        let cache_path = resolve_provider_file(&self.cfg.home_dir, &local_path);
+        self.apply_profile_change(
+            saved,
+            ProfileRefresh::Force { name, cache_path },
+            text::STATUS_UPDATING_SUBSCRIPTION,
+            true,
+        )
+    }
+
+    fn switch_profile(&mut self, name: &str) -> Result<(), ActionError> {
+        if self.sub_task.is_active() {
+            return Err(ActionError::general(text::ERR_SUBSCRIPTION_TASK_BUSY));
+        }
+        if self.active_profile.as_deref() == Some(name) {
+            return Ok(());
+        }
+        let saved = self.capture_live_or_persisted_state();
+        let local_path = mihomo::switch_profile(&self.cfg.config_file, name)?;
+        self.refresh_profiles_from_disk();
+        let cache_path = resolve_provider_file(&self.cfg.home_dir, &local_path);
+        self.apply_profile_change(
+            saved,
+            ProfileRefresh::UseCache {
+                name: name.to_string(),
+                cache_path,
+            },
+            text::STATUS_SWITCHING_PROFILE,
+            false,
+        )
+    }
+
+    fn delete_profile(&mut self, name: &str) -> Result<(), ActionError> {
+        if self.sub_task.is_active() {
+            return Err(ActionError::general(text::ERR_SUBSCRIPTION_TASK_BUSY));
+        }
+        let saved = self.capture_live_or_persisted_state();
+        let outcome = mihomo::delete_profile(&self.cfg.config_file, name)?;
+        if let Some(deleted_path) = outcome.deleted_path {
+            remove_provider_file_safely(&self.cfg.home_dir, &deleted_path);
+        }
+        self.refresh_profiles_from_disk();
+        let refresh = match (outcome.next_active, outcome.next_active_path) {
+            (Some(next), Some(path)) => ProfileRefresh::UseCache {
+                name: next,
+                cache_path: resolve_provider_file(&self.cfg.home_dir, &path),
+            },
+            _ => ProfileRefresh::None,
+        };
+        self.apply_profile_change(saved, refresh, text::STATUS_SWITCHING_PROFILE, false)
+    }
+
+    fn apply_profile_change(
+        &mut self,
+        saved: PersistedState,
+        refresh: ProfileRefresh,
+        status_note: &'static str,
+        start_if_stopped: bool,
+    ) -> Result<(), ActionError> {
         if let Some(client) = self.core.client().cloned().filter(|c| c.probe().is_ok()) {
             let id = self.sub_task.begin();
             self.state_sync.wait_sub_reload(saved);
-            let sub_cache = self
-                .cfg
-                .home_dir
-                .join(mihomo::SUBSCRIPTION_LOCAL_PATH.trim_start_matches("./"));
             if !self.spawn_background_task(
-                "mihomo-sub-apply",
-                AsyncTaskKind::ApplySubscription {
+                "mihomo-profile-apply",
+                AsyncTaskKind::ApplyProfile {
                     id,
                     reload_ok: false,
                 },
-                Some(text::STATUS_UPDATING_SUBSCRIPTION),
+                Some(status_note),
                 move || {
-                    let had_cached_sub = sub_cache.is_file();
+                    let had_cache = match &refresh {
+                        ProfileRefresh::Force { cache_path, .. }
+                        | ProfileRefresh::UseCache { cache_path, .. } => cache_path.is_file(),
+                        ProfileRefresh::None => false,
+                    };
                     if let Err(err) = client.reload_configs() {
                         return (
-                            AsyncTaskKind::ApplySubscription {
+                            AsyncTaskKind::ApplyProfile {
                                 id,
                                 reload_ok: false,
                             },
                             Some(err),
                         );
                     }
-                    let err = if had_cached_sub || !sub_cache.is_file() {
-                        client
-                            .refresh_provider(mihomo::SUBSCRIPTION_PROVIDER_NAME)
-                            .err()
-                    } else {
-                        None
+                    let err = match refresh {
+                        ProfileRefresh::Force { name, cache_path }
+                            if had_cache || !cache_path.is_file() =>
+                        {
+                            client.refresh_provider(&name).err()
+                        }
+                        ProfileRefresh::UseCache { name, cache_path } if !cache_path.is_file() => {
+                            client.refresh_provider(&name).err()
+                        }
+                        _ => None,
                     };
                     (
-                        AsyncTaskKind::ApplySubscription {
+                        AsyncTaskKind::ApplyProfile {
                             id,
                             reload_ok: true,
                         },
@@ -631,8 +736,11 @@ impl Worker {
         }
         self.sub_task.invalidate();
         self.set_status_note(None);
-        self.state_sync.arm_ready_restore(saved);
-        self.start_core_after_reload()
+        if start_if_stopped {
+            self.state_sync.arm_ready_restore(saved);
+            return self.start_core_after_reload();
+        }
+        Ok(())
     }
 
     fn handle_async_done(
@@ -653,18 +761,42 @@ impl Worker {
                     None => Ok(CommandOutcome::KeepError),
                 }
             }
-            AsyncTaskKind::RefreshSubscriptions { id }
-            | AsyncTaskKind::ApplySubscription { id, .. } => {
+            AsyncTaskKind::UpdateSubscription { id, name } => {
                 if !self.sub_task.finish(id) {
                     if let Some(err) = error {
-                        tracing::debug!("Ignoring stale subscription task error: {err}");
+                        tracing::debug!("Ignoring stale subscription update error: {err}");
                     }
                     return Ok(CommandOutcome::KeepError);
                 }
                 self.set_status_note(None);
-                if let AsyncTaskKind::ApplySubscription { reload_ok, .. } = kind {
-                    self.state_sync.finish_sub_reload(reload_ok);
+                match error {
+                    Some(err) => {
+                        self.show_notice(
+                            text::TITLE_UPDATE_SUBSCRIPTION,
+                            text::format_subscription_update_failed(&name, &err),
+                            true,
+                        );
+                        Err(ActionError::general(err))
+                    }
+                    None => {
+                        self.show_notice(
+                            text::TITLE_UPDATE_SUBSCRIPTION,
+                            text::format_subscription_updated(&name),
+                            false,
+                        );
+                        Ok(CommandOutcome::KeepError)
+                    }
                 }
+            }
+            AsyncTaskKind::ApplyProfile { id, reload_ok } => {
+                if !self.sub_task.finish(id) {
+                    if let Some(err) = error {
+                        tracing::debug!("Ignoring stale profile apply error: {err}");
+                    }
+                    return Ok(CommandOutcome::KeepError);
+                }
+                self.set_status_note(None);
+                self.state_sync.finish_sub_reload(reload_ok);
                 match error {
                     Some(err) => Err(ActionError::general(err)),
                     None => Ok(CommandOutcome::KeepError),
@@ -693,9 +825,15 @@ impl Worker {
                 .unfix_group(&group)
                 .map(|()| CommandOutcome::ClearError)?),
             WorkerCommand::TestGroupLatency(group) => self.start_test_group_latency(group),
-            WorkerCommand::RefreshSubscriptions => self.start_refresh_subscriptions(),
-            WorkerCommand::SetSubscriptionUrl(url) => self
-                .set_subscription_url(&url)
+            WorkerCommand::UpdateSubscription(name) => self.start_update_subscription(name),
+            WorkerCommand::SetSubscription { name, url } => self
+                .set_subscription(&name, &url)
+                .map(|()| CommandOutcome::ClearError),
+            WorkerCommand::SwitchProfile(name) => self
+                .switch_profile(&name)
+                .map(|()| CommandOutcome::ClearError),
+            WorkerCommand::DeleteProfile(name) => self
+                .delete_profile(&name)
                 .map(|()| CommandOutcome::ClearError),
             WorkerCommand::CopyEnvVars => self.copy_env_vars().map(|()| CommandOutcome::ClearError),
             WorkerCommand::RestartCore => self
@@ -1055,6 +1193,8 @@ impl Worker {
             })
             .flatten();
         snap.resolved_config = Some(self.cfg.config_file.clone());
+        snap.profiles = self.profiles.clone();
+        snap.active_profile = self.active_profile.clone();
         snap.page_size = self.cfg.settings.groups.page_size;
     }
 
@@ -1073,6 +1213,34 @@ impl Worker {
         let msg = self.action_error.as_ref().map(|e| e.message.clone());
         let mut snap = self.shared.lock().unwrap();
         snap.action_error = msg;
+    }
+}
+
+fn resolve_provider_file(home_dir: &Path, raw_path: &str) -> PathBuf {
+    let trimmed = raw_path
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches(".\\");
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        home_dir.join(p)
+    }
+}
+
+fn remove_provider_file_safely(home_dir: &Path, raw_path: &str) {
+    let target = resolve_provider_file(home_dir, raw_path);
+    if let Ok(canon_home) = std::fs::canonicalize(home_dir)
+        && let Ok(canon_file) = std::fs::canonicalize(&target)
+        && canon_file.starts_with(&canon_home)
+        && canon_file.is_file()
+        && let Err(err) = std::fs::remove_file(&canon_file)
+    {
+        tracing::warn!(
+            "Failed to delete cached provider {}: {err}",
+            canon_file.display()
+        );
     }
 }
 
@@ -1305,21 +1473,25 @@ mod tests {
         );
         assert!(!worker.latency_task.is_active());
 
-        // Active subscription task blocks concurrent SetSubscriptionUrl and ignores stale errors.
+        // Active subscription task blocks concurrent SetSubscription and ignores stale errors.
         let old_sub = worker.sub_task.begin();
         worker.sub_task.invalidate();
         let active_sub = worker.sub_task.begin();
-        worker.set_status_note(Some(text::STATUS_REFRESHING_SUBSCRIPTION));
+        worker.set_status_note(Some(text::STATUS_UPDATING_SUBSCRIPTION));
         let busy_err = worker
-            .handle_command(WorkerCommand::SetSubscriptionUrl(
-                "https://example.com/sub".to_string(),
-            ))
+            .handle_command(WorkerCommand::SetSubscription {
+                name: "sub".to_string(),
+                url: "https://example.com/sub".to_string(),
+            })
             .unwrap_err();
         assert_eq!(busy_err.message, text::ERR_SUBSCRIPTION_TASK_BUSY);
         assert_eq!(
             worker
                 .handle_command(WorkerCommand::AsyncDone {
-                    kind: AsyncTaskKind::RefreshSubscriptions { id: old_sub },
+                    kind: AsyncTaskKind::UpdateSubscription {
+                        id: old_sub,
+                        name: "sub".to_string(),
+                    },
                     error: Some("stale sub err".to_string()),
                 })
                 .unwrap(),
@@ -1328,7 +1500,10 @@ mod tests {
         assert!(worker.sub_task.is_active());
         worker
             .handle_command(WorkerCommand::AsyncDone {
-                kind: AsyncTaskKind::RefreshSubscriptions { id: active_sub },
+                kind: AsyncTaskKind::UpdateSubscription {
+                    id: active_sub,
+                    name: "sub".to_string(),
+                },
                 error: None,
             })
             .unwrap();
@@ -1413,9 +1588,10 @@ mod tests {
         worker.live.tun = false;
 
         worker
-            .handle_command(WorkerCommand::SetSubscriptionUrl(
-                "https://example.com/sub".to_string(),
-            ))
+            .handle_command(WorkerCommand::SetSubscription {
+                name: "subscription".to_string(),
+                url: "https://example.com/sub".to_string(),
+            })
             .unwrap();
         // Live poll before AsyncDone must not revert saved mode; user SetMode during reload wins.
         let mut mid_cfg = CoreConfigs {
@@ -1935,6 +2111,197 @@ mod tests {
         let persisted = crate::config::state_store::load(&worker.cfg.home_dir).unwrap();
         assert!(!persisted.system_proxy);
         assert_eq!(persisted.tun, Some(true));
+
+        stop_mock_server(port);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switch_profile_uses_local_cache_and_delete_removes_provider_file() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        let root = crate::config::test_temp_dir("worker_profile_switch_delete");
+        let cfg_dir = root.join("config");
+        let prov_dir = cfg_dir.join("providers");
+        std::fs::create_dir_all(&prov_dir).unwrap();
+        let cfg_path = cfg_dir.join("config.yaml");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            &cfg_path,
+            format!("mixed-port: 7890\nmode: rule\nexternal-controller: 127.0.0.1:{port}\n"),
+        )
+        .unwrap();
+        mihomo::upsert_profile(&cfg_path, "Alpha", "https://example.com/a").unwrap();
+        mihomo::upsert_profile(&cfg_path, "Beta", "https://example.com/b").unwrap();
+        // Pre-seed Alpha cache so switching back to Alpha must reload without calling refresh_provider.
+        let alpha_cache = prov_dir.join("Alpha.yaml");
+        let beta_cache = prov_dir.join("Beta.yaml");
+        std::fs::write(&alpha_cache, "proxies: []\n").unwrap();
+        std::fs::write(&beta_cache, "proxies: []\n").unwrap();
+
+        let reload_hits = Arc::new(AtomicUsize::new(0));
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let r_srv = Arc::clone(&reload_hits);
+        let f_srv = Arc::clone(&refresh_hits);
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("POST /__stop ") {
+                    send_http_response(&mut stream, "200 OK", "");
+                    break;
+                }
+                if req.starts_with("GET /version ") {
+                    send_http_response(&mut stream, "200 OK", r#"{"version":"v1.19.0"}"#);
+                } else if req.starts_with("PUT /configs?force=true ") {
+                    r_srv.fetch_add(1, Ordering::AcqRel);
+                    send_http_response(&mut stream, "204 No Content", "");
+                } else if req.starts_with("PUT /providers/proxies/") {
+                    f_srv.fetch_add(1, Ordering::AcqRel);
+                    send_http_response(&mut stream, "204 No Content", "");
+                } else {
+                    send_http_response(&mut stream, "404 Not Found", "");
+                }
+            }
+        });
+
+        let (mut worker, rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker
+            .core
+            .set_client_for_test(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        assert_eq!(worker.active_profile.as_deref(), Some("Beta"));
+
+        // Switch to cached Alpha -> reloads only, zero provider network refresh.
+        worker
+            .handle_command(WorkerCommand::SwitchProfile("Alpha".to_string()))
+            .unwrap();
+        let done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(done).unwrap();
+        assert_eq!(worker.active_profile.as_deref(), Some("Alpha"));
+        assert_eq!(
+            shared.lock().unwrap().active_profile.as_deref(),
+            Some("Alpha")
+        );
+        assert_eq!(reload_hits.load(Ordering::Acquire), 1);
+        assert_eq!(refresh_hits.load(Ordering::Acquire), 0);
+
+        // Delete active Alpha -> deletes Alpha.yaml on disk and auto-switches to cached Beta.
+        worker
+            .handle_command(WorkerCommand::DeleteProfile("Alpha".to_string()))
+            .unwrap();
+        let done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(done).unwrap();
+        assert!(!alpha_cache.exists());
+        assert!(beta_cache.exists());
+        assert_eq!(worker.profiles, vec!["Beta".to_string()]);
+        assert_eq!(worker.active_profile.as_deref(), Some("Beta"));
+        assert_eq!(reload_hits.load(Ordering::Acquire), 2);
+        assert_eq!(refresh_hits.load(Ordering::Acquire), 0);
+
+        stop_mock_server(port);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_subscription_emits_notice_dialog_events_for_success_and_error() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let root = crate::config::test_temp_dir("worker_update_notice");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let fail_srv = Arc::clone(&fail_next);
+
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("POST /__stop ") {
+                    send_http_response(&mut stream, "200 OK", "");
+                    break;
+                }
+                if req.starts_with("PUT /providers/proxies/Alpha ") {
+                    if fail_srv.load(Ordering::Acquire) {
+                        send_http_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "upstream down",
+                        );
+                    } else {
+                        send_http_response(&mut stream, "204 No Content", "");
+                    }
+                } else {
+                    send_http_response(&mut stream, "404 Not Found", "");
+                }
+            }
+        });
+
+        let settings_path = crate::config::tray::settings_path(&root);
+        let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let (ui_tx, ui_rx) = mpsc::channel();
+        let (mut worker, rx) = Worker::new(
+            root.clone(),
+            settings_path,
+            TraySettings::default(),
+            Arc::clone(&shared),
+            UiNotifier::Channel(ui_tx),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        worker
+            .core
+            .set_client_for_test(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+
+        // 1. Success path emits non-error ShowNotice.
+        worker
+            .handle_command(WorkerCommand::UpdateSubscription("Alpha".to_string()))
+            .unwrap();
+        let done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.handle_command(done).unwrap();
+        let notices: Vec<(String, String, bool)> = ui_rx
+            .try_iter()
+            .filter_map(|ev| match ev {
+                AppEvent::ShowNotice {
+                    title,
+                    message,
+                    is_error,
+                } => Some((title, message, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0, text::TITLE_UPDATE_SUBSCRIPTION);
+        assert!(notices[0].1.contains("Alpha"));
+        assert!(!notices[0].2);
+
+        // 2. Failure path emits error ShowNotice.
+        fail_next.store(true, Ordering::Release);
+        worker
+            .handle_command(WorkerCommand::UpdateSubscription("Alpha".to_string()))
+            .unwrap();
+        let done = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(worker.handle_command(done).is_err());
+        let err_notices: Vec<(String, String, bool)> = ui_rx
+            .try_iter()
+            .filter_map(|ev| match ev {
+                AppEvent::ShowNotice {
+                    title,
+                    message,
+                    is_error,
+                } => Some((title, message, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(err_notices.len(), 1);
+        assert_eq!(err_notices[0].0, text::TITLE_UPDATE_SUBSCRIPTION);
+        assert!(err_notices[0].1.contains("Alpha"));
+        assert!(err_notices[0].2);
 
         stop_mock_server(port);
         server.join().unwrap();

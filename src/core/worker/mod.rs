@@ -724,17 +724,35 @@ impl Worker {
         Ok(())
     }
 
+    fn apply_tun(&mut self, want_enable: bool) -> Result<(), ActionError> {
+        let shared = &self.shared;
+        let proxy = &self.proxy;
+        self.core.apply_tun_state(&self.cfg, want_enable, &|note| {
+            write_status_note(shared, proxy, note)
+        })
+    }
+
+    fn disable_system_proxy(&mut self) -> Result<(), ActionError> {
+        platform::proxy_disable()?;
+        self.state_sync
+            .update(&self.cfg.home_dir, |s| s.system_proxy = false);
+        self.live.sysproxy = false;
+        Ok(())
+    }
+
     fn toggle_system_proxy(&mut self) -> Result<(), ActionError> {
         if platform::proxy_is_enabled() {
-            platform::proxy_disable()?;
-            self.state_sync
-                .update(&self.cfg.home_dir, |s| s.system_proxy = false);
-            self.live.sysproxy = false;
-            return Ok(());
+            return self.disable_system_proxy();
         }
         let cfg = self.core.require_client()?.get_configs()?;
         if cfg.mixed_port == 0 {
             return Err(ActionError::general(text::ERR_NO_MIXED_PORT_FOR_PROXY));
+        }
+        if cfg.tun_enable {
+            self.apply_tun(false)?;
+            self.state_sync
+                .update(&self.cfg.home_dir, |s| s.tun = Some(false));
+            self.live.tun = false;
         }
         platform::proxy_enable(cfg.mixed_port, &self.cfg.settings.proxy.bypass)?;
         self.state_sync
@@ -746,16 +764,13 @@ impl Worker {
     fn toggle_tun(&mut self) -> Result<(), ActionError> {
         let current = self.core.require_client()?.get_configs()?;
         let want_enable = !current.tun_enable;
-        {
-            let shared = &self.shared;
-            let proxy = &self.proxy;
-            self.core.apply_tun_state(&self.cfg, want_enable, &|note| {
-                write_status_note(shared, proxy, note)
-            })?;
-        }
+        self.apply_tun(want_enable)?;
         self.state_sync
             .update(&self.cfg.home_dir, |s| s.tun = Some(want_enable));
         self.live.tun = want_enable;
+        if want_enable && platform::proxy_is_enabled() {
+            self.disable_system_proxy()?;
+        }
         Ok(())
     }
 
@@ -796,13 +811,7 @@ impl Worker {
         if want_tun == cfg.tun_enable {
             return RestoreStep::Continue;
         }
-        let tun_res = {
-            let shared = &self.shared;
-            let proxy = &self.proxy;
-            self.core.apply_tun_state(&self.cfg, want_tun, &|note| {
-                write_status_note(shared, proxy, note)
-            })
-        };
+        let tun_res = self.apply_tun(want_tun);
         match tun_res {
             Ok(()) => {
                 if let Some(client) = self.core.client()
@@ -865,7 +874,17 @@ impl Worker {
             }
         }
 
-        if restore.system_proxy {
+        if cfg.tun_enable {
+            if platform::proxy_is_enabled()
+                && let Err(err) = platform::proxy_disable()
+            {
+                self.set_action_error(Some(ActionError::general(err)));
+            }
+            if restore.system_proxy {
+                self.state_sync
+                    .update(&self.cfg.home_dir, |s| s.system_proxy = false);
+            }
+        } else if restore.system_proxy {
             if cfg.mixed_port == 0 {
                 self.set_action_error(Some(ActionError::general(
                     text::ERR_NO_MIXED_PORT_FOR_RESTORE,
@@ -1762,6 +1781,163 @@ mod tests {
         worker.startup_with_running(&running);
         assert_eq!(worker.state_sync.take_ready_restore(), None);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn toggle_system_proxy_checks_port_and_disables_tun_before_enabling_proxy() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let root = crate::config::test_temp_dir("worker_sysproxy_tun_mutex");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mixed_port = Arc::new(AtomicUsize::new(0));
+        let tun_sticky = Arc::new(AtomicBool::new(true));
+        let tun_on = Arc::new(AtomicBool::new(true));
+        let patch_hits = Arc::new(AtomicUsize::new(0));
+
+        let mp_srv = Arc::clone(&mixed_port);
+        let sticky_srv = Arc::clone(&tun_sticky);
+        let tun_srv = Arc::clone(&tun_on);
+        let patch_srv = Arc::clone(&patch_hits);
+        let server = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("POST /__stop ") {
+                    send_http_response(&mut stream, "200 OK", "");
+                    break;
+                }
+                if req.starts_with("GET /configs ") {
+                    let body = format!(
+                        r#"{{"mode":"rule","mixed-port":{},"tun":{{"enable":{}}}}}"#,
+                        mp_srv.load(Ordering::Acquire),
+                        tun_srv.load(Ordering::Acquire)
+                    );
+                    send_http_response(&mut stream, "200 OK", &body);
+                } else if req.starts_with("PATCH /configs ") {
+                    patch_srv.fetch_add(1, Ordering::AcqRel);
+                    if !sticky_srv.load(Ordering::Acquire) {
+                        tun_srv.store(false, Ordering::Release);
+                    }
+                    send_http_response(&mut stream, "204 No Content", "");
+                } else {
+                    send_http_response(&mut stream, "404 Not Found", "");
+                }
+            }
+        });
+
+        let (mut worker, _rx, _shared) = test_worker(&root, TraySettings::default(), None);
+        worker
+            .core
+            .set_client_for_test(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        worker.live.tun = true;
+
+        // 1. Missing mixed-port must fail before sending PATCH to turn off TUN.
+        let err = worker
+            .handle_command(WorkerCommand::ToggleSystemProxy)
+            .unwrap_err();
+        assert_eq!(err.message, text::ERR_NO_MIXED_PORT_FOR_PROXY);
+        assert_eq!(patch_hits.load(Ordering::Acquire), 0);
+
+        // 2. If disabling TUN fails, System Proxy must not be enabled.
+        mixed_port.store(7890, Ordering::Release);
+        let err = worker
+            .handle_command(WorkerCommand::ToggleSystemProxy)
+            .unwrap_err();
+        assert_eq!(err.message, text::ERR_TUN_STILL_ENABLED);
+        assert_eq!(patch_hits.load(Ordering::Acquire), 1);
+        assert!(worker.live.tun);
+
+        #[cfg(not(windows))]
+        {
+            // 3. When disabling TUN succeeds, live + persisted TUN flips to false first.
+            tun_sticky.store(false, Ordering::Release);
+            let _ = worker.handle_command(WorkerCommand::ToggleSystemProxy);
+            assert!(!worker.live.tun);
+            assert_eq!(
+                crate::config::state_store::load(&worker.cfg.home_dir).and_then(|s| s.tun),
+                Some(false)
+            );
+        }
+
+        stop_mock_server(port);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn restore_normalizes_legacy_dual_enabled_state_to_tun_only() {
+        use std::net::TcpListener;
+
+        let root = crate::config::test_temp_dir("worker_restore_tun_mutex");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut mode = "rule".to_string();
+            let mut tun_on = false;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut stream);
+                if req.starts_with("POST /__stop ") {
+                    send_http_response(&mut stream, "200 OK", "");
+                    break;
+                }
+                if req.starts_with("PATCH /configs ") {
+                    let (_, payload) = req.split_once("\r\n\r\n").unwrap();
+                    let json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    if let Some(m) = json.get("mode").and_then(|v| v.as_str()) {
+                        mode = m.to_string();
+                    }
+                    if let Some(t) = json
+                        .get("tun")
+                        .and_then(|v| v.get("enable"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        tun_on = t;
+                    }
+                    send_http_response(&mut stream, "204 No Content", "");
+                } else if req.starts_with("GET /configs ") {
+                    let body = format!(
+                        r#"{{"mode":"{mode}","mixed-port":7890,"tun":{{"enable":{tun_on}}}}}"#
+                    );
+                    send_http_response(&mut stream, "200 OK", &body);
+                } else {
+                    send_http_response(&mut stream, "404 Not Found", "");
+                }
+            }
+        });
+
+        let (mut worker, _rx, shared) = test_worker(&root, TraySettings::default(), None);
+        worker
+            .core
+            .set_client_for_test(Client::new(&format!("127.0.0.1:{port}"), "", 2000).unwrap());
+        let saved = PersistedState {
+            system_proxy: true,
+            mode: Some("global".to_string()),
+            tun: Some(true),
+        };
+        crate::config::state_store::save(&worker.cfg.home_dir, &saved);
+        worker.state_sync.arm_ready_restore(saved);
+
+        let mut cfg = CoreConfigs {
+            mode: "rule".to_string(),
+            mixed_port: 7890,
+            tun_enable: false,
+        };
+        assert!(worker.apply_pending_restore_if_needed(&mut cfg));
+        assert!(cfg.tun_enable);
+        assert_eq!(cfg.mode, "global");
+        // proxy_enable errors on Linux; None proves restore skipped System Proxy.
+        assert_eq!(shared.lock().unwrap().action_error, None);
+        let persisted = crate::config::state_store::load(&worker.cfg.home_dir).unwrap();
+        assert!(!persisted.system_proxy);
+        assert_eq!(persisted.tun, Some(true));
+
+        stop_mock_server(port);
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

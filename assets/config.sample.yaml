@@ -2,7 +2,7 @@
 # Use "Profiles -> Set Subscription" in the tray menu to configure subscriptions;
 # active subscriptions update every 12 hours automatically once set.
 
-mixed-port: 7890
+mixed-port: 2080
 allow-lan: true
 ipv6: true
 mode: rule

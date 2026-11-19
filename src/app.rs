@@ -175,7 +175,12 @@ impl MihomoTrayApp {
 
         match action {
             MenuAction::OpenWebUi => self.open_web_ui(),
-            MenuAction::SetSubscriptionUrl => self.prompt_and_set_subscription(),
+            MenuAction::SetSubscription => self.prompt_and_set_subscription(),
+            MenuAction::SwitchProfile(name) => self.send_worker(WorkerCommand::SwitchProfile(name)),
+            MenuAction::UpdateSubscription(name) => {
+                self.send_worker(WorkerCommand::UpdateSubscription(name));
+            }
+            MenuAction::DeleteProfile(name) => self.confirm_and_delete_profile(name),
             MenuAction::OpenTrayConfig => {
                 crate::config::tray::ensure_sample_file(&self.settings_path);
                 self.open_target(self.settings_path.clone());
@@ -210,23 +215,6 @@ impl MihomoTrayApp {
             MenuAction::UnfixGroup(group) => self.send_worker(WorkerCommand::UnfixGroup(group)),
             MenuAction::TestGroupLatency(group) => {
                 self.send_worker(WorkerCommand::TestGroupLatency(group));
-            }
-            MenuAction::RefreshSubscription => {
-                let target = {
-                    let snap = self.shared.lock().unwrap();
-                    snap.active_profile
-                        .clone()
-                        .or_else(|| snap.profiles.first().cloned())
-                };
-                if let Some(name) = target {
-                    self.send_worker(WorkerCommand::UpdateSubscription(name));
-                } else {
-                    self.spawn_notice_dialog(
-                        crate::text::TITLE_UPDATE_SUBSCRIPTION.to_string(),
-                        crate::text::ERR_NO_SUBSCRIPTION_PROVIDER.to_string(),
-                        true,
-                    );
-                }
             }
             MenuAction::CopyEnvVars => self.send_worker(WorkerCommand::CopyEnvVars),
             MenuAction::RestartCore => self.send_worker(WorkerCommand::RestartCore),
@@ -311,7 +299,6 @@ impl MihomoTrayApp {
         });
     }
 
-    #[allow(dead_code)]
     fn confirm_and_delete_profile(&self, name: String) {
         let Some(tx) = self.worker.as_ref().map(|w| w.tx.clone()) else {
             return;

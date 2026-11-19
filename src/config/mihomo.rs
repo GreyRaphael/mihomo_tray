@@ -14,8 +14,6 @@ const HEALTH_CHECK_INTERVAL_SECS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileEntry {
     pub name: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub url: String,
     pub path: String,
 }
 
@@ -361,20 +359,15 @@ fn extract_profiles(root_map: &Mapping) -> ProfilesOverview {
             let is_http = scalar_str(entry, "type")
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case("http"));
-            let Some(url) = scalar_str(entry, "url")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            if !is_http {
+            let has_url = scalar_str(entry, "url").is_some_and(|s| !s.trim().is_empty());
+            if !is_http || !has_url {
                 continue;
             }
             let path = scalar_str(entry, "path")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| profile_local_path(&name));
-            profiles.push(ProfileEntry { name, url, path });
+            profiles.push(ProfileEntry { name, path });
         }
     }
 
@@ -577,6 +570,16 @@ mod tests {
     use super::*;
     use serde_yaml_ng::Value;
 
+    fn read_provider_url(cfg: &Path, name: &str) -> Option<String> {
+        let text = std::fs::read_to_string(cfg).ok()?;
+        let root: Value = serde_yaml_ng::from_str(crate::config::strip_utf8_bom(&text)).ok()?;
+        root.get("proxy-providers")?
+            .get(name)?
+            .get("url")?
+            .as_str()
+            .map(ToString::to_string)
+    }
+
     #[test]
     fn extracts_controller_secret_and_ui() {
         let yaml = r#"
@@ -615,7 +618,10 @@ external-ui: ./ui
         upsert_profile(&cfg, "subscription", "https://example.com/sub?token=abc").unwrap();
         let ov = read_profiles(&cfg);
         assert_eq!(ov.profiles.len(), 1);
-        assert_eq!(ov.profiles[0].url, "https://example.com/sub?token=abc");
+        assert_eq!(
+            read_provider_url(&cfg, "subscription").as_deref(),
+            Some("https://example.com/sub?token=abc")
+        );
 
         let text = std::fs::read_to_string(&cfg).unwrap();
         let root: Value = serde_yaml_ng::from_str(&text).unwrap();
@@ -707,8 +713,8 @@ proxy-groups:
         assert!(updated.contains("# keep inline comment"));
         assert!(updated.contains("# Group section comment"));
         assert_eq!(
-            read_profiles(&cfg).profiles[0].url,
-            "https://example.com/sub2"
+            read_provider_url(&cfg, "subscription").as_deref(),
+            Some("https://example.com/sub2")
         );
         assert!(upsert_profile(&cfg, "subscription", "https://").is_err());
 
@@ -728,8 +734,8 @@ proxy-providers:
         assert!(after_custom.contains("filter: \"HK|SG\""));
         assert!(after_custom.contains("udp: true"));
         assert_eq!(
-            read_profiles(&cfg).profiles[0].url,
-            "https://example.com/new"
+            read_provider_url(&cfg, "subscription").as_deref(),
+            Some("https://example.com/new")
         );
 
         let parsed: Value = serde_yaml_ng::from_str(&updated).unwrap();
@@ -799,7 +805,10 @@ proxy-providers:
         let ov = read_profiles(&cfg);
         assert_eq!(ov.profiles.len(), 2);
         assert_eq!(ov.active.as_deref(), Some("主力机场"));
-        assert_eq!(ov.profiles[0].url, "https://example.com/a-v2");
+        assert_eq!(
+            read_provider_url(&cfg, "主力机场").as_deref(),
+            Some("https://example.com/a-v2")
+        );
 
         // 3. Switch back to Backup US.
         let switched_path = switch_profile(&cfg, "Backup US").unwrap();

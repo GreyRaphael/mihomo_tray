@@ -15,7 +15,7 @@
   - 或者直接在 `tray.yml` 中配置 `ui.web_url`（支持 `{host}`、`{port}`、`{secret}` 占位符）；
   - 点击 `Open WebUI` 或左键单击托盘图标，直接调用系统默认浏览器打开。
 - **免安装、无服务、按需 TUN 提权**：绝不注册 Windows Service；日常以普通权限启动内核，仅在启用 TUN 模式且需要管理员权限时，通过隐藏自身 UAC 辅助进程（`--elevate-start` / `--elevate-stop`）拉起提权内核。
-- **托盘一键填订阅**：点击菜单 `Set Subscription URL` 打开原生居中输入框，填入订阅地址即可写入 `config/config.yaml`（默认 12h 自动更新并绑定到 `🚀Proxy` / `⚡Auto` / `🚑Fallback`，`🤖AI` 通过 `include-all: true` 自动纳入节点），同时立即拉取节点。
+- **多订阅共享模板**：通过 `Profiles` 子菜单管理多个订阅（全部保存在 `config/config.yaml` 的 `proxy-providers` 中，缓存分别存于 `./config/providers/<name>.yaml`），共用一套 `config.yaml` 规则模板；点击即可利用本地缓存秒切且互斥生效，支持单订阅独立更新（带结果弹窗）与二次确认删除。
 - **跨重启状态持久化**：在 `./config/.tray-state.json` 中记住退出前的 **`System Proxy`、代理模式、TUN 模式**状态；退出时清理系统代理避免断网，下次启动或点击 `More -> Restart Application` 后自动恢复。
 - **低内存开箱即用 Release 便携包**：GitHub Releases 自动打包 `mihomo-tray.exe`（内嵌可执行文件图标）、最新 `mihomo-windows-amd64-v3` 内核、最新 `zashboard`（`dist-no-fonts`）、默认 `config/config.yaml`、`Country.mmdb` 以及轻量化 `.mrs` 二进制规则集（`./config/rules/*.mrs`）。
 - **按需菜单刷新与纯代码双轴图标**：
@@ -65,14 +65,17 @@ mihomo-tray/
 
 - **状态行**：显示 `Mihomo <version> Running(<port>)` / `Mihomo: Stopped` / `Mihomo: Controller Unreachable` 及最近错误。
 - **Open WebUI**：用默认浏览器打开面板（左键单击托盘图标同样触发）。
-- **Set Subscription URL**：弹出居中原生输入框保存订阅地址到 `config/config.yaml`（默认 12 小时更新），并立即触发加载与刷新节点。
+- **Profiles**：
+  - 平铺列出所有已配置订阅，左勾选互斥单选，点击直接利用本地缓存秒切（共用 `config/config.yaml` 模板，缓存独立存放在 `./config/providers/<name>.yaml`）；
+  - `Set Subscription`：弹出原生居中双输入框（Name + Subscription URL，默认留空），新增订阅或同名更新 URL 并立即拉取；
+  - `Update Subscription`：二级菜单按订阅单独刷新（旁侧显示相对更新时间），更新成功或失败均弹窗提示；
+  - `Delete Profile`：二级菜单选择后经二次确认弹窗删除配置条目与本地缓存文件。
 - **模式切换**：`Rule` / `Global` / `Direct`。
-- **接管开关**：`System Proxy` / `TUN Mode`（状态跨重启记忆）。
+- **接管开关**：`System Proxy` / `TUN Mode`（互斥切换，状态跨重启记忆）。
 - **Proxy Groups**：各策略组子菜单（支持 `Test Group Latency`、`Auto (Unpin)`、延迟排序与分页）。
 - **Open**：快捷打开 `tray.yml`、`config.yaml`、便携根目录、`ui/` 目录及日志文件。
 - **More**：
   - `Copy Environment Variables`：复制终端代理环境变量命令到剪贴板；
-  - `Update Subscription`：立即刷新订阅/代理提供者（并在旁侧显示距上次更新的相对时间）；
   - `Restart Mihomo Core`：重新扫描并重启 mihomo 内核；
   - `Restart Application`：重启 `mihomo-tray` 应用（无单实例冲突并自动恢复运行状态）；
   - `Auto Start`：注册/取消开机自启（基于当前便携 exe 路径）；

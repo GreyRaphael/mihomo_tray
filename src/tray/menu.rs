@@ -12,7 +12,10 @@ use crate::text;
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     OpenWebUi,
-    SetSubscriptionUrl,
+    SetSubscription,
+    SwitchProfile(String),
+    UpdateSubscription(String),
+    DeleteProfile(String),
     SetMode(ProxyMode),
     ToggleSystemProxy,
     ToggleTun,
@@ -25,7 +28,6 @@ pub enum MenuAction {
     OpenUiDir,
     OpenLogFile,
     CopyEnvVars,
-    RefreshSubscription,
     RestartCore,
     RestartApp,
     ToggleAutostart,
@@ -42,6 +44,12 @@ impl MenuFingerprint {
         snap.status_line().hash(&mut hasher);
         snap.error().hash(&mut hasher);
         snap.web_ui_url.is_some().hash(&mut hasher);
+        snap.profiles.hash(&mut hasher);
+        snap.active_profile.hash(&mut hasher);
+        for name in &snap.profiles {
+            text::subscription_age_bucket(snap.provider_updated_at(name), now_unix)
+                .hash(&mut hasher);
+        }
         snap.proxy_mode().hash(&mut hasher);
         snap.controller_ok.hash(&mut hasher);
         (snap.mixed_port > 0).hash(&mut hasher);
@@ -56,7 +64,6 @@ impl MenuFingerprint {
                 }
             }
         }
-        text::subscription_age_bucket(snap.subscription_updated_at(), now_unix).hash(&mut hasher);
         snap.page_size.hash(&mut hasher);
         Self(hasher.finish())
     }
@@ -156,7 +163,7 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
         append_menu_item(&menu, &mut recorder, &format!("! {short}"), false, None);
     }
 
-    // 2. WebUI & subscription onboarding
+    // 2. WebUI & Profiles submenu
     append_menu_item(
         &menu,
         &mut recorder,
@@ -164,13 +171,9 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
         snapshot.web_ui_url.is_some(),
         Some(MenuAction::OpenWebUi),
     );
-    append_menu_item(
-        &menu,
-        &mut recorder,
-        text::MENU_SET_SUBSCRIPTION,
-        true,
-        Some(MenuAction::SetSubscriptionUrl),
-    );
+    let profiles_sub = Submenu::new(text::MENU_PROFILES, true);
+    append_profiles_items(&profiles_sub, snapshot, now_unix, &mut recorder);
+    let _ = menu.append(&profiles_sub);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     // 3. Proxy routing modes
@@ -230,7 +233,7 @@ pub fn build(snapshot: &Snapshot, generation: u64, now_unix: i64) -> BuiltMenu {
     let _ = menu.append(&open_sub);
 
     let more_sub = Submenu::new(text::MENU_MORE, true);
-    append_more_items(&more_sub, snapshot, now_unix, &mut recorder);
+    append_more_items(&more_sub, snapshot, &mut recorder);
     let _ = menu.append(&more_sub);
 
     append_menu_item(
@@ -383,27 +386,71 @@ fn append_open_items(sub: &Submenu, recorder: &mut ActionRecorder) {
     );
 }
 
-fn append_more_items(
+fn append_profiles_items(
     sub: &Submenu,
     snapshot: &Snapshot,
     now_unix: i64,
     recorder: &mut ActionRecorder,
 ) {
+    if !snapshot.profiles.is_empty() {
+        for name in &snapshot.profiles {
+            let active = snapshot.active_profile.as_deref() == Some(name.as_str());
+            append_check_item(
+                sub,
+                recorder,
+                name,
+                true,
+                active,
+                MenuAction::SwitchProfile(name.clone()),
+            );
+        }
+        let _ = sub.append(&PredefinedMenuItem::separator());
+    }
+
+    append_menu_item(
+        sub,
+        recorder,
+        text::MENU_SET_SUBSCRIPTION,
+        true,
+        Some(MenuAction::SetSubscription),
+    );
+
+    if !snapshot.profiles.is_empty() {
+        let update_sub = Submenu::new(text::MENU_UPDATE_SUBSCRIPTION, snapshot.controller_ok);
+        for name in &snapshot.profiles {
+            let label =
+                text::format_profile_age_label(name, snapshot.provider_updated_at(name), now_unix);
+            append_menu_item(
+                &update_sub,
+                recorder,
+                &label,
+                snapshot.controller_ok,
+                Some(MenuAction::UpdateSubscription(name.clone())),
+            );
+        }
+        let _ = sub.append(&update_sub);
+
+        let delete_sub = Submenu::new(text::MENU_DELETE_PROFILE, true);
+        for name in &snapshot.profiles {
+            append_menu_item(
+                &delete_sub,
+                recorder,
+                name,
+                true,
+                Some(MenuAction::DeleteProfile(name.clone())),
+            );
+        }
+        let _ = sub.append(&delete_sub);
+    }
+}
+
+fn append_more_items(sub: &Submenu, snapshot: &Snapshot, recorder: &mut ActionRecorder) {
     append_menu_item(
         sub,
         recorder,
         text::MENU_COPY_ENV_VARS,
         true,
         Some(MenuAction::CopyEnvVars),
-    );
-    let update_label =
-        text::format_update_subscription_label(snapshot.subscription_updated_at(), now_unix);
-    append_menu_item(
-        sub,
-        recorder,
-        &update_label,
-        snapshot.controller_ok,
-        Some(MenuAction::RefreshSubscription),
     );
     append_menu_item(
         sub,
@@ -470,6 +517,19 @@ mod tests {
             .collect()
     }
 
+    fn find_submenu(
+        items: Vec<tray_icon::menu::MenuItemKind>,
+        title: &str,
+    ) -> tray_icon::menu::Submenu {
+        items
+            .into_iter()
+            .find_map(|item| match item {
+                tray_icon::menu::MenuItemKind::Submenu(sub) if sub.text() == title => Some(sub),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Submenu '{title}' missing"))
+    }
+
     #[test]
     fn builds_requested_hierarchy_without_id_collisions() {
         let snap = Snapshot {
@@ -477,6 +537,8 @@ mod tests {
             version: "v1.19.34".to_string(),
             mode: "rule".to_string(),
             mixed_port: 7890,
+            profiles: vec!["AirportA".to_string(), "AirportB".to_string()],
+            active_profile: Some("AirportA".to_string()),
             web_ui_url: Some("http://127.0.0.1:9090/ui/".to_string()),
             groups: vec![Group {
                 name: "Proxy_Group".to_string(),
@@ -491,18 +553,35 @@ mod tests {
 
         let built = build(&snap, 1, 1_700_000_000);
         assert!(matches!(built.actions[0], MenuAction::OpenWebUi));
-        assert!(matches!(built.actions[1], MenuAction::SetSubscriptionUrl));
         assert!(
             built
                 .actions
                 .iter()
-                .any(|a| matches!(a, MenuAction::CopyEnvVars))
+                .any(|a| matches!(a, MenuAction::SwitchProfile(n) if n == "AirportB"))
         );
         assert!(
             built
                 .actions
                 .iter()
-                .any(|a| matches!(a, MenuAction::RefreshSubscription))
+                .any(|a| matches!(a, MenuAction::SetSubscription))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::UpdateSubscription(n) if n == "AirportA"))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::DeleteProfile(n) if n == "AirportB"))
+        );
+        assert!(
+            built
+                .actions
+                .iter()
+                .any(|a| matches!(a, MenuAction::CopyEnvVars))
         );
         assert!(
             built
@@ -530,7 +609,7 @@ mod tests {
             vec![
                 "Mihomo v1.19.34 Running(7890)",
                 "Open WebUI",
-                "Set Subscription URL",
+                "Profiles",
                 "---",
                 "Rule",
                 "Global",
@@ -546,6 +625,26 @@ mod tests {
                 "Quit",
             ]
         );
+
+        let profiles_sub = find_submenu(built.menu.items(), text::MENU_PROFILES);
+        assert_eq!(
+            item_texts(profiles_sub.items()),
+            vec![
+                "AirportA",
+                "AirportB",
+                "---",
+                "Set Subscription",
+                "Update Subscription",
+                "Delete Profile",
+            ]
+        );
+        let delete_sub = find_submenu(profiles_sub.items(), text::MENU_DELETE_PROFILE);
+        assert_eq!(item_texts(delete_sub.items()), vec!["AirportA", "AirportB"]);
+
+        let more_sub = find_submenu(built.menu.items(), text::MENU_MORE);
+        let more_texts = item_texts(more_sub.items());
+        assert!(more_texts.iter().any(|t| t == "Auto Start"));
+        assert!(!more_texts.iter().any(|t| t.contains("Update Subscription")));
     }
 
     #[test]
@@ -602,8 +701,10 @@ mod tests {
         let now = 1_700_000_000;
         let make_snap = |controller_ok: bool, vehicle: &str, updated_at: Option<i64>| Snapshot {
             controller_ok,
+            profiles: vec!["AirportA".to_string()],
+            active_profile: Some("AirportA".to_string()),
             providers: vec![crate::state::Provider {
-                name: "subscription".to_string(),
+                name: "AirportA".to_string(),
                 vehicle: vehicle.to_string(),
                 updated_at,
             }],
@@ -618,7 +719,7 @@ mod tests {
             MenuFingerprint::from_snapshot(&s_45s, now)
         );
 
-        // Crossing into the minute bucket updates fingerprint and More submenu item text.
+        // Crossing into the minute bucket updates fingerprint and Profiles -> Update Subscription text.
         let s_2m = make_snap(true, "HTTP", Some(now - 120));
         assert_ne!(
             MenuFingerprint::from_snapshot(&s_45s, now),
@@ -626,32 +727,17 @@ mod tests {
         );
 
         let built = build(&s_2m, 1, now);
-        let more_sub = built
-            .menu
-            .items()
-            .into_iter()
-            .find_map(|item| match item {
-                tray_icon::menu::MenuItemKind::Submenu(sub) if sub.text() == text::MENU_MORE => {
-                    Some(sub)
-                }
-                _ => None,
-            })
-            .expect("More submenu missing");
-        let more_texts = item_texts(more_sub.items());
-        assert!(
-            more_texts
-                .iter()
-                .any(|t| t == "Update Subscription (2m ago)")
-        );
-        assert!(more_texts.iter().any(|t| t == "Auto Start"));
+        let profiles_sub = find_submenu(built.menu.items(), text::MENU_PROFILES);
+        let update_sub = find_submenu(profiles_sub.items(), text::MENU_UPDATE_SUBSCRIPTION);
+        assert_eq!(item_texts(update_sub.items()), vec!["AirportA (2m ago)"]);
 
-        // Non-refreshable Compatible groups and offline controller states fall back cleanly.
+        // Non-refreshable Compatible providers and offline controller states fall back cleanly.
         assert_eq!(
-            make_snap(true, "Compatible", Some(now - 120)).subscription_updated_at(),
+            make_snap(true, "Compatible", Some(now - 120)).provider_updated_at("AirportA"),
             None
         );
         assert_eq!(
-            make_snap(false, "HTTP", Some(now - 120)).subscription_updated_at(),
+            make_snap(false, "HTTP", Some(now - 120)).provider_updated_at("AirportA"),
             None
         );
     }

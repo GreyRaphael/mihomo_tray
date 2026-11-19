@@ -8,7 +8,10 @@ pub const RUNTIME_LOCK_NAME: &str = ".runtime.json";
 pub const STATE_FILE_NAME: &str = ".tray-state.json";
 
 pub const MENU_OPEN_WEB_UI: &str = "Open WebUI";
-pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription URL";
+pub const MENU_PROFILES: &str = "Profiles";
+pub const MENU_SET_SUBSCRIPTION: &str = "Set Subscription";
+pub const MENU_UPDATE_SUBSCRIPTION: &str = "Update Subscription";
+pub const MENU_DELETE_PROFILE: &str = "Delete Profile";
 pub const MENU_MODE_RULE: &str = "Rule";
 pub const MENU_MODE_GLOBAL: &str = "Global";
 pub const MENU_MODE_DIRECT: &str = "Direct";
@@ -25,7 +28,6 @@ pub const MENU_OPEN_UI_DIR: &str = "Open WebUI Folder (ui/)";
 pub const MENU_OPEN_LOG_FILE: &str = "Open Log File";
 pub const MENU_MORE: &str = "More";
 pub const MENU_COPY_ENV_VARS: &str = "Copy Environment Variables";
-const MENU_REFRESH_SUBSCRIPTION: &str = "Update Subscription";
 pub const MENU_RESTART_CORE: &str = "Restart Mihomo Core";
 pub const MENU_RESTART_APP: &str = "Restart Application";
 pub const MENU_AUTOSTART: &str = "Auto Start";
@@ -62,8 +64,6 @@ pub const ERR_LOCATE_ELEVATE_PROCESS: &str =
     "Could not locate the running mihomo process to elevate.";
 pub const ERR_MULTIPLE_EXTERNAL_CORES: &str =
     "Multiple external mihomo processes are running; stop them before restarting.";
-pub const ERR_NO_SUBSCRIPTION_PROVIDER: &str =
-    "No subscription profile configured. Use Profiles -> Set Subscription first.";
 pub const ERR_SUBSCRIPTION_TASK_BUSY: &str =
     "A subscription update is already in progress; try again shortly.";
 pub const ERR_INVALID_PROFILE_NAME: &str =
@@ -246,15 +246,15 @@ pub fn subscription_age_bucket(updated_at: Option<i64>, now_unix: i64) -> SubAge
     }
 }
 
-/// Formats `Update Subscription` with a coarse relative age bucket so tray
-/// menus only rebuild when the displayed minute/hour/day label changes.
-pub fn format_update_subscription_label(updated_at: Option<i64>, now_unix: i64) -> String {
+/// Formats a profile label under `Update Subscription` with a coarse relative age bucket
+/// so tray menus only rebuild when the displayed minute/hour/day label changes.
+pub fn format_profile_age_label(name: &str, updated_at: Option<i64>, now_unix: i64) -> String {
     match subscription_age_bucket(updated_at, now_unix) {
-        SubAgeBucket::None => MENU_REFRESH_SUBSCRIPTION.to_string(),
-        SubAgeBucket::JustNow => format!("{MENU_REFRESH_SUBSCRIPTION} (just now)"),
-        SubAgeBucket::Minutes(m) => format!("{MENU_REFRESH_SUBSCRIPTION} ({m}m ago)"),
-        SubAgeBucket::Hours(h) => format!("{MENU_REFRESH_SUBSCRIPTION} ({h}h ago)"),
-        SubAgeBucket::Days(d) => format!("{MENU_REFRESH_SUBSCRIPTION} ({d}d ago)"),
+        SubAgeBucket::None => name.to_string(),
+        SubAgeBucket::JustNow => format!("{name} (just now)"),
+        SubAgeBucket::Minutes(m) => format!("{name} ({m}m ago)"),
+        SubAgeBucket::Hours(h) => format!("{name} ({h}h ago)"),
+        SubAgeBucket::Days(d) => format!("{name} ({d}d ago)"),
     }
 }
 
@@ -277,40 +277,37 @@ mod tests {
     }
 
     #[test]
-    fn formats_update_subscription_label_buckets() {
+    fn formats_profile_age_label_buckets() {
         let now = 1_700_000_000;
-        assert_eq!(
-            format_update_subscription_label(None, now),
-            "Update Subscription"
-        );
+        assert_eq!(format_profile_age_label("Alpha", None, now), "Alpha");
         // Clock skew slightly in the future should still read cleanly.
         assert_eq!(
-            format_update_subscription_label(Some(now + 10), now),
-            "Update Subscription (just now)"
+            format_profile_age_label("Alpha", Some(now + 10), now),
+            "Alpha (just now)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 59), now),
-            "Update Subscription (just now)"
+            format_profile_age_label("Alpha", Some(now - 59), now),
+            "Alpha (just now)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 60), now),
-            "Update Subscription (1m ago)"
+            format_profile_age_label("Alpha", Some(now - 60), now),
+            "Alpha (1m ago)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 3_599), now),
-            "Update Subscription (59m ago)"
+            format_profile_age_label("Alpha", Some(now - 3_599), now),
+            "Alpha (59m ago)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 3_600), now),
-            "Update Subscription (1h ago)"
+            format_profile_age_label("Alpha", Some(now - 3_600), now),
+            "Alpha (1h ago)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 86_399), now),
-            "Update Subscription (23h ago)"
+            format_profile_age_label("Alpha", Some(now - 86_399), now),
+            "Alpha (23h ago)"
         );
         assert_eq!(
-            format_update_subscription_label(Some(now - 86_400), now),
-            "Update Subscription (1d ago)"
+            format_profile_age_label("Alpha", Some(now - 86_400), now),
+            "Alpha (1d ago)"
         );
     }
 }

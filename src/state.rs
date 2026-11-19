@@ -126,18 +126,6 @@ impl Snapshot {
         self.node_latency.get(node).copied().flatten()
     }
 
-    pub fn subscription_updated_at(&self) -> Option<i64> {
-        if !self.controller_ok {
-            return None;
-        }
-        self.providers
-            .iter()
-            .filter(|p| p.refreshable())
-            .filter_map(|p| p.updated_at)
-            .max()
-    }
-
-    #[allow(dead_code)]
     pub fn provider_updated_at(&self, name: &str) -> Option<i64> {
         if !self.controller_ok {
             return None;
@@ -205,9 +193,7 @@ pub enum WorkerCommand {
         name: String,
         url: String,
     },
-    #[allow(dead_code)]
     SwitchProfile(String),
-    #[allow(dead_code)]
     DeleteProfile(String),
     CopyEnvVars,
     RestartCore,
